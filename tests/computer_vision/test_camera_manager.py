@@ -1,0 +1,385 @@
+"""
+Tests for CameraManager.
+
+Tests camera lifecycle management without requiring a physical camera.
+Uses mocking to simulate OpenCV VideoCapture behavior.
+"""
+
+import pytest
+import sys
+from pathlib import Path
+from unittest.mock import Mock, patch, MagicMock
+import numpy as np
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.computer_vision.camera_manager import CameraManager
+
+
+class TestCameraManagerInitialization:
+    """Test CameraManager initialization and opening."""
+    
+    def test_init_with_defaults(self):
+        """Test initialization with default parameters."""
+        manager = CameraManager()
+        assert manager.camera_index == 0
+        assert manager.width is None
+        assert manager.height is None
+        assert not manager.is_open()
+    
+    def test_init_with_custom_camera_index(self):
+        """Test initialization with custom camera index."""
+        manager = CameraManager(camera_index=1)
+        assert manager.camera_index == 1
+        assert not manager.is_open()
+    
+    def test_init_with_resolution(self):
+        """Test initialization with custom resolution."""
+        manager = CameraManager(width=1280, height=720)
+        assert manager.width == 1280
+        assert manager.height == 720
+        assert not manager.is_open()
+    
+    @patch('cv2.VideoCapture')
+    def test_open_success(self, mock_video_capture):
+        """Test successful camera opening."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager(camera_index=0)
+        result = manager.open()
+        
+        assert result is True
+        assert manager.is_open()
+        mock_video_capture.assert_called_once_with(0)
+        mock_capture.isOpened.assert_called_once()
+    
+    @patch('cv2.VideoCapture')
+    def test_open_failure(self, mock_video_capture):
+        """Test failed camera opening."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = False
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager(camera_index=0)
+        result = manager.open()
+        
+        assert result is False
+        assert not manager.is_open()
+    
+    @patch('cv2.VideoCapture')
+    def test_open_with_resolution(self, mock_video_capture):
+        """Test opening camera with custom resolution."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager(camera_index=0, width=1920, height=1080)
+        result = manager.open()
+        
+        assert result is True
+        mock_capture.set.assert_any_call(3, 1920)  # CAP_PROP_FRAME_WIDTH = 3
+        mock_capture.set.assert_any_call(4, 1080)  # CAP_PROP_FRAME_HEIGHT = 4
+    
+    @patch('cv2.VideoCapture')
+    def test_open_when_already_open(self, mock_video_capture):
+        """Test opening camera when already open."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        # Try to open again
+        result = manager.open()
+        assert result is True
+        # VideoCapture should only be called once
+        assert mock_video_capture.call_count == 1
+    
+    @patch('cv2.VideoCapture')
+    def test_open_exception_handling(self, mock_video_capture):
+        """Test exception handling during camera opening."""
+        mock_video_capture.side_effect = Exception("Camera initialization error")
+        
+        manager = CameraManager()
+        result = manager.open()
+        
+        assert result is False
+        assert not manager.is_open()
+
+
+class TestCameraManagerFrameCapture:
+    """Test frame capture functionality."""
+    
+    @patch('cv2.VideoCapture')
+    def test_read_frame_success(self, mock_video_capture):
+        """Test successful frame reading."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        
+        # Create a mock frame
+        mock_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        mock_capture.read.return_value = (True, mock_frame)
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        success, frame = manager.read_frame()
+        
+        assert success is True
+        assert frame is not None
+        assert isinstance(frame, np.ndarray)
+        assert frame.shape == (480, 640, 3)
+    
+    @patch('cv2.VideoCapture')
+    def test_read_frame_failure(self, mock_video_capture):
+        """Test failed frame reading."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_capture.read.return_value = (False, None)
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        success, frame = manager.read_frame()
+        
+        assert success is False
+        assert frame is None
+    
+    def test_read_frame_when_not_open(self):
+        """Test reading frame when camera is not open."""
+        manager = CameraManager()
+        
+        success, frame = manager.read_frame()
+        
+        assert success is False
+        assert frame is None
+    
+    @patch('cv2.VideoCapture')
+    def test_read_frame_exception_handling(self, mock_video_capture):
+        """Test exception handling during frame reading."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_capture.read.side_effect = Exception("Frame read error")
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        success, frame = manager.read_frame()
+        
+        assert success is False
+        assert frame is None
+
+
+class TestCameraManagerRelease:
+    """Test camera release functionality."""
+    
+    @patch('cv2.VideoCapture')
+    def test_release(self, mock_video_capture):
+        """Test camera release."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        assert manager.is_open()
+        
+        manager.release()
+        
+        assert not manager.is_open()
+        mock_capture.release.assert_called_once()
+    
+    def test_release_when_not_open(self):
+        """Test releasing camera when not open."""
+        manager = CameraManager()
+        
+        # Should not raise exception
+        manager.release()
+        assert not manager.is_open()
+    
+    @patch('cv2.VideoCapture')
+    def test_release_multiple_times(self, mock_video_capture):
+        """Test releasing camera multiple times."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        manager.release()
+        manager.release()  # Should not raise exception
+        
+        assert not manager.is_open()
+        mock_capture.release.assert_called_once()
+    
+    @patch('cv2.VideoCapture')
+    def test_release_exception_handling(self, mock_video_capture):
+        """Test exception handling during release."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_capture.release.side_effect = Exception("Release error")
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        # Should handle exception gracefully
+        manager.release()
+        assert not manager.is_open()
+
+
+class TestCameraManagerState:
+    """Test camera state management."""
+    
+    def test_is_open_initially_false(self):
+        """Test that camera is not open initially."""
+        manager = CameraManager()
+        assert not manager.is_open()
+    
+    @patch('cv2.VideoCapture')
+    def test_is_open_after_successful_open(self, mock_video_capture):
+        """Test is_open returns True after successful open."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        assert manager.is_open()
+    
+    @patch('cv2.VideoCapture')
+    def test_is_open_after_failed_open(self, mock_video_capture):
+        """Test is_open returns False after failed open."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = False
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        assert not manager.is_open()
+    
+    @patch('cv2.VideoCapture')
+    def test_is_open_after_release(self, mock_video_capture):
+        """Test is_open returns False after release."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        manager.release()
+        
+        assert not manager.is_open()
+
+
+class TestCameraManagerUtilities:
+    """Test utility methods."""
+    
+    @patch('cv2.VideoCapture')
+    def test_get_frame_dimensions_success(self, mock_video_capture):
+        """Test getting frame dimensions."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_capture.get.side_effect = lambda prop: 1920 if prop == 3 else 1080
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        dimensions = manager.get_frame_dimensions()
+        
+        assert dimensions is not None
+        assert dimensions == (1920, 1080)
+    
+    def test_get_frame_dimensions_when_not_open(self):
+        """Test getting frame dimensions when camera not open."""
+        manager = CameraManager()
+        
+        dimensions = manager.get_frame_dimensions()
+        
+        assert dimensions is None
+    
+    @patch('cv2.VideoCapture')
+    def test_get_frame_dimensions_exception_handling(self, mock_video_capture):
+        """Test exception handling when getting dimensions."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_capture.get.side_effect = Exception("Get property error")
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        dimensions = manager.get_frame_dimensions()
+        
+        assert dimensions is None
+
+
+class TestCameraManagerContextManager:
+    """Test context manager functionality."""
+    
+    @patch('cv2.VideoCapture')
+    def test_context_manager_opens_and_closes(self, mock_video_capture):
+        """Test context manager properly opens and closes camera."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        
+        with manager:
+            assert manager.is_open()
+        
+        assert not manager.is_open()
+        mock_capture.release.assert_called_once()
+    
+    @patch('cv2.VideoCapture')
+    def test_context_manager_with_exception(self, mock_video_capture):
+        """Test context manager closes camera even with exception."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        
+        with pytest.raises(ValueError):
+            with manager:
+                assert manager.is_open()
+                raise ValueError("Test exception")
+        
+        assert not manager.is_open()
+        mock_capture.release.assert_called_once()
+
+
+class TestCameraManagerDestructor:
+    """Test destructor behavior."""
+    
+    @patch('cv2.VideoCapture')
+    def test_destructor_releases_camera(self, mock_video_capture):
+        """Test that destructor releases camera."""
+        mock_capture = Mock()
+        mock_capture.isOpened.return_value = True
+        mock_video_capture.return_value = mock_capture
+        
+        manager = CameraManager()
+        manager.open()
+        
+        # Explicitly delete to trigger destructor
+        del manager
+        
+        mock_capture.release.assert_called()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

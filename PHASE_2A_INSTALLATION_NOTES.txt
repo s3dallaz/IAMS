@@ -1,0 +1,99 @@
+==================================================
+PHASE 2A INSTALLATION NOTES
+==================================================
+
+Date: 2026-09-26
+Python Version: 3.14.7
+Platform: Windows (win32)
+
+DEPENDENCY INSTALLATION STATUS
+==================================================
+
+Successfully Installed:
+- opencv-python 5.0.0.93
+- opencv-contrib-python 5.0.0.93
+- mediapipe 1.0.1
+- numpy 2.5.3 (already installed)
+- Pillow 12.3.0 (already installed)
+
+Partially Installed (with compatibility issue):
+- face-recognition 1.3.0
+- dlib 20.0.1
+- face-recognition-models 0.3.0
+
+KNOWN INSTALLATION BLOCKER
+==================================================
+
+Issue: face_recognition_models incompatible with Python 3.14
+
+Details:
+The face_recognition_models package (v0.3.0) depends on pkg_resources,
+which was removed in Python 3.14. The package uses deprecated setuptools
+functionality and has not been updated since 2018.
+
+Error message:
+  "ModuleNotFoundError: No module named 'pkg_resources'"
+  
+When attempting to import face_recognition, it internally tries to import
+face_recognition_models, which fails with the pkg_resources error.
+
+Impact:
+- face_recognition library is installed but cannot be imported
+- Face recognition functionality will not be available until this is resolved
+- Face detection (MediaPipe) and other CV operations remain functional
+
+Workarounds Attempted:
+- Installing setuptools (v84.0.0) - pkg_resources still not available in Python 3.14
+- Reinstalling face-recognition - same issue
+- Force reinstalling setuptools - no change
+
+RESOLUTION OPTIONS
+==================================================
+
+Option 1 (Recommended for Production):
+Use Python 3.11 or 3.12 where pkg_resources is still available.
+
+Option 2 (Development Workaround):
+Install a patched version of face_recognition_models that uses
+importlib.resources instead of pkg_resources:
+  pip install git+https://github.com/ageitgey/face_recognition_models
+
+Option 3 (Future):
+Wait for face_recognition library maintainers to update the package
+for Python 3.14 compatibility.
+
+Option 4 (Alternative):
+Consider alternative face recognition libraries compatible with Python 3.14:
+- deepface
+- insightface
+Note: This would require architecture changes.
+
+CURRENT PROJECT STATE
+==================================================
+
+Phase 1: INTACT - All Phase 1 tests passing (79/79)
+Phase 2A Foundation: COMPLETE - CV package structure established
+
+Working CV Components:
+- OpenCV for image processing ✓
+- MediaPipe for face detection ✓
+- NumPy for numerical operations ✓
+- Configuration system updated ✓
+- CV verification utility created ✓
+
+Blocked CV Components:
+- face_recognition library import ✗
+- Face encoding generation (requires face_recognition) ✗
+- Face comparison (requires face_recognition) ✗
+
+RECOMMENDATION
+==================================================
+
+For immediate continued development:
+1. Use Python 3.11 or 3.12 for full face_recognition support
+2. Keep current Python 3.14 for Phase 2B (face detection with MediaPipe only)
+3. Implement Phase 2B using MediaPipe for detection
+4. Defer face_recognition integration until Python environment resolved
+
+The project architecture remains valid. Only the Python version compatibility
+needs to be addressed before implementing face recognition in Phase 2C.

@@ -1,0 +1,89 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "provider": {
+    "omniroute": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OmniRoute",
+
+      "options": {
+        "baseURL": "http://localhost:20128/v1",
+        "apiKey": "{env:OMNIROUTE_API_KEY}"
+      },
+
+      "models": {
+        "auto": {
+          "name": "Auto — Balanced"
+        },
+        "auto/cheap": {
+          "name": "Auto — Cheap"
+        },
+        "auto/fast": {
+          "name": "Auto — Fast"
+        },
+        "auto/coding": {
+          "name": "Auto — Coding"
+        },
+        "auto/smart": {
+          "name": "Auto — Smart"
+        },
+
+        "kr/claude-haiku-4.5": {
+          "name": "Claude Haiku 4.5"
+        },
+        "kr/claude-sonnet-4.5": {
+          "name": "Claude Sonnet 4.5"
+        },
+        "kr/claude-sonnet-5": {
+          "name": "Claude Sonnet 5"
+        }
+      }
+    }
+  },
+
+  "model": "omniroute/kr/claude-sonnet-4.5",
+
+  "small_model": "omniroute/auto/cheap",
+
+  "agent": {
+    "plan": {
+      "mode": "primary",
+      "model": "omniroute/auto/cheap",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny"
+      }
+    },
+
+    "build": {
+      "mode": "primary",
+      "model": "omniroute/kr/claude-sonnet-4.5",
+      "permission": {
+        "edit": "allow",
+        "bash": "ask"
+      }
+    },
+
+    "architect": {
+      "description": "Handles complex architecture, system design, and difficult technical decisions.",
+      "mode": "primary",
+      "model": "omniroute/kr/claude-sonnet-5",
+      "permission": {
+        "edit": "ask",
+        "bash": "ask"
+      }
+    },
+
+    "reviewer": {
+      "description": "Reviews code for bugs, security, performance, and maintainability without modifying files.",
+      "mode": "subagent",
+      "model": "omniroute/auto/coding",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny"
+      }
+    }
+  },
+
+  "default_agent": "build"
+}
