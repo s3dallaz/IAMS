@@ -90,3 +90,6 @@ dmypy.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# Local liveness diagnostic data
+manual_tests/liveness_detection/ear_diagnostic_data.csv

@@ -50,7 +50,7 @@ FACE_RECOGNITION_THRESHOLD: Final[float] = 0.6
 # Liveness detection confidence threshold
 # Confidence scores above this threshold indicate a live person
 # NOTE: Phase 3A establishes the configuration framework
-#       Phase 3B/3C will implement the algorithm and tune these values
+#       Phase 3B implements blink detection algorithm
 LIVENESS_THRESHOLD: Final[float] = 0.75
 
 # Minimum number of frames required for reliable liveness detection
@@ -60,6 +60,60 @@ LIVENESS_MIN_FRAMES: Final[int] = 10
 # Temporal window for liveness analysis (in seconds)
 # Frames must be captured within this window for temporal consistency
 LIVENESS_TEMPORAL_WINDOW: Final[float] = 2.0
+
+# Eye Aspect Ratio (EAR) default threshold (alias for backward compatibility)
+LIVENESS_EAR_THRESHOLD: Final[float] = 0.21
+
+# Eye Aspect Ratio (EAR) threshold for detecting closed eyes (hysteresis lower bound)
+# EAR below this value indicates eyes are closing / closed
+# Typical range: 0.20-0.23
+LIVENESS_EAR_CLOSE_THRESHOLD: Final[float] = 0.21
+
+# Eye Aspect Ratio threshold for detecting eye reopening (hysteresis upper bound)
+# EAR above this value indicates eyes are open / reopened
+# Higher than close threshold to prevent oscillation at boundary
+LIVENESS_EAR_OPEN_THRESHOLD: Final[float] = 0.25
+
+# Number of consecutive frames with EAR below threshold to confirm eye closure
+# Set to 1 to reliably capture fast natural human blinks (100-250ms duration)
+LIVENESS_EAR_CONSECUTIVE_FRAMES: Final[int] = 1
+
+# Minimum number of blinks required to classify as LIVE
+# A blink is a complete eye closure followed by reopening
+LIVENESS_MIN_BLINKS: Final[int] = 1
+
+# EAR temporal smoothing window size (frames)
+# 0 = no smoothing (required to detect fast natural blinks without attenuation)
+# Smoothing would mask rapid blinks by averaging EAR values across frames
+LIVENESS_EAR_SMOOTHING_WINDOW: Final[int] = 0
+
+# ============================================================================
+# Phase 3C: Active Liveness & Anti-Spoofing Configuration
+# ============================================================================
+
+# Enable active challenge-response liveness detection
+# Requires user to perform randomized actions (e.g., head turns)
+LIVENESS_ENABLE_ACTIVE_CHALLENGES: Final[bool] = True
+
+# Challenge timeout in seconds
+# User must complete the challenge within this time
+LIVENESS_CHALLENGE_TIMEOUT: Final[float] = 5.0
+
+# Head turn angle thresholds (in degrees)
+# Yaw angle required to complete left/right turn challenges
+LIVENESS_HEAD_TURN_ANGLE: Final[float] = 25.0
+
+# Head pose return-to-center tolerance (in degrees)
+# Maximum deviation from center to consider head "centered"
+LIVENESS_HEAD_CENTER_TOLERANCE: Final[float] = 15.0
+
+# Minimum frames the head must be held in target position
+# Prevents accidental/brief movements from completing challenges
+LIVENESS_HEAD_HOLD_FRAMES: Final[int] = 3
+
+# Require challenge completion along with blink detection for LIVE state
+# If False, blink detection alone is sufficient (Phase 3B behavior)
+LIVENESS_REQUIRE_CHALLENGE: Final[bool] = True
 
 # Number of enrollment images required per student (to be implemented in Phase 2B)
 # ENROLLMENT_IMAGES_REQUIRED: int = 5
@@ -91,7 +145,7 @@ def ensure_directories() -> None:
         UNKNOWN_FACES_DIR,
         LOGS_DIR,
     ]
-    
+
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -99,7 +153,7 @@ def ensure_directories() -> None:
 def validate_config() -> bool:
     """
     Validate configuration on application startup.
-    
+
     Returns:
         bool: True if configuration is valid, False otherwise.
     """
@@ -118,7 +172,7 @@ if __name__ == "__main__":
     print(f"Database Path: {DATABASE_PATH}")
     print(f"Debug Mode: {APP_DEBUG}")
     print(f"Log Level: {LOG_LEVEL}")
-    
+
     if validate_config():
         print("\n[OK] Configuration is valid")
         print("[OK] All directories created successfully")
