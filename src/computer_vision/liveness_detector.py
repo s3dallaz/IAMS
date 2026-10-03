@@ -132,7 +132,6 @@ class ChallengeState(Enum):
     ACTIVE = "active"
     COMPLETED = "completed"
     FAILED = "failed"
-    TIMEOUT = "timeout"
 
 
 class LivenessDetector:
@@ -198,7 +197,6 @@ class LivenessDetector:
         min_blinks: Optional[int] = None,
         ear_smoothing_window: Optional[int] = None,
         enable_challenges: Optional[bool] = None,
-        challenge_timeout: Optional[float] = None,
         head_turn_angle: Optional[float] = None,
         head_center_tolerance: Optional[float] = None,
         head_hold_frames: Optional[int] = None,
@@ -227,8 +225,6 @@ class LivenessDetector:
                                  If None, uses config.LIVENESS_EAR_SMOOTHING_WINDOW (default: 0)
             enable_challenges: Enable active challenge-response detection.
                               If None, uses config.LIVENESS_ENABLE_ACTIVE_CHALLENGES (default: True)
-            challenge_timeout: Challenge timeout in seconds.
-                              If None, uses config.LIVENESS_CHALLENGE_TIMEOUT (default: 5.0)
             head_turn_angle: Required head turn angle in degrees for challenges.
                             If None, uses config.LIVENESS_HEAD_TURN_ANGLE (default: 25.0)
             head_center_tolerance: Maximum deviation from center in degrees.
@@ -345,11 +341,6 @@ class LivenessDetector:
             if enable_challenges is not None
             else getattr(config, "LIVENESS_ENABLE_ACTIVE_CHALLENGES", True)
         )
-        self.challenge_timeout = (
-            challenge_timeout
-            if challenge_timeout is not None
-            else getattr(config, "LIVENESS_CHALLENGE_TIMEOUT", 5.0)
-        )
         self.head_turn_angle = (
             head_turn_angle
             if head_turn_angle is not None
@@ -372,8 +363,6 @@ class LivenessDetector:
         )
 
         # Validate challenge configuration
-        if self.challenge_timeout <= 0:
-            raise ValueError(f"challenge_timeout must be positive, got {self.challenge_timeout}")
         if self.head_turn_angle <= 0:
             raise ValueError(f"head_turn_angle must be positive, got {self.head_turn_angle}")
         if self.head_center_tolerance < 0:
@@ -438,7 +427,6 @@ class LivenessDetector:
         """Reset challenge state (Phase 3C)."""
         self._current_challenge = ChallengeType.NONE
         self._challenge_state = ChallengeState.INACTIVE
-        self._challenge_start_time = None
         self._challenge_frames_held = 0
         self._challenge_completed = False
 
@@ -466,19 +454,31 @@ class LivenessDetector:
         challenges = [ChallengeType.TURN_LEFT, ChallengeType.TURN_RIGHT]
         self._current_challenge = random.choice(challenges)
         self._challenge_state = ChallengeState.ACTIVE
-        self._challenge_start_time = time.time()
         self._challenge_frames_held = 0
         self._challenge_completed = False
 
         self.logger.info(f"New challenge started: {self._current_challenge.value}")
         return self._current_challenge
 
-    def get_challenge_time_remaining(self) -> float:
-        """Get remaining time for current challenge in seconds."""
-        if self._challenge_start_time is None:
-            return 0.0
-        elapsed = time.time() - self._challenge_start_time
-        return max(0.0, self.challenge_timeout - elapsed)
+    def get_challenge_progress(self) -> dict:
+        """
+        Get current challenge progress information for UI display (Phase 3C).
+
+        Returns:
+            dict with keys:
+                - challenge_type: str (current challenge name or 'none')
+                - challenge_state: str (state name)
+                - frames_held: int (frames held in target position)
+                - frames_required: int (frames required to complete)
+                - progress_percent: float (0.0 to 1.0)
+        """
+        return {
+            'challenge_type': self._current_challenge.value,
+            'challenge_state': self._challenge_state.value,
+            'frames_held': self._challenge_frames_held,
+            'frames_required': self.head_hold_frames,
+            'progress_percent': min(1.0, self._challenge_frames_held / self.head_hold_frames) if self.head_hold_frames > 0 else 0.0
+        }
 
     def _initialize_landmarker(self) -> None:
         """
@@ -748,14 +748,6 @@ class LivenessDetector:
         if self._challenge_state != ChallengeState.ACTIVE:
             return
 
-        # Check timeout
-        if self._challenge_start_time is not None:
-            elapsed = time.time() - self._challenge_start_time
-            if elapsed > self.challenge_timeout:
-                self._challenge_state = ChallengeState.TIMEOUT
-                self.logger.info(f"Challenge {self._current_challenge.value} timed out")
-                return
-
         # Estimate head pose
         yaw = self._estimate_head_yaw(frame, detected_face)
 
@@ -959,6 +951,7 @@ class LivenessDetector:
         Detect liveness across a sequence of frames (temporal analysis).
 
         Phase 3B implements blink detection through Eye Aspect Ratio (EAR) analysis.
+        Phase 3C adds active challenge-response verification.
         Tracks eye states across frames to detect complete blink cycles.
 
         Args:
@@ -966,7 +959,7 @@ class LivenessDetector:
             detected_faces: List of DetectedFace objects for each frame
 
         Returns:
-            LivenessResult based on temporal blink analysis
+            LivenessResult based on temporal blink analysis and challenge completion
 
         Raises:
             LivenessDetectionError: If inputs are invalid or mismatched
@@ -1016,6 +1009,7 @@ class LivenessDetector:
 
         # Reset temporal state for evaluating new batch sequence
         self._reset_temporal_state()
+        # Note: challenge state is NOT reset here - challenges persist across sequences
 
         frames_with_landmarks = 0
 
@@ -1024,11 +1018,12 @@ class LivenessDetector:
 
             if ear is None:
                 self.logger.debug(f"Frame {idx}: No valid landmarks or EAR calculation failed")
-                self.update_temporal_state(None)
+                self.update_temporal_state(None, frame, face)
                 continue
 
             frames_with_landmarks += 1
-            self._detect_blink_from_ear(ear)
+            # Update both blink detection and challenge progress
+            self.update_temporal_state(ear, frame, face)
 
         blinks_detected = self._blink_count
 
@@ -1040,6 +1035,24 @@ class LivenessDetector:
                 reason=f"Insufficient valid landmarks: {frames_with_landmarks}/{frame_count} frames"
             )
 
+        # Phase 3C: Check if challenges are required and validate completion
+        if self.require_challenge and self.enable_challenges:
+            return self._evaluate_liveness_with_challenge(blinks_detected, frame_count)
+        else:
+            # Phase 3B behavior: blink detection only
+            return self._evaluate_liveness_blink_only(blinks_detected, frame_count)
+
+    def _evaluate_liveness_blink_only(self, blinks_detected: int, frame_count: int) -> LivenessResult:
+        """
+        Evaluate liveness based on blink detection only (Phase 3B behavior).
+
+        Args:
+            blinks_detected: Number of blinks detected
+            frame_count: Total number of frames analyzed
+
+        Returns:
+            LivenessResult based on blink detection
+        """
         if blinks_detected >= self.min_blinks:
             confidence = min(
                 self.liveness_threshold + (blinks_detected - self.min_blinks) * 0.05,
@@ -1058,6 +1071,96 @@ class LivenessDetector:
                 frame_count=frame_count,
                 reason=f"Insufficient blinks: {blinks_detected} < {self.min_blinks} required"
             )
+
+    def _evaluate_liveness_with_challenge(self, blinks_detected: int, frame_count: int) -> LivenessResult:
+        """
+        Evaluate liveness based on both blink detection and challenge completion (Phase 3C).
+
+        Args:
+            blinks_detected: Number of blinks detected
+            frame_count: Total number of frames analyzed
+
+        Returns:
+            LivenessResult considering both blinks and challenge state
+        """
+        # Check blink requirement first
+        blink_passed = blinks_detected >= self.min_blinks
+
+        # Check challenge state
+        challenge_state = self._challenge_state
+
+        # Case 1: Challenge completed successfully + sufficient blinks = LIVE
+        if challenge_state == ChallengeState.COMPLETED and blink_passed:
+            confidence = min(
+                self.liveness_threshold + (blinks_detected - self.min_blinks) * 0.05 + 0.1,  # Bonus for challenge
+                1.0
+            )
+            return LivenessResult(
+                state=LivenessState.LIVE,
+                confidence=confidence,
+                frame_count=frame_count,
+                reason=f"Blinks: {blinks_detected}, Challenge: {self._current_challenge.value} completed"
+            )
+
+        # Case 2: Challenge completed but insufficient blinks - CRITICAL BUG FIX
+        if challenge_state == ChallengeState.COMPLETED and not blink_passed:
+            return LivenessResult(
+                state=LivenessState.UNKNOWN,
+                confidence=0.0,
+                frame_count=frame_count,
+                reason=f"Challenge completed but insufficient blinks: {blinks_detected} < {self.min_blinks} required"
+            )
+
+        # Case 3: Challenge failed - insufficient evidence
+        if challenge_state == ChallengeState.FAILED:
+            return LivenessResult(
+                state=LivenessState.UNKNOWN,
+                confidence=0.0,
+                frame_count=frame_count,
+                reason=f"Challenge {self._current_challenge.value} failed"
+            )
+
+        # Case 4: Challenge still active - insufficient evidence (need more frames)
+        if challenge_state == ChallengeState.ACTIVE:
+            if blink_passed:
+                return LivenessResult(
+                    state=LivenessState.UNKNOWN,
+                    confidence=0.0,
+                    frame_count=frame_count,
+                    reason=f"Blinks: {blinks_detected}, awaiting {self._current_challenge.value} challenge completion"
+                )
+            else:
+                return LivenessResult(
+                    state=LivenessState.UNKNOWN,
+                    confidence=0.0,
+                    frame_count=frame_count,
+                    reason=f"Insufficient blinks: {blinks_detected} < {self.min_blinks} required"
+                )
+
+        # Case 5: No challenge started yet - insufficient evidence
+        if challenge_state == ChallengeState.INACTIVE:
+            if blink_passed:
+                return LivenessResult(
+                    state=LivenessState.UNKNOWN,
+                    confidence=0.0,
+                    frame_count=frame_count,
+                    reason=f"Blinks: {blinks_detected}, challenge required but not started"
+                )
+            else:
+                return LivenessResult(
+                    state=LivenessState.UNKNOWN,
+                    confidence=0.0,
+                    frame_count=frame_count,
+                    reason=f"Insufficient blinks: {blinks_detected} < {self.min_blinks} required"
+                )
+
+        # Fallback - should never reach here but return UNKNOWN for safety
+        return LivenessResult(
+            state=LivenessState.UNKNOWN,
+            confidence=0.0,
+            frame_count=frame_count,
+            reason=f"Unexpected challenge state: {challenge_state}"
+        )
 
     def _validate_frame(self, frame: np.ndarray) -> None:
         """

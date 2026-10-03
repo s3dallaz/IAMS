@@ -14,6 +14,7 @@ will be added in Phase 3B/3C.
 
 import pytest
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 import numpy as np
@@ -1022,7 +1023,7 @@ class TestLivenessDetectionWithMockLandmarks:
     @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
     def test_sequence_with_blinks_returns_live(self, mock_extract):
         """Test that sequence with blinks returns LIVE."""
-        detector = LivenessDetector(min_frames=10, min_blinks=1)
+        detector = LivenessDetector(min_frames=10, min_blinks=1, enable_challenges=False)
 
         # Create sequence: open -> close -> open (one blink)
         frames = [self._create_test_frame() for _ in range(15)]
@@ -1079,7 +1080,7 @@ class TestLivenessDetectionWithMockLandmarks:
     @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
     def test_sequence_with_multiple_blinks(self, mock_extract):
         """Test sequence with multiple blinks increases confidence."""
-        detector = LivenessDetector(min_frames=20, min_blinks=1)
+        detector = LivenessDetector(min_frames=20, min_blinks=1, enable_challenges=False)
 
         frames = [self._create_test_frame() for _ in range(30)]
         faces = [self._create_test_face() for _ in range(30)]
@@ -1156,7 +1157,7 @@ class TestTemporalStateReset:
     @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
     def test_state_resets_between_sequences(self, mock_extract):
         """Test that temporal state resets between different sequences."""
-        detector = LivenessDetector(min_frames=10, min_blinks=1)
+        detector = LivenessDetector(min_frames=10, min_blinks=1, enable_challenges=False)
 
         # Mock landmarks for blink
         def mock_with_blink(frame, face):
@@ -1345,6 +1346,887 @@ class TestIncrementalAndStreaming:
         ear = detector.extract_ear(frame, face)
         assert ear is not None
         assert 0.7 < ear < 0.9
+
+
+# =============================================================================
+# Phase 3C Tests - Active Challenges and Anti-Spoofing
+# =============================================================================
+
+
+class TestPhase3CConfiguration:
+    """Test Phase 3C configuration parameters."""
+
+    def test_enable_challenges_default(self):
+        """Test enable_challenges uses config default."""
+        detector = LivenessDetector()
+        assert detector.enable_challenges == config.LIVENESS_ENABLE_ACTIVE_CHALLENGES
+
+    def test_enable_challenges_custom(self):
+        """Test enable_challenges can be customized."""
+        detector = LivenessDetector(enable_challenges=False)
+        assert detector.enable_challenges == False
+
+    def test_head_turn_angle_default(self):
+        """Test head_turn_angle uses config default."""
+        detector = LivenessDetector()
+        assert detector.head_turn_angle == config.LIVENESS_HEAD_TURN_ANGLE
+
+    def test_head_turn_angle_custom(self):
+        """Test head_turn_angle can be customized."""
+        detector = LivenessDetector(head_turn_angle=30.0)
+        assert detector.head_turn_angle == 30.0
+
+    def test_head_turn_angle_validation(self):
+        """Test head_turn_angle must be positive."""
+        with pytest.raises(ValueError, match="head_turn_angle must be positive"):
+            LivenessDetector(head_turn_angle=0.0)
+        
+        with pytest.raises(ValueError, match="head_turn_angle must be positive"):
+            LivenessDetector(head_turn_angle=-10.0)
+
+    def test_head_hold_frames_default(self):
+        """Test head_hold_frames uses config default."""
+        detector = LivenessDetector()
+        assert detector.head_hold_frames == config.LIVENESS_HEAD_HOLD_FRAMES
+
+    def test_head_hold_frames_custom(self):
+        """Test head_hold_frames can be customized."""
+        detector = LivenessDetector(head_hold_frames=5)
+        assert detector.head_hold_frames == 5
+
+    def test_head_hold_frames_validation(self):
+        """Test head_hold_frames must be at least 1."""
+        with pytest.raises(ValueError, match="head_hold_frames must be at least 1"):
+            LivenessDetector(head_hold_frames=0)
+
+    def test_require_challenge_default(self):
+        """Test require_challenge uses config default."""
+        detector = LivenessDetector()
+        assert detector.require_challenge == config.LIVENESS_REQUIRE_CHALLENGE
+
+    def test_require_challenge_custom(self):
+        """Test require_challenge can be customized."""
+        detector = LivenessDetector(require_challenge=False)
+        assert detector.require_challenge == False
+
+
+class TestChallengeEnums:
+    """Test Phase 3C challenge enums."""
+
+    def test_challenge_type_values(self):
+        """Test ChallengeType enum values."""
+        from src.computer_vision.liveness_detector import ChallengeType
+        
+        assert hasattr(ChallengeType, 'TURN_LEFT')
+        assert hasattr(ChallengeType, 'TURN_RIGHT')
+        assert hasattr(ChallengeType, 'NONE')
+        
+        assert ChallengeType.TURN_LEFT.value == "turn_left"
+        assert ChallengeType.TURN_RIGHT.value == "turn_right"
+        assert ChallengeType.NONE.value == "none"
+
+    def test_challenge_state_values(self):
+        """Test ChallengeState enum values."""
+        from src.computer_vision.liveness_detector import ChallengeState
+        
+        assert hasattr(ChallengeState, 'INACTIVE')
+        assert hasattr(ChallengeState, 'ACTIVE')
+        assert hasattr(ChallengeState, 'COMPLETED')
+        assert hasattr(ChallengeState, 'FAILED')
+
+
+class TestChallengeInitialization:
+    """Test challenge initialization and state management."""
+
+    def test_initial_challenge_state(self):
+        """Test challenge starts in INACTIVE state."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(enable_challenges=True)
+        
+        assert detector.current_challenge == ChallengeType.NONE
+        assert detector.challenge_state == ChallengeState.INACTIVE
+
+    def test_start_new_challenge_when_enabled(self):
+        """Test starting a new challenge when challenges are enabled."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(enable_challenges=True)
+        
+        challenge = detector.start_new_challenge()
+        
+        assert challenge in [ChallengeType.TURN_LEFT, ChallengeType.TURN_RIGHT]
+        assert detector.current_challenge == challenge
+        assert detector.challenge_state == ChallengeState.ACTIVE
+
+    def test_start_new_challenge_when_disabled(self):
+        """Test starting a challenge when challenges are disabled returns NONE."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(enable_challenges=False)
+        
+        challenge = detector.start_new_challenge()
+        
+        assert challenge == ChallengeType.NONE
+        assert detector.current_challenge == ChallengeType.NONE
+
+    def test_challenge_randomization(self):
+        """Test that challenges are randomized."""
+        from src.computer_vision.liveness_detector import ChallengeType
+        
+        detector = LivenessDetector(enable_challenges=True)
+        
+        # Start multiple challenges and check we get both types
+        challenges = set()
+        for _ in range(20):
+            detector.reset_temporal_state()
+            challenge = detector.start_new_challenge()
+            challenges.add(challenge)
+        
+        # Should have at least both types over 20 trials
+        assert len(challenges) >= 2
+        assert ChallengeType.TURN_LEFT in challenges or ChallengeType.TURN_RIGHT in challenges
+
+    def test_reset_temporal_state_resets_challenge(self):
+        """Test that reset_temporal_state also resets challenge state."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(enable_challenges=True)
+        detector.start_new_challenge()
+        
+        assert detector.challenge_state == ChallengeState.ACTIVE
+        
+        detector.reset_temporal_state()
+        
+        assert detector.current_challenge == ChallengeType.NONE
+        assert detector.challenge_state == ChallengeState.INACTIVE
+
+
+class TestHeadYawEstimation:
+    """Test head yaw estimation."""
+
+    def _create_test_frame(self):
+        """Helper to create a test frame."""
+        return np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+    def _create_test_face(self):
+        """Helper to create a test DetectedFace."""
+        return DetectedFace(bbox=(100, 100, 200, 200), confidence=0.95)
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_estimate_head_yaw_called_during_challenge(self, mock_yaw):
+        """Test that head yaw estimation is called during active challenge."""
+        from src.computer_vision.liveness_detector import ChallengeState
+        
+        mock_yaw.return_value = 0.0  # Center position
+        
+        detector = LivenessDetector(enable_challenges=True)
+        detector.start_new_challenge()
+        
+        frame = self._create_test_frame()
+        face = self._create_test_face()
+        
+        detector.update_temporal_state(0.30, frame, face)
+        
+        # Yaw estimation should be called
+        assert mock_yaw.called
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_turn_left_requires_negative_yaw(self, mock_yaw):
+        """Test that TURN_LEFT challenge requires negative yaw angle."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3
+        )
+        
+        # Force TURN_LEFT challenge
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        frame = self._create_test_frame()
+        face = self._create_test_face()
+        
+        # Test with insufficient left turn
+        mock_yaw.return_value = -15.0  # Not enough
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 0
+        
+        # Test with sufficient left turn
+        mock_yaw.return_value = -30.0  # Enough
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 1
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_turn_right_requires_positive_yaw(self, mock_yaw):
+        """Test that TURN_RIGHT challenge requires positive yaw angle."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3
+        )
+        
+        # Force TURN_RIGHT challenge
+        detector._current_challenge = ChallengeType.TURN_RIGHT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        frame = self._create_test_frame()
+        face = self._create_test_face()
+        
+        # Test with insufficient right turn
+        mock_yaw.return_value = 15.0  # Not enough
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 0
+        
+        # Test with sufficient right turn
+        mock_yaw.return_value = 30.0  # Enough
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 1
+
+
+class TestChallengeCompletion:
+    """Test challenge completion logic."""
+
+    def _create_test_frame(self):
+        """Helper to create a test frame."""
+        return np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+    def _create_test_face(self):
+        """Helper to create a test DetectedFace."""
+        return DetectedFace(bbox=(100, 100, 200, 200), confidence=0.95)
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_challenge_requires_hold_frames(self, mock_yaw):
+        """Test that challenge requires holding position for required frames."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3
+        )
+        
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        frame = self._create_test_frame()
+        face = self._create_test_face()
+        
+        mock_yaw.return_value = -30.0  # Correct position
+        
+        # Frame 1 - not complete yet
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector.challenge_state == ChallengeState.ACTIVE
+        assert detector._challenge_frames_held == 1
+        
+        # Frame 2 - still not complete
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector.challenge_state == ChallengeState.ACTIVE
+        assert detector._challenge_frames_held == 2
+        
+        # Frame 3 - now complete!
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector.challenge_state == ChallengeState.COMPLETED
+        assert detector._challenge_frames_held == 3
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_challenge_resets_on_lost_position(self, mock_yaw):
+        """Test that losing target position resets hold counter."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3
+        )
+        
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        frame = self._create_test_frame()
+        face = self._create_test_face()
+        
+        # Hold position for 2 frames
+        mock_yaw.return_value = -30.0
+        detector.update_temporal_state(0.30, frame, face)
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 2
+        
+        # Lose position
+        mock_yaw.return_value = -10.0  # Not enough
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 0  # Reset
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_challenge_resets_on_face_loss(self, mock_yaw):
+        """Test that losing face resets hold counter."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3
+        )
+        
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        frame = self._create_test_frame()
+        face = self._create_test_face()
+        
+        # Hold position for 2 frames
+        mock_yaw.return_value = -30.0
+        detector.update_temporal_state(0.30, frame, face)
+        detector.update_temporal_state(0.30, frame, face)
+        assert detector._challenge_frames_held == 2
+        
+        # Face lost (None EAR)
+        detector.update_temporal_state(None, frame, face)
+        assert detector._challenge_frames_held == 0  # Reset
+
+
+class TestChallengeProgress:
+    """Test challenge progress tracking."""
+
+    def test_get_challenge_progress_inactive(self):
+        """Test get_challenge_progress when challenge is inactive."""
+        detector = LivenessDetector(enable_challenges=True)
+        
+        progress = detector.get_challenge_progress()
+        
+        assert progress['challenge_type'] == 'none'
+        assert progress['challenge_state'] == 'inactive'
+        assert progress['frames_held'] == 0
+        assert progress['progress_percent'] == 0.0
+
+    def test_get_challenge_progress_active(self):
+        """Test get_challenge_progress when challenge is active."""
+        from src.computer_vision.liveness_detector import ChallengeType
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_hold_frames=5
+        )
+        
+        challenge = detector.start_new_challenge()
+        
+        progress = detector.get_challenge_progress()
+        
+        assert progress['challenge_type'] in ['turn_left', 'turn_right']
+        assert progress['challenge_state'] == 'active'
+        assert progress['frames_held'] == 0
+        assert progress['frames_required'] == 5
+        assert progress['progress_percent'] == 0.0
+
+    def test_get_challenge_progress_partial(self):
+        """Test get_challenge_progress with partial completion."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_hold_frames=5
+        )
+        
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 3
+        
+        progress = detector.get_challenge_progress()
+        
+        assert progress['frames_held'] == 3
+        assert progress['frames_required'] == 5
+        assert progress['progress_percent'] == 0.6  # 3/5
+
+
+class TestLivenessWithChallenges:
+    """Test liveness detection with challenge integration."""
+
+    def _create_test_frame(self):
+        """Helper to create a test frame."""
+        return np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+    def _create_test_face(self):
+        """Helper to create a test DetectedFace."""
+        return DetectedFace(bbox=(100, 100, 200, 200), confidence=0.95)
+
+    def _mock_landmarks_open_eyes(self):
+        """Create mock landmarks for open eyes."""
+        left_eye = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right_eye = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        return (left_eye, right_eye)
+
+    def _mock_landmarks_closed_eyes(self):
+        """Create mock landmarks for closed eyes."""
+        left_eye = [(33, 160), (35, 160), (37, 160), (39, 160), (37, 160), (35, 160)]
+        right_eye = [(200, 160), (202, 160), (204, 160), (206, 160), (204, 160), (202, 160)]
+        return (left_eye, right_eye)
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_liveness_without_challenges_returns_live_on_blinks(self, mock_extract):
+        """Test that with challenges disabled, blinks alone give LIVE result."""
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=False
+        )
+        
+        frames = [self._create_test_frame() for _ in range(15)]
+        faces = [self._create_test_face() for _ in range(15)]
+        
+        # Mock blink: frames 5-8 closed
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return self._mock_landmarks_closed_eyes()
+            else:
+                return self._mock_landmarks_open_eyes()
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        assert result.state == LivenessState.LIVE
+        assert "Blinks detected" in result.reason
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_liveness_with_challenges_requires_both_blink_and_challenge(self, mock_extract, mock_yaw):
+        """Test that with challenges required, must have both blinks and challenge completion."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True,
+            head_hold_frames=3
+        )
+        
+        # Start a TURN_LEFT challenge
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        frames = [self._create_test_frame() for _ in range(20)]
+        faces = [self._create_test_face() for _ in range(20)]
+        
+        # Mock blink in frames 5-8
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return self._mock_landmarks_closed_eyes()
+            else:
+                return self._mock_landmarks_open_eyes()
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        # Mock head turn in frames 12-15
+        def mock_yaw_value(frame, face):
+            call_count = mock_yaw.call_count
+            if 12 <= call_count <= 15:
+                return -30.0  # Left turn
+            else:
+                return 0.0
+        
+        mock_yaw.side_effect = mock_yaw_value
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # Should be LIVE with both blinks and challenge completed
+        assert result.state == LivenessState.LIVE
+        assert "Challenge" in result.reason
+        assert "completed" in result.reason.lower()
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_liveness_with_challenges_returns_unknown_without_challenge(self, mock_extract):
+        """Test that with challenge required but not completed, returns UNKNOWN."""
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True
+        )
+        
+        # Challenge not started
+        assert detector.challenge_state.value == 'inactive'
+        
+        frames = [self._create_test_frame() for _ in range(15)]
+        faces = [self._create_test_face() for _ in range(15)]
+        
+        # Mock blink
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return self._mock_landmarks_closed_eyes()
+            else:
+                return self._mock_landmarks_open_eyes()
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # Should be UNKNOWN because challenge not completed
+        assert result.state == LivenessState.UNKNOWN
+        assert "challenge" in result.reason.lower()
+
+
+class TestPhase3CBackwardCompatibility:
+    """Test backward compatibility with Phase 3A and 3B."""
+
+    def _create_test_frame(self):
+        """Helper to create a test frame."""
+        return np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+    def _create_test_face(self):
+        """Helper to create a test DetectedFace."""
+        return DetectedFace(bbox=(100, 100, 200, 200), confidence=0.95)
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_phase_3b_behavior_preserved_when_challenges_disabled(self, mock_extract):
+        """Test that Phase 3B behavior is preserved when challenges are disabled."""
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=False  # Phase 3B mode
+        )
+        
+        frames = [self._create_test_frame() for _ in range(15)]
+        faces = [self._create_test_face() for _ in range(15)]
+        
+        # Mock blink
+        left = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        open_eyes = (left, right)
+        
+        left_closed = [(33, 160), (35, 160), (37, 160), (39, 160), (37, 160), (35, 160)]
+        right_closed = [(200, 160), (202, 160), (204, 160), (206, 160), (204, 160), (202, 160)]
+        closed_eyes = (left_closed, right_closed)
+        
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return closed_eyes
+            else:
+                return open_eyes
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # Phase 3B behavior: LIVE based on blinks alone
+        assert result.state == LivenessState.LIVE
+        assert "Blinks detected" in result.reason
+
+
+class TestBlinkBugRegression:
+    """Regression tests for the critical blink requirement bug."""
+
+    def _create_test_frame(self):
+        """Helper to create a test frame."""
+        return np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+    def _create_test_face(self):
+        """Helper to create a test DetectedFace."""
+        return DetectedFace(bbox=(100, 100, 200, 200), confidence=0.95)
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_challenge_completed_without_blink_must_not_be_live(self, mock_extract, mock_yaw):
+        """CRITICAL BUG TEST: Challenge completes with zero blinks -> result must NOT be LIVE."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True,
+            head_hold_frames=3
+        )
+        
+        frames = [self._create_test_frame() for _ in range(20)]
+        faces = [self._create_test_face() for _ in range(20)]
+        
+        # Mock: eyes ALWAYS open (NO blinks)
+        left = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        mock_extract.return_value = (left, right)
+        
+        # Mock: head turn completes - simulate left turn completing in frames 10-13
+        call_counter = {'count': 0}
+        def mock_yaw_value(frame, face):
+            call_counter['count'] += 1
+            if 10 <= call_counter['count'] <= 13:
+                return -30.0  # Left turn
+            else:
+                return 0.0
+        
+        mock_yaw.side_effect = mock_yaw_value
+        
+        # Start the challenge before calling detect_liveness_sequence
+        # Note: detect_liveness_sequence calls _reset_temporal_state but NOT _reset_challenge_state
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        detector._challenge_frames_held = 0
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # CRITICAL: Must NOT be LIVE because blink requirement not satisfied
+        assert result is not None, "Result should not be None"
+        assert result.state == LivenessState.UNKNOWN, f"Expected UNKNOWN but got {result.state}"
+        assert result.state != LivenessState.LIVE, "Must NOT be LIVE without blinks"
+        # Should indicate challenge completed but insufficient blinks
+        assert detector.challenge_state == ChallengeState.COMPLETED, f"Challenge should be COMPLETED but is {detector.challenge_state}"
+        assert detector.blink_count == 0, f"Expected 0 blinks but got {detector.blink_count}"
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_blink_satisfied_without_challenge_must_not_be_live(self, mock_extract, mock_yaw):
+        """Blink requirement satisfied but challenge incomplete -> result must NOT be LIVE."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True,
+            head_hold_frames=3
+        )
+        
+        # Start challenge
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        
+        frames = [self._create_test_frame() for _ in range(20)]
+        faces = [self._create_test_face() for _ in range(20)]
+        
+        # Mock: blink occurs in frames 5-8
+        left_open = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right_open = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        left_closed = [(33, 160), (35, 160), (37, 160), (39, 160), (37, 160), (35, 160)]
+        right_closed = [(200, 160), (202, 160), (204, 160), (206, 160), (204, 160), (202, 160)]
+        
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return (left_closed, right_closed)
+            else:
+                return (left_open, right_open)
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        # Mock: head NEVER turns enough (challenge incomplete)
+        mock_yaw.return_value = -10.0  # Not enough
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # CRITICAL: Must NOT be LIVE because challenge not completed
+        assert result.state == LivenessState.UNKNOWN
+        assert result.state != LivenessState.LIVE
+        # Blinks should be detected but challenge still active
+        assert detector.blink_count >= 1
+        assert detector.challenge_state == ChallengeState.ACTIVE
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_both_requirements_satisfied_must_be_live(self, mock_extract, mock_yaw):
+        """Both blink AND challenge completed -> result must be LIVE."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True,
+            head_hold_frames=3
+        )
+        
+        # Start challenge
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        
+        frames = [self._create_test_frame() for _ in range(20)]
+        faces = [self._create_test_face() for _ in range(20)]
+        
+        # Mock: blink occurs in frames 5-8
+        left_open = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right_open = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        left_closed = [(33, 160), (35, 160), (37, 160), (39, 160), (37, 160), (35, 160)]
+        right_closed = [(200, 160), (202, 160), (204, 160), (206, 160), (204, 160), (202, 160)]
+        
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return (left_closed, right_closed)
+            else:
+                return (left_open, right_open)
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        # Mock: head turn completes in frames 12-15
+        def mock_yaw_value(frame, face):
+            call_count = mock_yaw.call_count
+            if 12 <= call_count <= 15:
+                return -30.0  # Left turn
+            else:
+                return 0.0
+        
+        mock_yaw.side_effect = mock_yaw_value
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # CORRECT: Should be LIVE with both requirements satisfied
+        assert result.state == LivenessState.LIVE
+        assert detector.blink_count >= 1
+        assert detector.challenge_state == ChallengeState.COMPLETED
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_challenge_first_then_blink_becomes_live(self, mock_extract, mock_yaw):
+        """Challenge completes first, then blink occurs -> final result becomes LIVE."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True,
+            head_hold_frames=3
+        )
+        
+        # Start challenge
+        detector._current_challenge = ChallengeType.TURN_RIGHT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        
+        frames = [self._create_test_frame() for _ in range(25)]
+        faces = [self._create_test_face() for _ in range(25)]
+        
+        # Mock: blink occurs AFTER challenge (frames 18-21)
+        left_open = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right_open = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        left_closed = [(33, 160), (35, 160), (37, 160), (39, 160), (37, 160), (35, 160)]
+        right_closed = [(200, 160), (202, 160), (204, 160), (206, 160), (204, 160), (202, 160)]
+        
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 18 <= call_count <= 21:
+                return (left_closed, right_closed)
+            else:
+                return (left_open, right_open)
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        # Mock: head turn completes EARLY in frames 5-8
+        def mock_yaw_value(frame, face):
+            call_count = mock_yaw.call_count
+            if 5 <= call_count <= 8:
+                return 30.0  # Right turn
+            else:
+                return 0.0
+        
+        mock_yaw.side_effect = mock_yaw_value
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # Should be LIVE because both requirements eventually satisfied
+        assert result.state == LivenessState.LIVE
+        assert detector.blink_count >= 1
+        assert detector.challenge_state == ChallengeState.COMPLETED
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._extract_eye_landmarks')
+    def test_blink_first_then_challenge_becomes_live(self, mock_extract, mock_yaw):
+        """Blink occurs first, then challenge completes -> final result becomes LIVE."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True,
+            head_hold_frames=3
+        )
+        
+        # Start challenge
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state = ChallengeState.ACTIVE
+
+        
+        frames = [self._create_test_frame() for _ in range(25)]
+        faces = [self._create_test_face() for _ in range(25)]
+        
+        # Mock: blink occurs EARLY (frames 5-8)
+        left_open = [(33, 160), (35, 155), (37, 155), (39, 160), (37, 165), (35, 165)]
+        right_open = [(200, 160), (202, 155), (204, 155), (206, 160), (204, 165), (202, 165)]
+        left_closed = [(33, 160), (35, 160), (37, 160), (39, 160), (37, 160), (35, 160)]
+        right_closed = [(200, 160), (202, 160), (204, 160), (206, 160), (204, 160), (202, 160)]
+        
+        def mock_landmarks(frame, face):
+            call_count = mock_extract.call_count
+            if 5 <= call_count <= 8:
+                return (left_closed, right_closed)
+            else:
+                return (left_open, right_open)
+        
+        mock_extract.side_effect = mock_landmarks
+        
+        # Mock: head turn completes LATER in frames 18-21
+        def mock_yaw_value(frame, face):
+            call_count = mock_yaw.call_count
+            if 18 <= call_count <= 21:
+                return -30.0  # Left turn
+            else:
+                return 0.0
+        
+        mock_yaw.side_effect = mock_yaw_value
+        
+        result = detector.detect_liveness_sequence(frames, faces)
+        
+        # Should be LIVE because both requirements eventually satisfied
+        assert result.state == LivenessState.LIVE
+        assert detector.blink_count >= 1
+        assert detector.challenge_state == ChallengeState.COMPLETED
+
+    def test_challenge_state_completed_alone_not_sufficient(self):
+        """ChallengeState.COMPLETED alone must NOT indicate overall test completion."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+        
+        detector = LivenessDetector(
+            min_frames=10,
+            min_blinks=1,
+            enable_challenges=True,
+            require_challenge=True
+        )
+        
+        # Simulate challenge completion without blinks
+        detector._challenge_state = ChallengeState.COMPLETED
+        detector._challenge_completed = True
+        detector._blink_count = 0  # NO blinks
+        
+        # Challenge state is COMPLETED but blink requirement not met
+        assert detector.challenge_state == ChallengeState.COMPLETED
+        assert detector.blink_count < 1
+        
+        # This state should NOT be considered overall LIVE
+        # The evaluation logic must check BOTH conditions
 
 
 # Run tests if executed directly

@@ -52,7 +52,7 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["Home", "Student Registry"],
+        ["Home", "Student Registry", "Liveness Test"],
         key="navigation"
     )
     
@@ -61,6 +61,8 @@ def main():
         render_home_page()
     elif page == "Student Registry":
         render_student_registry_page()
+    elif page == "Liveness Test":
+        render_liveness_test_page()
 
 
 def render_home_page():
@@ -171,6 +173,12 @@ def render_student_registry_page():
     """Render the Student Registry page."""
     from src.ui.pages.student_registry import render_student_registry
     render_student_registry()
+
+
+def render_liveness_test_page():
+    """Render the Liveness Test page."""
+    from src.ui.pages.liveness_test import render_liveness_test
+    render_liveness_test()
 
 
 if __name__ == "__main__":
