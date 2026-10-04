@@ -4,3 +4,9 @@ Repository layer for database persistence operations.
 This package contains repository classes that provide clean database access
 without business logic.
 """
+
+from src.data.repositories.student_repository import StudentRepository
+from src.data.repositories.session_repository import SessionRepository
+from src.data.repositories.attendance_repository import AttendanceRepository
+
+__all__ = ['StudentRepository', 'SessionRepository', 'AttendanceRepository']

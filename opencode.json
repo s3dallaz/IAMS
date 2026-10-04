@@ -18,6 +18,11 @@
         "auto/cheap": {
           "name": "Auto — Cheap"
         },
+
+	"Ze2by": {
+  	"name": "Ze2by"
+	},
+
         "auto/fast": {
           "name": "Auto — Fast"
         },
@@ -57,7 +62,7 @@
 
     "build": {
       "mode": "primary",
-      "model": "omniroute/kr/claude-sonnet-4.5",
+      "model": "omniroute/Ze2by",
       "permission": {
         "edit": "allow",
         "bash": "ask"
