@@ -8,5 +8,7 @@ without business logic.
 from src.data.repositories.student_repository import StudentRepository
 from src.data.repositories.session_repository import SessionRepository
 from src.data.repositories.attendance_repository import AttendanceRepository
+from src.data.repositories.enrollment_repository import EnrollmentRepository
 
-__all__ = ['StudentRepository', 'SessionRepository', 'AttendanceRepository']
+__all__ = ['StudentRepository', 'SessionRepository', 'AttendanceRepository', 'EnrollmentRepository']
+

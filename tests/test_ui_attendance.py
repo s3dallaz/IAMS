@@ -243,3 +243,46 @@ def test_render_realtime_attendance_no_sessions(mock_get_sessions):
          patch("streamlit.session_state", {}):
         render_realtime_attendance()
         mock_warning.assert_called_once()
+
+
+@patch("src.ui.pages.student_registry.render_face_dataset_tab")
+def test_render_student_registry_manage_face_active(mock_render_face):
+    """Test that student registry directly renders Manage Face when student ID is in session state."""
+    from src.ui.pages.student_registry import render_student_registry
+    
+    fake_state = {'manage_face_student_id': 1}
+    with patch("streamlit.session_state", fake_state), \
+         patch("streamlit.button") as mock_btn:
+        mock_btn.return_value = False
+        render_student_registry()
+        mock_render_face.assert_called_once()
+
+
+@patch("src.ui.pages.student_registry.render_edit_student_tab")
+def test_render_student_registry_edit_profile_active(mock_render_edit):
+    """Test that student registry directly renders Edit Profile when student ID is in session state."""
+    from src.ui.pages.student_registry import render_student_registry
+    
+    fake_state = {'edit_student_id': 1}
+    with patch("streamlit.session_state", fake_state), \
+         patch("streamlit.button") as mock_btn:
+        mock_btn.return_value = False
+        render_student_registry()
+        mock_render_edit.assert_called_once()
+
+
+@patch("streamlit.tabs")
+def test_render_student_registry_default_tabs(mock_tabs):
+    """Test that student registry renders standard tabs when no specific student action is active."""
+    from src.ui.pages.student_registry import render_student_registry
+    
+    mock_tabs.return_value = [MagicMock(), MagicMock(), MagicMock(), MagicMock()]
+    fake_state = {'manage_face_student_id': None, 'edit_student_id': None}
+    
+    with patch("streamlit.session_state", fake_state), \
+         patch("src.ui.pages.student_registry.render_student_list_tab"), \
+         patch("src.ui.pages.student_registry.render_add_student_tab"), \
+         patch("src.ui.pages.student_registry.render_face_dataset_tab"), \
+         patch("src.ui.pages.student_registry.render_edit_student_tab"):
+        render_student_registry()
+        mock_tabs.assert_called_once()

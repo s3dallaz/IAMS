@@ -141,8 +141,8 @@ def test_record_attendance_without_marked_at_uses_current_time(attendance_servic
     
     # Verify it's a reasonable timestamp (not in distant past or future)
     # Should be within 1 day of 2026-10-04
-    reference_date = datetime(2026, 10, 4)
-    assert abs((marked_time - reference_date).days) < 1
+    reference_date = datetime.now()
+    assert abs((marked_time - reference_date).total_seconds()) < 86400
 
 
 # ============================================================================

@@ -33,6 +33,7 @@ from src.services.real_time_attendance_service import (
 from src.services.session_service import SessionService, SessionStatus
 from src.services.attendance_service import AttendanceService, AttendanceStatus
 from src.services.student_service import StudentService
+from src.services.enrollment_service import EnrollmentService
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -131,6 +132,11 @@ def render_realtime_attendance():
             if st.button("⏹️ Close Session", use_container_width=True):
                 try:
                     session_service.close_session(selected_session_id)
+                    if st.session_state.att_camera_manager is not None:
+                        st.session_state.att_camera_manager.release()
+                        st.session_state.att_camera_manager = None
+                    st.session_state.att_camera_active = False
+                    st.session_state.att_rt_manager = None
                     st.success(f"Session #{selected_session_id} closed!")
                     st.rerun()
                 except Exception as e:
@@ -236,6 +242,9 @@ def _run_realtime_attendance_stream(
             cooldown_seconds=cooldown_seconds,
             marked_by="cv_realtime"
         )
+        enrollment_service = EnrollmentService()
+        gallery = enrollment_service.load_active_gallery()
+        rt_manager.set_gallery(gallery)
         st.session_state.att_rt_manager = rt_manager
     else:
         rt_manager = st.session_state.att_rt_manager

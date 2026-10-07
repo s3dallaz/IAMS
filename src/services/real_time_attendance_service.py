@@ -30,6 +30,7 @@ from src.services.attendance_service import (
 )
 from src.services.session_service import SessionService, SessionStatus
 from src.services.student_service import StudentService
+from src.services.enrollment_service import EnrollmentService
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
