@@ -151,7 +151,13 @@ class StudentService:
                 department=department,
                 notes=notes
             )
-            logger.info(f"Student created successfully: {student_id} (DB ID: {student_db_id})")
+            
+            # Post-insert verification: Confirm record was written and committed to SQLite
+            saved_student = self.repository.get_by_id(student_db_id)
+            if not saved_student or saved_student['student_id'] != student_id:
+                raise StudentServiceError(f"Database insertion verification failed for student ID '{student_id}'.")
+                
+            logger.info(f"Student created and verified successfully: {student_id} (DB ID: {student_db_id})")
             return student_db_id
             
         except sqlite3.IntegrityError as e:
@@ -411,6 +417,34 @@ class StudentService:
         if rows_affected > 0:
             logger.info(f"Student DB ID {student_db_id} deactivated successfully")
         
+        return rows_affected
+
+    def delete_student(self, student_db_id: int) -> int:
+        """
+        Delete a student from the database.
+        
+        Args:
+            student_db_id: Database primary key
+            
+        Returns:
+            Number of rows affected (1 if deleted, 0 if not found)
+            
+        Raises:
+            InvalidStudentDataError: If student_db_id is invalid
+            StudentNotFoundError: If student does not exist
+        """
+        if not isinstance(student_db_id, int) or student_db_id <= 0:
+            raise InvalidStudentDataError("student_db_id must be a positive integer")
+            
+        existing_student = self.repository.get_by_id(student_db_id)
+        if not existing_student:
+            raise StudentNotFoundError(f"Student with DB ID {student_db_id} not found")
+            
+        rows_affected = self.repository.delete_student(student_db_id)
+        
+        if rows_affected > 0:
+            logger.info(f"Student DB ID {student_db_id} deleted successfully")
+            
         return rows_affected
 
 

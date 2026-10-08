@@ -245,44 +245,155 @@ def test_render_realtime_attendance_no_sessions(mock_get_sessions):
         mock_warning.assert_called_once()
 
 
-@patch("src.ui.pages.student_registry.render_face_dataset_tab")
+@patch("src.ui.pages.student_registry.render_manage_face_view")
 def test_render_student_registry_manage_face_active(mock_render_face):
-    """Test that student registry directly renders Manage Face when student ID is in session state."""
+    """Test that student registry directly renders Manage Face when view is manage_face."""
     from src.ui.pages.student_registry import render_student_registry
     
-    fake_state = {'manage_face_student_id': 1}
-    with patch("streamlit.session_state", fake_state), \
-         patch("streamlit.button") as mock_btn:
-        mock_btn.return_value = False
+    fake_state = {'current_view': 'manage_face', 'selected_student_id': 1}
+    with patch("streamlit.session_state", fake_state):
         render_student_registry()
-        mock_render_face.assert_called_once()
+        mock_render_face.assert_called_once_with(mock_render_face.call_args[0][0], mock_render_face.call_args[0][1], 1)
 
 
-@patch("src.ui.pages.student_registry.render_edit_student_tab")
+@patch("src.ui.pages.student_registry.render_edit_student_view")
 def test_render_student_registry_edit_profile_active(mock_render_edit):
-    """Test that student registry directly renders Edit Profile when student ID is in session state."""
+    """Test that student registry directly renders Edit Profile when view is edit."""
     from src.ui.pages.student_registry import render_student_registry
     
-    fake_state = {'edit_student_id': 1}
+    fake_state = {'current_view': 'edit', 'selected_student_id': 1}
+    with patch("streamlit.session_state", fake_state):
+        render_student_registry()
+        mock_render_edit.assert_called_once_with(mock_render_edit.call_args[0][0], 1)
+
+
+@patch("src.ui.pages.student_registry.render_directory_view")
+def test_render_student_registry_default_directory(mock_dir):
+    """Test that student registry renders directory view when view is directory."""
+    from src.ui.pages.student_registry import render_student_registry
+    
+    fake_state = {'current_view': 'directory', 'selected_student_id': None}
+    with patch("streamlit.session_state", fake_state):
+        render_student_registry()
+        mock_dir.assert_called_once()
+
+
+def test_release_registration_camera_cleans_up():
+    """Test that release_registration_camera releases camera and resets state."""
+    from src.ui.pages.student_registry import release_registration_camera
+    
+    mock_cam = MagicMock()
+    fake_state = {
+        'reg_cam_manager': mock_cam,
+        'reg_cam_active': True,
+        'captured_photo_preview': np.zeros((10, 10, 3), dtype=np.uint8)
+    }
+    
+    with patch("streamlit.session_state", fake_state):
+        release_registration_camera()
+        mock_cam.release.assert_called_once()
+        assert fake_state['reg_cam_manager'] is None
+        assert fake_state['reg_cam_active'] is False
+        assert fake_state['captured_photo_preview'] is None
+
+
+@patch("streamlit.radio")
+@patch("src.services.enrollment_service.EnrollmentService.get_student_samples_count")
+@patch("src.services.student_service.StudentService.get_student_by_id")
+@patch("src.services.student_service.StudentService.get_all_students")
+def test_manage_face_camera_off_by_default(mock_get_all, mock_get_by_id, mock_get_count, mock_radio):
+    """Test that opening Manage Face has camera OFF by default and shows Start Camera button."""
+    from src.ui.pages.student_registry import render_manage_face_view
+    
+    mock_get_all.return_value = [{'id': 1, 'student_id': '2021001', 'name': 'John Doe'}]
+    mock_get_by_id.return_value = {'id': 1, 'student_id': '2021001', 'name': 'John Doe', 'department': 'CS'}
+    mock_get_count.return_value = 0
+    mock_radio.return_value = "📹 Take Photo with Live Camera"
+    
+    fake_state = {
+        'selected_student_id': 1,
+        'reg_cam_active': False,
+        'reg_cam_manager': None,
+        'captured_photo_preview': None,
+        'confirm_reset_face_id': None
+    }
+    
+    mock_student_svc = MagicMock()
+    mock_student_svc.get_all_students.return_value = [{'id': 1, 'student_id': '2021001', 'name': 'John Doe'}]
+    mock_student_svc.get_student_by_id.return_value = {'id': 1, 'student_id': '2021001', 'name': 'John Doe', 'department': 'CS'}
+    mock_enroll_svc = MagicMock()
+    mock_enroll_svc.get_student_samples_count.return_value = 0
+    
     with patch("streamlit.session_state", fake_state), \
          patch("streamlit.button") as mock_btn:
         mock_btn.return_value = False
-        render_student_registry()
-        mock_render_edit.assert_called_once()
+        render_manage_face_view(mock_student_svc, mock_enroll_svc, 1)
+        assert fake_state['reg_cam_active'] is False
+        assert fake_state['reg_cam_manager'] is None
 
 
-@patch("streamlit.tabs")
-def test_render_student_registry_default_tabs(mock_tabs):
-    """Test that student registry renders standard tabs when no specific student action is active."""
-    from src.ui.pages.student_registry import render_student_registry
+@patch("streamlit.radio")
+@patch("streamlit.image")
+def test_manage_face_photo_preview_approval_workflow(mock_img, mock_radio):
+    """Test that captured photo is frozen for approval and camera stays active."""
+    from src.ui.pages.student_registry import render_manage_face_view
     
-    mock_tabs.return_value = [MagicMock(), MagicMock(), MagicMock(), MagicMock()]
-    fake_state = {'manage_face_student_id': None, 'edit_student_id': None}
+    mock_radio.return_value = "📹 Take Photo with Live Camera"
+    dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    mock_cam = MagicMock()
+    mock_cam.is_open.return_value = True
+    
+    fake_state = {
+        'selected_student_id': 1,
+        'reg_cam_active': True,
+        'reg_cam_manager': mock_cam,
+        'captured_photo_preview': dummy_frame,
+        'confirm_reset_face_id': None
+    }
+    
+    mock_student_svc = MagicMock()
+    mock_student_svc.get_all_students.return_value = [{'id': 1, 'student_id': '2021001', 'name': 'John Doe'}]
+    mock_student_svc.get_student_by_id.return_value = {'id': 1, 'student_id': '2021001', 'name': 'John Doe', 'department': 'CS'}
+    mock_enroll_svc = MagicMock()
+    mock_enroll_svc.get_student_samples_count.return_value = 0
     
     with patch("streamlit.session_state", fake_state), \
-         patch("src.ui.pages.student_registry.render_student_list_tab"), \
-         patch("src.ui.pages.student_registry.render_add_student_tab"), \
-         patch("src.ui.pages.student_registry.render_face_dataset_tab"), \
-         patch("src.ui.pages.student_registry.render_edit_student_tab"):
-        render_student_registry()
-        mock_tabs.assert_called_once()
+         patch("streamlit.button") as mock_btn:
+        mock_btn.return_value = False
+        render_manage_face_view(mock_student_svc, mock_enroll_svc, 1)
+        # Image was rendered for user review
+        mock_img.assert_called_once()
+        # Camera was NOT released
+        mock_cam.release.assert_not_called()
+        assert fake_state['reg_cam_active'] is True
+
+
+def test_manage_face_reset_confirmation_warning():
+    """Test that reset face dataset requires confirmation and does not delete immediately."""
+    from src.ui.pages.student_registry import render_manage_face_view
+    
+    mock_student_svc = MagicMock()
+    mock_student_svc.get_all_students.return_value = [{'id': 1, 'student_id': '2021001', 'name': 'John Doe'}]
+    mock_student_svc.get_student_by_id.return_value = {'id': 1, 'student_id': '2021001', 'name': 'John Doe', 'department': 'CS'}
+    mock_enroll_svc = MagicMock()
+    mock_enroll_svc.get_student_samples_count.return_value = 3
+    
+    # State with confirmation active
+    fake_state = {
+        'selected_student_id': 1,
+        'confirm_reset_face_id': 1,
+        'reg_cam_active': False,
+        'reg_cam_manager': None,
+        'captured_photo_preview': None
+    }
+    
+    with patch("streamlit.session_state", fake_state), \
+         patch("streamlit.warning") as mock_warn, \
+         patch("streamlit.button") as mock_btn, \
+         patch("streamlit.radio"):
+        mock_btn.return_value = False
+        render_manage_face_view(mock_student_svc, mock_enroll_svc, 1)
+        # Warning shown
+        mock_warn.assert_called_once()
+        # Not deleted without explicit confirmation click
+        mock_enroll_svc.clear_student_face_dataset.assert_not_called()

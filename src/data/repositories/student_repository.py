@@ -311,6 +311,34 @@ class StudentRepository:
             logger.error(f"Database error checking student existence: {e}")
             raise
 
+    def delete_student(self, student_db_id: int) -> int:
+        """
+        Delete a student by database ID.
+        
+        Foreign key ON DELETE CASCADE will clean up enrollments and attendance records.
+        
+        Args:
+            student_db_id: Database primary key
+            
+        Returns:
+            Number of rows affected (1 if deleted, 0 if not found)
+        """
+        query = "DELETE FROM students WHERE id = ?"
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, (student_db_id,))
+                rows_affected = cursor.rowcount
+                if rows_affected > 0:
+                    logger.info(f"Deleted student DB ID {student_db_id}")
+                else:
+                    logger.warning(f"Student DB ID {student_db_id} not found for deletion")
+                return rows_affected
+        except sqlite3.Error as e:
+            logger.error(f"Database error deleting student {student_db_id}: {e}")
+            raise
+
 
 if __name__ == "__main__":
     # Simple manual test

@@ -56,7 +56,8 @@ def main():
             "Home",
             "Real-Time Attendance",
             "Session Management",
-            "Student Registry"
+            "Student Registry",
+            "Statistics & Reports"
         ],
         key="navigation"
     )
@@ -70,6 +71,8 @@ def main():
         render_session_management_page()
     elif page == "Student Registry":
         render_student_registry_page()
+    elif page == "Statistics & Reports":
+        render_statistics_reports_page()
 
 
 def render_home_page():
@@ -192,6 +195,12 @@ def render_realtime_attendance_page():
     """Render the Real-Time Attendance page."""
     from src.ui.pages.realtime_attendance import render_realtime_attendance
     render_realtime_attendance()
+
+
+def render_statistics_reports_page():
+    """Render the Statistics & Reports page."""
+    from src.ui.pages.statistics_reports import render_statistics_reports_page
+    render_statistics_reports_page()
 
 
 if __name__ == "__main__":

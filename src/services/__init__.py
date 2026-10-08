@@ -19,6 +19,8 @@ from src.services.real_time_attendance_service import (
     FaceProcessingResult,
     RealTimeAttendanceError
 )
+from src.services.statistics_service import StatisticsService
+from src.services.report_service import ReportService
 
 __all__ = [
     'StudentService',
@@ -33,7 +35,9 @@ __all__ = [
     'RealTimeAttendanceService',
     'RealTimeAttendanceResult',
     'FaceProcessingResult',
-    'RealTimeAttendanceError'
+    'RealTimeAttendanceError',
+    'StatisticsService',
+    'ReportService'
 ]
 
 
