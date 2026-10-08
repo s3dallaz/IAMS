@@ -231,6 +231,27 @@ class AnalyticsRepository:
             logger.error(f"Database error getting course attendance summary: {e}")
             raise
 
+    def get_attendance_trend(self) -> List[Dict[str, Any]]:
+        """Return recorded present/late counts grouped by marked date."""
+        query = """
+            SELECT
+                DATE(marked_at) AS attendance_date,
+                COUNT(*) AS total_marked,
+                SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present_count,
+                SUM(CASE WHEN status = 'late' THEN 1 ELSE 0 END) AS late_count
+            FROM attendance_records
+            GROUP BY DATE(marked_at)
+            ORDER BY attendance_date ASC
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting attendance trend: {e}")
+            raise
+
     def get_filtered_attendance_history(
         self,
         student_id_str: Optional[str] = None,

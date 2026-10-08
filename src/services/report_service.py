@@ -132,11 +132,11 @@ class ReportService:
         writer.writerow(["Student ID", student_stats.get('student_id', '')])
         writer.writerow(["Student Name", student_stats.get('name', '')])
         writer.writerow(["Department", student_stats.get('department', '')])
-        writer.writerow(["Total Sessions", student_stats.get('total_sessions', 0)])
+        writer.writerow(["Sessions With Attendance Records", student_stats.get('total_sessions', 0)])
         writer.writerow(["Present Count", student_stats.get('present_count', 0)])
         writer.writerow(["Late Count", student_stats.get('late_count', 0)])
-        writer.writerow(["Absent Count", student_stats.get('absent_count', 0)])
-        writer.writerow(["Attendance Rate", f"{student_stats.get('attendance_percentage', 0)}%"])
+        writer.writerow(["Absences", "Not available: no session roster is recorded"])
+        writer.writerow(["Attendance Rate", "Not available: no session roster is recorded"])
         writer.writerow([])
         
         # History Table
@@ -172,12 +172,12 @@ class ReportService:
         writer.writerow(["Course Code", session_stats.get('course_code', '')])
         writer.writerow(["Start Time", session_stats.get('start_time', '')])
         writer.writerow(["Status", session_stats.get('status', '').upper()])
-        writer.writerow(["Expected Students", session_stats.get('expected_students', 0)])
+        writer.writerow(["Expected Students", "Not available: no session roster is recorded"])
         writer.writerow(["Total Marked", session_stats.get('total_marked', 0)])
         writer.writerow(["Present Count", session_stats.get('present_count', 0)])
         writer.writerow(["Late Count", session_stats.get('late_count', 0)])
-        writer.writerow(["Absent Count", session_stats.get('absent_count', 0)])
-        writer.writerow(["Attendance Rate", f"{session_stats.get('attendance_percentage', 0)}%"])
+        writer.writerow(["Absences", "Not available: no session roster is recorded"])
+        writer.writerow(["Attendance Rate", "Not available: no session roster is recorded"])
         writer.writerow([])
         
         writer.writerow(["Student ID", "Student Name", "Department", "Marked Time", "Status", "Confidence", "Liveness", "Marked By"])
@@ -220,41 +220,40 @@ class ReportService:
         pdf.set_xy(pdf.l_margin + 4, pdf.get_y() + 3)
         pdf.set_font('Helvetica', 'B', 10)
         pdf.set_text_color(15, 23, 42)
-        pdf.cell(40, 6, "Student Name:", 0, 0)
+        pdf.cell(40, 6, "Student Name:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(55, 6, str(student_stats.get('name', '—')), 0, 0)
+        pdf.cell(55, 6, str(student_stats.get('name', '—')), new_x='RIGHT', new_y='TOP')
         
         pdf.set_font('Helvetica', 'B', 10)
-        pdf.cell(35, 6, "Student ID:", 0, 0)
+        pdf.cell(35, 6, "Student ID:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 6, str(student_stats.get('student_id', '—')), 0, 1)
+        pdf.cell(0, 6, str(student_stats.get('student_id', '—')), new_x='LMARGIN', new_y='NEXT')
         
         pdf.set_x(pdf.l_margin + 4)
         pdf.set_font('Helvetica', 'B', 10)
-        pdf.cell(40, 6, "Department:", 0, 0)
+        pdf.cell(40, 6, "Department:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(55, 6, str(student_stats.get('department', '—')), 0, 0)
+        pdf.cell(55, 6, str(student_stats.get('department', '—')), new_x='RIGHT', new_y='TOP')
         
         pdf.set_font('Helvetica', 'B', 10)
-        pdf.cell(35, 6, "Profile Status:", 0, 0)
+        pdf.cell(35, 6, "Profile Status:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
         status_text = "Active" if student_stats.get('is_active') else "Inactive"
-        pdf.cell(0, 6, status_text, 0, 1)
+        pdf.cell(0, 6, status_text, new_x='LMARGIN', new_y='NEXT')
         
         pdf.ln(10)
         
         # Key Metrics Grid
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(30, 41, 59)
-        pdf.cell(0, 7, "Attendance Performance Summary", 0, 1)
+        pdf.cell(0, 7, "Attendance Performance Summary", new_x='LMARGIN', new_y='NEXT')
         
-        col_w = pdf.epw / 5
+        col_w = pdf.epw / 4
         metrics = [
-            ("Total Sessions", str(student_stats.get('total_sessions', 0))),
+            ("Recorded Sessions", str(student_stats.get('total_sessions', 0))),
             ("Present", str(student_stats.get('present_count', 0))),
             ("Late", str(student_stats.get('late_count', 0))),
-            ("Absent", str(student_stats.get('absent_count', 0))),
-            ("Attendance Rate", f"{student_stats.get('attendance_percentage', 0)}%")
+            ("On-time Rate", f"{student_stats.get('punctuality_percentage', 0)}%")
         ]
         
         pdf.set_fill_color(241, 245, 249)
@@ -273,7 +272,7 @@ class ReportService:
         # History Table
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(30, 41, 59)
-        pdf.cell(0, 7, "Attendance Records History", 0, 1)
+        pdf.cell(0, 7, "Attendance Records History", new_x='LMARGIN', new_y='NEXT')
         
         table_headers = [
             ("Session Name", 65),
@@ -334,40 +333,39 @@ class ReportService:
         pdf.set_xy(pdf.l_margin + 4, pdf.get_y() + 3)
         pdf.set_font('Helvetica', 'B', 10)
         pdf.set_text_color(15, 23, 42)
-        pdf.cell(35, 6, "Session Name:", 0, 0)
+        pdf.cell(35, 6, "Session Name:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(60, 6, str(session_stats.get('session_name', '—')), 0, 0)
+        pdf.cell(60, 6, str(session_stats.get('session_name', '—')), new_x='RIGHT', new_y='TOP')
         
         pdf.set_font('Helvetica', 'B', 10)
-        pdf.cell(30, 6, "Course Code:", 0, 0)
+        pdf.cell(30, 6, "Course Code:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 6, str(session_stats.get('course_code', '—')), 0, 1)
+        pdf.cell(0, 6, str(session_stats.get('course_code', '—')), new_x='LMARGIN', new_y='NEXT')
         
         pdf.set_x(pdf.l_margin + 4)
         pdf.set_font('Helvetica', 'B', 10)
-        pdf.cell(35, 6, "Start Time:", 0, 0)
+        pdf.cell(35, 6, "Start Time:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(60, 6, str(session_stats.get('start_time', '—')), 0, 0)
+        pdf.cell(60, 6, str(session_stats.get('start_time', '—')), new_x='RIGHT', new_y='TOP')
         
         pdf.set_font('Helvetica', 'B', 10)
-        pdf.cell(30, 6, "Status:", 0, 0)
+        pdf.cell(30, 6, "Status:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 6, str(session_stats.get('status', '—')).upper(), 0, 1)
+        pdf.cell(0, 6, str(session_stats.get('status', '—')).upper(), new_x='LMARGIN', new_y='NEXT')
         
         pdf.ln(10)
         
         # Performance Summary Metrics
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(30, 41, 59)
-        pdf.cell(0, 7, "Session Attendance Metrics", 0, 1)
+        pdf.cell(0, 7, "Session Attendance Metrics", new_x='LMARGIN', new_y='NEXT')
         
-        col_w = pdf.epw / 5
+        col_w = pdf.epw / 4
         metrics = [
-            ("Expected", str(session_stats.get('expected_students', 0))),
             ("Total Marked", str(session_stats.get('total_marked', 0))),
             ("Present", str(session_stats.get('present_count', 0))),
             ("Late", str(session_stats.get('late_count', 0))),
-            ("Attendance Rate", f"{session_stats.get('attendance_percentage', 0)}%")
+            ("On-time Rate", f"{session_stats.get('punctuality_percentage', 0)}%")
         ]
         
         pdf.set_fill_color(241, 245, 249)
@@ -386,7 +384,7 @@ class ReportService:
         # Records Table
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(30, 41, 59)
-        pdf.cell(0, 7, "Recorded Student Attendance", 0, 1)
+        pdf.cell(0, 7, "Recorded Student Attendance", new_x='LMARGIN', new_y='NEXT')
         
         table_headers = [
             ("Student ID", 35),

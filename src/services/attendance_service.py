@@ -213,6 +213,7 @@ class AttendanceService:
                 session_id=session_id,
                 student_id=student_id,
                 status=status,
+                marked_at=marked_at,
                 detection_confidence=detection_confidence,
                 liveness_score=liveness_score,
                 marked_by=marked_by,

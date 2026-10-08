@@ -52,7 +52,6 @@ def populated_db(temp_db):
     student_svc = StudentService(temp_db)
     session_svc = SessionService(temp_db)
     att_svc = AttendanceService(temp_db)
-    att_repo = AttendanceRepository(temp_db)
     
     # Create 3 students
     s1 = student_svc.create_student("STU001", "Alice Smith", "alice@test.com", "Computer Science")
@@ -162,6 +161,17 @@ def test_analytics_repo_filtered_history_by_date_range(populated_db):
     assert len(records) == 2
 
 
+def test_analytics_repo_attendance_trend(populated_db):
+    repo = AnalyticsRepository(populated_db['db_path'])
+
+    trend = repo.get_attendance_trend()
+
+    assert trend == [
+        {'attendance_date': '2026-10-01', 'total_marked': 2, 'present_count': 1, 'late_count': 1},
+        {'attendance_date': '2026-10-03', 'total_marked': 2, 'present_count': 2, 'late_count': 0},
+    ]
+
+
 # ============================================================================
 # 2. Statistics Service Tests
 # ============================================================================
@@ -176,7 +186,9 @@ def test_stats_service_dashboard_metrics(populated_db):
     assert stats['total_present'] == 3
     assert stats['total_late'] == 1
     assert stats['punctuality_rate'] == 75.0  # 3 present out of 4 marked
-    assert stats['attendance_rate'] > 0
+    assert stats['attendance_rate'] is None
+    assert stats['total_absent'] is None
+    assert stats['absence_supported'] is False
 
 
 def test_stats_service_empty_database_edge_case(temp_db):
@@ -186,7 +198,7 @@ def test_stats_service_empty_database_edge_case(temp_db):
     assert stats['total_students'] == 0
     assert stats['total_sessions'] == 0
     assert stats['total_records'] == 0
-    assert stats['attendance_rate'] == 0.0
+    assert stats['attendance_rate'] is None
     assert stats['punctuality_rate'] == 0.0
 
 
@@ -200,8 +212,8 @@ def test_stats_service_student_statistics(populated_db):
     assert stats['total_marked'] == 2
     assert stats['present_count'] == 2
     assert stats['late_count'] == 0
-    assert stats['absent_count'] == 0
-    assert stats['attendance_percentage'] == 100.0
+    assert stats['absent_count'] is None
+    assert stats['attendance_percentage'] is None
     assert len(stats['history']) == 2
 
 
@@ -214,8 +226,8 @@ def test_stats_service_student_zero_attendance(populated_db, temp_db):
     
     assert stats['total_marked'] == 0
     assert stats['present_count'] == 0
-    assert stats['absent_count'] == 2
-    assert stats['attendance_percentage'] == 0.0
+    assert stats['absent_count'] is None
+    assert stats['attendance_percentage'] is None
     assert len(stats['history']) == 0
 
 
@@ -225,12 +237,12 @@ def test_stats_service_session_statistics(populated_db):
     
     stats = svc.get_session_statistics(sess1_id)
     assert stats['session_name'] == "CS101 Intro Lecture"
-    assert stats['expected_students'] == 3
+    assert stats['expected_students'] is None
     assert stats['total_marked'] == 2
     assert stats['present_count'] == 1
     assert stats['late_count'] == 1
-    assert stats['absent_count'] == 1
-    assert stats['attendance_percentage'] == pytest.approx(66.7, 0.1)
+    assert stats['absent_count'] is None
+    assert stats['attendance_percentage'] is None
 
 
 def test_stats_service_all_students_statistics(populated_db):
@@ -242,6 +254,7 @@ def test_stats_service_all_students_statistics(populated_db):
     assert "STU001" in ids
     assert "STU002" in ids
     assert "STU003" in ids
+    assert all(student['attendance_percentage'] is None for student in all_stats)
 
 
 def test_stats_service_course_statistics(populated_db):
@@ -252,6 +265,12 @@ def test_stats_service_course_statistics(populated_db):
     cs_course = next(c for c in courses if c['course_code'] == 'CS101')
     assert cs_course['total_sessions'] == 2
     assert cs_course['total_marked'] == 4
+
+
+def test_stats_service_attendance_trend(populated_db):
+    svc = StatisticsService(populated_db['db_path'])
+
+    assert len(svc.get_attendance_trend()) == 2
 
 
 # ============================================================================

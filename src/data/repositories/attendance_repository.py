@@ -39,7 +39,8 @@ class AttendanceRepository:
         detection_confidence: Optional[float] = None,
         liveness_score: Optional[float] = None,
         marked_by: str = 'system',
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        marked_at: Optional[str] = None
     ) -> int:
         """
         Create a new attendance record in the database.
@@ -48,6 +49,8 @@ class AttendanceRepository:
             session_id: Session database ID (foreign key to sessions table)
             student_id: Student database ID (foreign key to students table)
             status: Attendance status (e.g., 'present', 'late', 'absent')
+            marked_at: Timestamp when attendance was marked; uses the database
+                timestamp when omitted.
             detection_confidence: Face detection confidence score (optional)
             liveness_score: Liveness detection score (optional)
             marked_by: Who marked the attendance (default: 'system')
@@ -62,10 +65,10 @@ class AttendanceRepository:
         """
         query = """
             INSERT INTO attendance_records (
-                session_id, student_id, status, detection_confidence,
+                session_id, student_id, status, marked_at, detection_confidence,
                 liveness_score, marked_by, notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)
         """
         
         try:
@@ -73,8 +76,8 @@ class AttendanceRepository:
                 cursor = conn.cursor()
                 cursor.execute(
                     query,
-                    (session_id, student_id, status, detection_confidence,
-                     liveness_score, marked_by, notes)
+                    (session_id, student_id, status, marked_at, detection_confidence,
+                      liveness_score, marked_by, notes)
                 )
                 attendance_id = cursor.lastrowid
                 logger.info(

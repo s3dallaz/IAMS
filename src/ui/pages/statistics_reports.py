@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 def render_statistics_reports_page():
     """Main entry point to render the Statistics, Analytics & Reports page."""
     st.title("📊 Statistics, Analytics & Reports")
-    st.caption("Phase 5: Attendance Performance Insights, Visual Analytics & Document Export")
+    st.caption("Recorded attendance insights, history, and export")
     st.markdown("---")
 
     # Initialize Services without loading heavy CV models or camera
@@ -69,11 +69,11 @@ def render_overview_dashboard(stats_service: StatisticsService):
     # 1. Metric Cards
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("Total Students", stats['total_students'], help="Active students in system")
+        st.metric("Total Students", stats['total_students'])
     with col2:
         st.metric("Total Sessions", stats['total_sessions'], help=f"{stats['active_sessions']} active, {stats['closed_sessions']} closed")
     with col3:
-        st.metric("Attendance Rate", f"{stats['attendance_rate']}%", help="Percentage of expected attendance logged")
+        st.metric("Attendance Records", stats['total_records'])
     with col4:
         st.metric("Present Count", stats['total_present'], delta=f"{stats['punctuality_rate']}% on time")
     with col5:
@@ -88,12 +88,10 @@ def render_overview_dashboard(stats_service: StatisticsService):
         st.markdown("##### 🥧 Attendance Status Distribution")
         present = stats['total_present']
         late = stats['total_late']
-        absent = stats['total_absent']
-        
-        if (present + late + absent) > 0:
+        if (present + late) > 0:
             status_df = pd.DataFrame({
-                'Status': ['Present', 'Late', 'Absent'],
-                'Count': [present, late, absent]
+                'Status': ['Present', 'Late'],
+                'Count': [present, late]
             })
             st.bar_chart(status_df.set_index('Status'), color="#3b82f6")
         else:
@@ -112,6 +110,34 @@ def render_overview_dashboard(stats_service: StatisticsService):
             st.info("No course attendance data available.")
 
     st.markdown("---")
+
+    st.caption("Absences and attendance percentages are unavailable because the current database does not record session rosters or student-course enrollment.")
+
+    trend = stats_service.get_attendance_trend()
+    session_stats = stats_service.get_all_sessions_statistics()
+    col_trend, col_sessions = st.columns(2)
+    with col_trend:
+        st.markdown("##### Attendance trend")
+        if trend:
+            trend_df = pd.DataFrame(trend).rename(
+                columns={
+                    'attendance_date': 'Date',
+                    'present_count': 'Present',
+                    'late_count': 'Late',
+                }
+            )
+            st.line_chart(trend_df, x='Date', y=['Present', 'Late'])
+        else:
+            st.info("No recorded attendance trend yet.")
+    with col_sessions:
+        st.markdown("##### Session comparison")
+        if session_stats:
+            session_df = pd.DataFrame(session_stats).rename(
+                columns={'session_name': 'Session', 'total_marked': 'Recorded attendance'}
+            )
+            st.bar_chart(session_df, x='Session', y='Recorded attendance')
+        else:
+            st.info("No sessions available for comparison.")
     
     # 3. All Students Performance Leaderboard
     st.markdown("##### 👥 Student Attendance Summary")
@@ -126,10 +152,16 @@ def render_overview_dashboard(stats_service: StatisticsService):
                 'Marked Attendance': s['total_marked'],
                 'Present': s['present_count'],
                 'Late': s['late_count'],
-                'Attendance Rate': f"{s['attendance_percentage']}%",
+                'On-time Rate': f"{s['punctuality_percentage']}%",
                 'Status': "Active" if s['is_active'] else "Inactive"
             })
-        st.dataframe(display_list, use_container_width=True, hide_index=True)
+        st.dataframe(display_list, hide_index=True)
+
+        student_chart = pd.DataFrame(student_stats_list).rename(
+            columns={'name': 'Student', 'total_marked': 'Recorded attendance'}
+        )
+        st.markdown("##### Recorded attendance by student")
+        st.bar_chart(student_chart, x='Student', y='Recorded attendance')
     else:
         st.info("No students enrolled.")
 
@@ -174,14 +206,14 @@ def render_student_statistics_tab(
         st.markdown(f"### **{stats['name']}** (`{stats['student_id']}`)")
         st.caption(f"Department: {stats['department']} | Status: {'Active' if stats['is_active'] else 'Inactive'}")
     with col_info2:
-        st.metric("Attendance Rate", f"{stats['attendance_percentage']}%")
+        st.metric("On-time Rate", f"{stats['punctuality_percentage']}%")
 
     # Metrics Row
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Sessions", stats['total_sessions'])
+    m1.metric("Recorded Sessions", stats['total_sessions'])
     m2.metric("Present (On Time)", stats['present_count'])
     m3.metric("Late", stats['late_count'])
-    m4.metric("Absent", stats['absent_count'])
+    m4.metric("On-time Rate", f"{stats['punctuality_percentage']}%")
 
     st.markdown("---")
 
@@ -194,7 +226,6 @@ def render_student_statistics_tab(
             data=csv_data,
             file_name=f"attendance_student_{stats['student_id']}.csv",
             mime="text/csv",
-            use_container_width=True,
             key=f"btn_dl_csv_stu_{selected_id}"
         )
     with col_exp2:
@@ -205,7 +236,6 @@ def render_student_statistics_tab(
                 data=pdf_bytes,
                 file_name=f"attendance_student_{stats['student_id']}.pdf",
                 mime="application/pdf",
-                use_container_width=True,
                 key=f"btn_dl_pdf_stu_{selected_id}"
             )
         except Exception as e:
@@ -228,7 +258,7 @@ def render_student_statistics_tab(
                 'Confidence': f"{r.get('detection_confidence', 0):.2f}" if r.get('detection_confidence') is not None else '—',
                 'Marked By': r.get('marked_by', 'system')
             })
-        st.dataframe(table_data, use_container_width=True, hide_index=True)
+        st.dataframe(table_data, hide_index=True)
     else:
         st.info("No attendance records recorded for this student yet.")
 
@@ -273,14 +303,14 @@ def render_session_course_tab(
         st.markdown(f"### **{sess_stats['session_name']}** (`{sess_stats['course_code']}`)")
         st.caption(f"Start Time: {format_datetime(sess_stats['start_time'])} | Status: {sess_stats['status'].upper()} | Late Cutoff: {sess_stats['late_threshold_minutes']} min")
     with col_hdr2:
-        st.metric("Attendance Rate", f"{sess_stats['attendance_percentage']}%")
+        st.metric("On-time Rate", f"{sess_stats['punctuality_percentage']}%")
 
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Expected Students", sess_stats['expected_students'])
-    c2.metric("Total Marked", sess_stats['total_marked'])
-    c3.metric("Present", sess_stats['present_count'])
-    c4.metric("Late", sess_stats['late_count'])
+    c1.metric("Total Marked", sess_stats['total_marked'])
+    c2.metric("Present", sess_stats['present_count'])
+    c3.metric("Late", sess_stats['late_count'])
+    c4.metric("On-time Rate", f"{sess_stats['punctuality_percentage']}%")
 
     st.markdown("---")
 
@@ -293,7 +323,6 @@ def render_session_course_tab(
             data=csv_data,
             file_name=f"attendance_session_{selected_sess_id}.csv",
             mime="text/csv",
-            use_container_width=True,
             key=f"btn_dl_csv_sess_{selected_sess_id}"
         )
     with col_e2:
@@ -304,7 +333,6 @@ def render_session_course_tab(
                 data=pdf_bytes,
                 file_name=f"attendance_session_{selected_sess_id}.pdf",
                 mime="application/pdf",
-                use_container_width=True,
                 key=f"btn_dl_pdf_sess_{selected_sess_id}"
             )
         except Exception as e:
@@ -329,9 +357,25 @@ def render_session_course_tab(
                 'Liveness': f"{r.get('liveness_score', 0):.2f}" if r.get('liveness_score') is not None else '—',
                 'Marked By': r.get('marked_by', 'system')
             })
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        st.dataframe(table_rows, hide_index=True)
     else:
         st.info("No attendance records logged for this session yet.")
+
+    st.markdown("#### Course summary")
+    course_stats = stats_service.get_course_statistics()
+    if course_stats:
+        course_rows = pd.DataFrame(course_stats).rename(
+            columns={
+                'course_code': 'Course',
+                'total_sessions': 'Sessions',
+                'total_marked': 'Recorded attendance',
+                'present_count': 'Present',
+                'late_count': 'Late',
+            }
+        )[['Course', 'Sessions', 'Recorded attendance', 'Present', 'Late']]
+        st.dataframe(course_rows, hide_index=True)
+    else:
+        st.info("No course data available.")
 
 
 # ============================================================================
@@ -408,7 +452,6 @@ def render_filterable_history_tab(
                 data=csv_export,
                 file_name=f"attendance_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
-                use_container_width=True,
                 key="btn_export_history_csv"
             )
 
@@ -432,7 +475,7 @@ def render_filterable_history_tab(
             'Marked By': r.get('marked_by') or 'system'
         })
         
-    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+    st.dataframe(display_rows, hide_index=True)
 
 
 def format_datetime(dt_string: Optional[str]) -> str:
