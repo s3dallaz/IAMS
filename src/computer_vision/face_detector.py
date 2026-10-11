@@ -13,6 +13,7 @@ from mediapipe.tasks.python import vision
 from pathlib import Path
 
 import config
+from src.computer_vision.detection_diagnostics import get_diagnostics
 from src.utils.logger import get_logger
 
 
@@ -151,6 +152,9 @@ class FaceDetector:
             detection_result = self._detector.detect(mp_image)
             
             if detection_result.detections is None or len(detection_result.detections) == 0:
+                # Diagnostics: a zero-detection frame is the key measurement for
+                # diagnosing distance-related detection loss.
+                get_diagnostics().record(image_rgb.shape, [], stage="detection")
                 return []
             
             # Convert detections to DetectedFace objects
@@ -161,6 +165,8 @@ class FaceDetector:
                 detected_faces.append(DetectedFace(bbox, confidence))
             
             self.logger.debug(f"Detected {len(detected_faces)} face(s)")
+            # Diagnostics: record box size + confidence for this frame.
+            get_diagnostics().record(image_rgb.shape, detected_faces, stage="detection")
             return detected_faces
             
         except Exception as e:

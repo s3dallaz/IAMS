@@ -685,3 +685,67 @@ def test_reset_tracking(temp_db, active_session, mock_cv_components):
     
     manager.reset_tracking()
     liveness.reset_temporal_state.assert_called_once()
+
+
+# ============================================================================
+# Test Head Turn Angle Configuration
+# ============================================================================
+
+def test_head_turn_angle_passed_to_liveness_detector(temp_db, active_session):
+    """Test that head_turn_angle parameter is passed to LivenessDetector."""
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        head_turn_angle=20.0
+    )
+    
+    # Trigger lazy initialization
+    liveness_detector = manager._get_liveness_detector()
+    
+    assert liveness_detector.head_turn_angle == 20.0
+
+
+def test_head_turn_angle_default_from_config(temp_db, active_session):
+    """Test that head_turn_angle defaults to config value when not specified."""
+    import config
+    
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db
+    )
+    
+    liveness_detector = manager._get_liveness_detector()
+    
+    assert liveness_detector.head_turn_angle == config.LIVENESS_HEAD_TURN_ANGLE
+
+
+def test_head_turn_angle_can_be_updated_runtime(temp_db, active_session):
+    """Test that head_turn_angle can be changed at runtime."""
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        head_turn_angle=15.0
+    )
+    
+    # Initialize the detector
+    liveness_detector = manager._get_liveness_detector()
+    assert liveness_detector.head_turn_angle == 15.0
+    
+    # Update the angle
+    manager.head_turn_angle = 25.0
+    liveness_detector = manager._get_liveness_detector()
+    
+    assert liveness_detector.head_turn_angle == 25.0
+
+
+def test_head_turn_angle_validated(temp_db, active_session):
+    """Test that invalid head_turn_angle values raise errors."""
+    from src.computer_vision.liveness_detector import LivenessDetector
+    
+    # Zero angle should fail
+    with pytest.raises(ValueError, match="head_turn_angle must be positive"):
+        LivenessDetector(head_turn_angle=0.0)
+    
+    # Negative angle should fail
+    with pytest.raises(ValueError, match="head_turn_angle must be positive"):
+        LivenessDetector(head_turn_angle=-10.0)

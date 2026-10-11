@@ -512,17 +512,48 @@ def render_manage_face_view(
                         st.rerun()
                         
     elif enroll_method == "📹 Take Photo with Live Camera":
-        st.markdown("#### Live Camera Capture")
+        st.markdown("#### Live Camera Capture — Multi-Angle Enrollment")
+        
+        # Initialize multi-angle state
+        if 'angle_capture_mode' not in st.session_state:
+            st.session_state['angle_capture_mode'] = False
+        if 'angle_capture_step' not in st.session_state:
+            st.session_state['angle_capture_step'] = 0
+        if 'angle_captured_samples' not in st.session_state:
+            st.session_state['angle_captured_samples'] = []
+        
+        # Toggle for multi-angle mode
+        use_multi_angle = st.checkbox(
+            "📐 Use Guided Multi-Angle Capture (Recommended for better recognition)",
+            value=False,
+            key="chk_multi_angle_mode",
+            help="Capture frontal, left, and right angle views for improved recognition at various head positions"
+        )
+        
+        if use_multi_angle:
+            st.session_state['angle_capture_mode'] = True
+        else:
+            st.session_state['angle_capture_mode'] = False
+            st.session_state['angle_capture_step'] = 0
+            st.session_state['angle_captured_samples'] = []
         
         # State A: Camera is OFF
         if not st.session_state.get('reg_cam_active', False):
-            st.info("💡 Click **Take Photo** to start live preview, position face, and capture.")
+            if st.session_state['angle_capture_mode']:
+                angle_names = ["Frontal", "Left Turn", "Right Turn"]
+                st.info(f"💡 Multi-angle mode will guide you through capturing: **{', '.join(angle_names)}**")
+            else:
+                st.info("💡 Click **Take Photo** to start live preview, position face, and capture.")
+            
             if st.button("📸 Take Photo", type="primary", use_container_width=True, key="btn_start_enroll_camera"):
                 cam = CameraManager(camera_index=0)
                 if cam.open():
                     st.session_state['reg_cam_manager'] = cam
                     st.session_state['reg_cam_active'] = True
                     st.session_state['captured_photo_preview'] = None
+                    if st.session_state['angle_capture_mode']:
+                        st.session_state['angle_capture_step'] = 0
+                        st.session_state['angle_captured_samples'] = []
                     st.rerun()
                 else:
                     st.error("❌ Failed to open camera hardware. Ensure webcam is connected and not in use by another app.")
@@ -537,11 +568,38 @@ def render_manage_face_view(
                     st.rerun()
                 return
 
+            # Multi-angle capture mode
+            is_multi_angle = st.session_state.get('angle_capture_mode', False)
+            angle_steps = [
+                {"name": "Frontal", "icon": "🎯", "instruction": "Look directly at the camera"},
+                {"name": "Left Turn", "icon": "👈", "instruction": "Turn your head slightly to the LEFT"},
+                {"name": "Right Turn", "icon": "👉", "instruction": "Turn your head slightly to the RIGHT"},
+            ]
+            current_step = st.session_state.get('angle_capture_step', 0)
+            
+            # Show multi-angle progress bar
+            if is_multi_angle:
+                captured_samples = st.session_state.get('angle_captured_samples', [])
+                progress_cols = st.columns(len(angle_steps))
+                for i, step in enumerate(angle_steps):
+                    with progress_cols[i]:
+                        if i < len(captured_samples):
+                            st.markdown(f"✅ **{step['name']}**")
+                        elif i == current_step:
+                            st.markdown(f"📸 **{step['name']}**")
+                        else:
+                            st.markdown(f"⬜ {step['name']}")
+
             # State B: A photo is captured and awaiting user approval/retake (CAMERA STAYS OPEN)
             if st.session_state.get('captured_photo_preview') is not None:
                 captured_frame = st.session_state['captured_photo_preview']
                 
-                st.markdown("##### 📸 Photo Preview — Check your picture")
+                if is_multi_angle:
+                    step_info = angle_steps[current_step] if current_step < len(angle_steps) else angle_steps[0]
+                    st.markdown(f"##### 📸 {step_info['icon']} {step_info['name']} — Check your picture")
+                else:
+                    st.markdown("##### 📸 Photo Preview — Check your picture")
+                    
                 mirrored_captured = cv2.flip(captured_frame, 1)
                 st.image(
                     cv2.cvtColor(mirrored_captured, cv2.COLOR_BGR2RGB),
@@ -551,7 +609,10 @@ def render_manage_face_view(
                 
                 col_app, col_ret = st.columns(2)
                 with col_app:
-                    if st.button("✓ Approve / Use Photo", type="primary", use_container_width=True, key="btn_approve_captured"):
+                    approve_label = "✓ Approve / Use Photo"
+                    if is_multi_angle:
+                        approve_label = f"✓ Approve {angle_steps[current_step]['name']}"
+                    if st.button(approve_label, type="primary", use_container_width=True, key="btn_approve_captured"):
                         with st.spinner("Validating face and saving embedding..."):
                             try:
                                 # Validate and enroll the unmirrored original frame
@@ -561,7 +622,23 @@ def render_manage_face_view(
                                     enrollment_method="camera"
                                 )
                                 st.session_state['captured_photo_preview'] = None
-                                st.success(f"✅ Face sample approved and enrolled for **{student['name']}**!")
+                                
+                                if is_multi_angle:
+                                    # Track this angle as captured
+                                    captured_samples = st.session_state.get('angle_captured_samples', [])
+                                    captured_samples.append(angle_steps[current_step]['name'])
+                                    st.session_state['angle_captured_samples'] = captured_samples
+                                    
+                                    next_step = current_step + 1
+                                    if next_step < len(angle_steps):
+                                        st.session_state['angle_capture_step'] = next_step
+                                        st.success(f"✅ {angle_steps[current_step]['name']} enrolled! Next: **{angle_steps[next_step]['name']}**")
+                                    else:
+                                        st.success(f"✅ All {len(angle_steps)} angles enrolled for **{student['name']}**! Multi-angle enrollment complete.")
+                                        st.session_state['angle_capture_step'] = 0
+                                        st.session_state['angle_captured_samples'] = []
+                                else:
+                                    st.success(f"✅ Face sample approved and enrolled for **{student['name']}**!")
                                 st.rerun()
                             except InvalidFaceImageError as e:
                                 st.error(f"❌ Validation failed: {e}")
@@ -581,6 +658,11 @@ def render_manage_face_view(
                 return
 
             # State C: Live Camera Streaming Preview
+            # Show current angle instruction for multi-angle mode
+            if is_multi_angle and current_step < len(angle_steps):
+                step_info = angle_steps[current_step]
+                st.info(f"{step_info['icon']} **Step {current_step + 1}/{len(angle_steps)}: {step_info['name']}** — {step_info['instruction']}")
+            
             col_cap, col_cancel = st.columns(2)
             with col_cap:
                 capture_clicked = st.button("📸 Capture Photo", type="primary", use_container_width=True, key="btn_capture_frame_now")
@@ -604,6 +686,13 @@ def render_manage_face_view(
             # Live preview placeholder
             video_placeholder = st.empty()
             
+            # Show live caption with angle instruction
+            if is_multi_angle and current_step < len(angle_steps):
+                step_info = angle_steps[current_step]
+                live_caption = f"Live Feed — {step_info['instruction']} and click 'Capture Photo'"
+            else:
+                live_caption = "Live Camera Feed — Center face and click 'Capture Photo' above"
+            
             frame_count = 0
             max_frames_per_run = 150  # ~5 seconds of smooth 30fps streaming per cycle
             
@@ -622,7 +711,7 @@ def render_manage_face_view(
                     mirrored_preview = cv2.flip(frame, 1)
                     video_placeholder.image(
                         cv2.cvtColor(mirrored_preview, cv2.COLOR_BGR2RGB),
-                        caption="Live Camera Feed — Center face and click 'Capture Photo' above",
+                        caption=live_caption,
                         use_container_width=True
                     )
                     

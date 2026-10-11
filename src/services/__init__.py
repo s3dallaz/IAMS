@@ -21,6 +21,12 @@ from src.services.real_time_attendance_service import (
 )
 from src.services.statistics_service import StatisticsService
 from src.services.report_service import ReportService
+from src.services.ai_assistant_service import (
+    AIAssistantService,
+    AIAssistantError,
+    ModelUnavailableError,
+    AmbiguousQueryError
+)
 
 __all__ = [
     'StudentService',
@@ -37,7 +43,11 @@ __all__ = [
     'FaceProcessingResult',
     'RealTimeAttendanceError',
     'StatisticsService',
-    'ReportService'
+    'ReportService',
+    'AIAssistantService',
+    'AIAssistantError',
+    'ModelUnavailableError',
+    'AmbiguousQueryError'
 ]
 
 

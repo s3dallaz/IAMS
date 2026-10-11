@@ -15,10 +15,13 @@ import numpy as np
 from src.computer_vision.face_detector import FaceDetector, DetectedFace
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding, FaceEmbeddingError
 from src.computer_vision.face_recognizer import FaceRecognizer, RecognitionResult
+from src.computer_vision.detection_diagnostics import get_diagnostics
 from src.computer_vision.liveness_detector import (
     LivenessDetector,
     LivenessResult,
     LivenessState,
+    ChallengeState,
+    ChallengeType,
     LivenessDetectionError
 )
 from src.services.attendance_service import (
@@ -60,6 +63,11 @@ class FaceProcessingResult:
         student_name: Student full name if found in database, else None
         liveness_state: LivenessState enum (LIVE, SPOOF, UNKNOWN)
         liveness_confidence: Confidence score of liveness determination
+        blink_count: Number of blinks detected
+        min_blinks_required: Minimum blinks required for verification
+        challenge_type: Current challenge type (NONE, TURN_LEFT, TURN_RIGHT)
+        challenge_state: Current challenge state (INACTIVE, ACTIVE, COMPLETED, FAILED)
+        challenge_progress: Progress percentage (0.0 to 1.0)
         attendance_marked: True if attendance was newly marked in this step
         attendance_id: Database ID of created attendance record if marked
         attendance_status: Status assigned ('present', 'late') or None
@@ -79,6 +87,11 @@ class FaceProcessingResult:
         student_name: Optional[str] = None,
         liveness_state: LivenessState = LivenessState.UNKNOWN,
         liveness_confidence: float = 0.0,
+        blink_count: int = 0,
+        min_blinks_required: int = 0,
+        challenge_type: str = "none",
+        challenge_state: str = "inactive",
+        challenge_progress: float = 0.0,
         attendance_marked: bool = False,
         attendance_id: Optional[int] = None,
         attendance_status: Optional[str] = None,
@@ -95,6 +108,11 @@ class FaceProcessingResult:
         self.student_name = student_name
         self.liveness_state = liveness_state
         self.liveness_confidence = liveness_confidence
+        self.blink_count = blink_count
+        self.min_blinks_required = min_blinks_required
+        self.challenge_type = challenge_type
+        self.challenge_state = challenge_state
+        self.challenge_progress = challenge_progress
         self.attendance_marked = attendance_marked
         self.attendance_id = attendance_id
         self.attendance_status = attendance_status
@@ -183,7 +201,8 @@ class RealTimeAttendanceManager:
         liveness_detector: Optional[LivenessDetector] = None,
         require_liveness: bool = True,
         cooldown_seconds: float = 3.0,
-        marked_by: str = 'system'
+        marked_by: str = 'system',
+        head_turn_angle: Optional[float] = None
     ):
         """
         Initialize the RealTimeAttendanceManager.
@@ -201,6 +220,7 @@ class RealTimeAttendanceManager:
             require_liveness: If True, only LIVE faces can be marked present
             cooldown_seconds: Real-time debounce cooldown in seconds per student
             marked_by: Method identifier passed to attendance records ('system', 'cv_live', etc.)
+            head_turn_angle: Required head turn angle in degrees for liveness challenges (default: from config)
         """
         self.database_path = database_path
         
@@ -218,6 +238,7 @@ class RealTimeAttendanceManager:
         self.require_liveness = require_liveness
         self.cooldown_seconds = cooldown_seconds
         self.marked_by = marked_by
+        self.head_turn_angle = head_turn_angle
         
         # In-memory student gallery for face recognition: List[Tuple[str, FaceEmbedding]]
         self._gallery: List[Tuple[str, FaceEmbedding]] = []
@@ -327,7 +348,14 @@ class RealTimeAttendanceManager:
     
     def _get_liveness_detector(self) -> LivenessDetector:
         if self.liveness_detector is None:
-            self.liveness_detector = LivenessDetector()
+            # Pass head_turn_angle if provided by UI, otherwise use config default
+            kwargs = {}
+            if self.head_turn_angle is not None:
+                kwargs['head_turn_angle'] = self.head_turn_angle
+            self.liveness_detector = LivenessDetector(**kwargs)
+        elif self.head_turn_angle is not None and self.liveness_detector.head_turn_angle != self.head_turn_angle:
+            # Update existing detector with new angle if changed
+            self.liveness_detector.head_turn_angle = self.head_turn_angle
         return self.liveness_detector
     
     # ------------------------------------------------------------------------
@@ -393,6 +421,9 @@ class RealTimeAttendanceManager:
         detected_faces = face_detector.detect_faces(frame)
         
         if not detected_faces:
+            # Diagnostics: record the post-detection stages for a missed frame,
+            # which separates "not detected" from "detected but unusable".
+            get_diagnostics().record(frame.shape, [], stage="no_detection")
             return RealTimeAttendanceResult(
                 session_id=target_session,
                 faces_detected=0,
@@ -461,16 +492,18 @@ class RealTimeAttendanceManager:
         crop_w = max(1, min(w, frame_w - crop_x))
         crop_h = max(1, min(h, frame_h - crop_y))
         face_crop = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-        
+
         # Step A: Generate embedding & Recognize face
         identity = "Unknown"
         is_recognized = False
         distance = float('inf')
-        
+        embedding_ok = False
+
         if face_crop.size > 0 and len(self._gallery) > 0:
             try:
                 embedding = face_embedder.generate_embedding(face_crop)
                 if embedding is not None:
+                    embedding_ok = True
                     rec_result = face_recognizer.recognize(embedding, self._gallery)
                     if rec_result.is_match and rec_result.identity != "Unknown":
                         identity = rec_result.identity
@@ -480,32 +513,68 @@ class RealTimeAttendanceManager:
                 logger.debug(f"Face embedding generation skipped: {e}")
             except Exception as e:
                 logger.error(f"Face recognition error: {e}")
-        
+
         # Step B: Liveness analysis
+        # CRITICAL FIX: Start challenge if enabled and not yet started
+        if (liveness_detector.enable_challenges and 
+            liveness_detector.require_challenge and
+            liveness_detector.current_challenge == ChallengeType.NONE):
+            liveness_detector.start_new_challenge()
+        
         # Update temporal state for the face
         ear = liveness_detector.extract_ear(frame, detected_face)
         liveness_detector.update_temporal_state(ear, frame, detected_face)
-        
-        # Determine liveness state
-        # In real-time streaming, check blink count and active challenges
-        min_blinks = liveness_detector.min_blinks
-        blink_passed = liveness_detector.blink_count >= min_blinks
-        
-        if liveness_detector.enable_challenges and liveness_detector.require_challenge:
-            challenge_completed = (
-                liveness_detector.challenge_state.value == "completed" or
-                getattr(liveness_detector, "_challenge_completed", False)
+
+        # Diagnostics: which stage consumed the face. This distinguishes
+        # detection loss from recognition failure from liveness failure.
+        get_diagnostics().record_stage(
+            stage="recognition",
+            bbox=bbox,
+            detection_confidence=det_conf,
+            embedding_ok=embedding_ok,
+            recognized=is_recognized,
+            distance=distance if is_recognized else None,
+        )
+        if ear is None:
+            get_diagnostics().record_stage(
+                stage="liveness",
+                bbox=bbox,
+                detection_confidence=det_conf,
+                ear=None,
             )
-            is_live = blink_passed and challenge_completed
-        else:
-            is_live = blink_passed
         
-        if is_live:
-            liveness_state = LivenessState.LIVE
-            liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
+        # BUG FIX: Properly evaluate liveness state using both blinks AND challenges
+        # Previous implementation only checked blink_count manually, bypassing challenge verification
+        # Now we check both requirements according to the detector's configuration
+        blinks_detected = liveness_detector.blink_count
+        min_blinks = liveness_detector.min_blinks
+        blink_passed = blinks_detected >= min_blinks
+        
+        # Get challenge progress for UI display
+        challenge_progress = liveness_detector.get_challenge_progress()
+        
+        # Check if challenges are enabled and required
+        if liveness_detector.enable_challenges and liveness_detector.require_challenge:
+            # CRITICAL FIX: Must verify BOTH blinks AND challenge completion for LIVE state
+            challenge_state = liveness_detector.challenge_state
+            challenge_completed = (challenge_state == ChallengeState.COMPLETED)
+            
+            # Only LIVE if BOTH conditions are met
+            if blink_passed and challenge_completed:
+                liveness_state = LivenessState.LIVE
+                liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
+            else:
+                # Insufficient evidence - need both blinks and challenge
+                liveness_state = LivenessState.UNKNOWN
+                liveness_confidence = 0.0
         else:
-            liveness_state = LivenessState.UNKNOWN
-            liveness_confidence = 0.0
+            # Challenges disabled - only check blinks
+            if blink_passed:
+                liveness_state = LivenessState.LIVE
+                liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
+            else:
+                liveness_state = LivenessState.UNKNOWN
+                liveness_confidence = 0.0
         
         # Step C: Resolve student identity from database
         student_db_id = None
@@ -529,6 +598,11 @@ class RealTimeAttendanceManager:
                             student_name=student_record.get('name'),
                             liveness_state=liveness_state,
                             liveness_confidence=liveness_confidence,
+                            blink_count=blinks_detected,
+                            min_blinks_required=min_blinks,
+                            challenge_type=challenge_progress['challenge_type'],
+                            challenge_state=challenge_progress['challenge_state'],
+                            challenge_progress=challenge_progress['progress_percent'],
                             attendance_marked=False,
                             reason="Student is deactivated in system"
                         )
@@ -544,6 +618,11 @@ class RealTimeAttendanceManager:
                         recognition_distance=distance,
                         liveness_state=liveness_state,
                         liveness_confidence=liveness_confidence,
+                        blink_count=blinks_detected,
+                        min_blinks_required=min_blinks,
+                        challenge_type=challenge_progress['challenge_type'],
+                        challenge_state=challenge_progress['challenge_state'],
+                        challenge_progress=challenge_progress['progress_percent'],
                         attendance_marked=False,
                         reason=f"Identity '{identity}' not found in student database"
                     )
@@ -557,6 +636,11 @@ class RealTimeAttendanceManager:
                     recognition_distance=distance,
                     liveness_state=liveness_state,
                     liveness_confidence=liveness_confidence,
+                    blink_count=blinks_detected,
+                    min_blinks_required=min_blinks,
+                    challenge_type=challenge_progress['challenge_type'],
+                    challenge_state=challenge_progress['challenge_state'],
+                    challenge_progress=challenge_progress['progress_percent'],
                     attendance_marked=False,
                     reason=f"Error looking up student: {e}"
                 )
@@ -570,6 +654,11 @@ class RealTimeAttendanceManager:
                 recognition_distance=distance,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 reason="Unknown person - not enrolled"
             )
@@ -587,6 +676,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 reason="Liveness verification pending / not confirmed"
             )
@@ -604,6 +698,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 reason="Session is not active (scheduled or closed)"
             )
@@ -621,6 +720,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 already_marked=True,
                 reason="Attendance already recorded for this session"
@@ -640,6 +744,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 reason="Cooldown in progress"
             )
@@ -681,6 +790,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=True,
                 attendance_id=attendance_id,
                 attendance_status=status,
@@ -701,6 +815,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 already_marked=True,
                 reason="Attendance already recorded for this session"
@@ -717,6 +836,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 reason=str(e)
             )
@@ -733,6 +857,11 @@ class RealTimeAttendanceManager:
                 student_name=student_name,
                 liveness_state=liveness_state,
                 liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
                 reason=f"Failed to record attendance: {e}"
             )

@@ -17,6 +17,7 @@ from datetime import datetime
 
 from src.computer_vision.camera_manager import CameraManager
 from src.computer_vision.face_detector import FaceDetector, DetectedFace
+from src.computer_vision.detection_diagnostics import get_diagnostics
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding
 from src.computer_vision.face_recognizer import FaceRecognizer
 from src.computer_vision.liveness_detector import (
@@ -68,6 +69,14 @@ def render_realtime_attendance():
             value=3.0,
             step=0.5,
             help="Minimum seconds between re-evaluating the same student"
+        )
+        
+        # Configurable head-turn angle for liveness challenges
+        head_turn_angle = st.select_slider(
+            "Liveness Head-Turn Angle (°)",
+            options=[5, 10, 15, 20, 25, 30, 35],
+            value=15,
+            help="Required head turn angle for liveness challenges. Lower angles are easier, higher angles more secure."
         )
         
         st.markdown("---")
@@ -207,7 +216,8 @@ def render_realtime_attendance():
             cooldown_seconds=cooldown_seconds,
             session_service=session_service,
             attendance_service=attendance_service,
-            student_service=student_service
+            student_service=student_service,
+            head_turn_angle=head_turn_angle
         )
     else:
         # Show Current Session Attendance Records Table when stream is idle
@@ -220,11 +230,17 @@ def _run_realtime_attendance_stream(
     cooldown_seconds: float,
     session_service: SessionService,
     attendance_service: AttendanceService,
-    student_service: StudentService
+    student_service: StudentService,
+    head_turn_angle: float
 ):
     """
     Run the live camera feed and real-time attendance processing loop.
     Uses st.empty() updates for smooth, responsive real-time streaming.
+    
+    Optimizations to reduce per-frame overhead:
+    - Database queries throttled (every 30 frames, not every frame)
+    - Widgets pre-created and content updated via markdown/image only
+    - Minimal Streamlit API calls inside the frame loop
     """
     camera = st.session_state.att_camera_manager
     if camera is None or not camera.is_open():
@@ -240,7 +256,8 @@ def _run_realtime_attendance_stream(
             student_service=student_service,
             require_liveness=require_liveness,
             cooldown_seconds=cooldown_seconds,
-            marked_by="cv_realtime"
+            marked_by="cv_realtime",
+            head_turn_angle=head_turn_angle
         )
         enrollment_service = EnrollmentService()
         gallery = enrollment_service.load_active_gallery()
@@ -250,13 +267,13 @@ def _run_realtime_attendance_stream(
         rt_manager = st.session_state.att_rt_manager
         rt_manager.require_liveness = require_liveness
         rt_manager.cooldown_seconds = cooldown_seconds
+        rt_manager.head_turn_angle = head_turn_angle
         
     # Layout placeholders
     col_video, col_live_status = st.columns([3, 2])
     
     with col_video:
         video_placeholder = st.empty()
-        live_alert_placeholder = st.empty()
         
     with col_live_status:
         st.markdown("### 📊 Live Session Stats")
@@ -269,7 +286,21 @@ def _run_realtime_attendance_stream(
     records_table_placeholder = st.empty()
     
     frame_count = 0
-    max_frames_per_run = 300  # Stream batch frames per execution cycle (~10 seconds at 30 fps)
+    max_frames_per_run = 900  # Stream batch frames per execution cycle (~30 seconds at 30 fps)
+    # BUG FIX: Increased from 300 to 900 frames to reduce page refresh frequency
+    # from every 10 seconds to every 30 seconds, making refreshes less disruptive
+    
+    # Cache for database queries (refreshed periodically, not every frame)
+    cached_records = []
+    cached_present_cnt = 0
+    cached_late_cnt = 0
+    cached_total_cnt = 0
+    
+    # Cache for CV processing results (to avoid processing every frame)
+    # The key bottleneck: face detection/recognition/liveness is expensive
+    # We process every 5th frame but display all frames for smooth preview
+    last_cv_result: Optional[RealTimeAttendanceResult] = None
+    cv_process_interval = 5  # Process CV every 5 frames = 6fps processing at 30fps preview
     
     try:
         while frame_count < max_frames_per_run:
@@ -282,57 +313,58 @@ def _run_realtime_attendance_stream(
                 time.sleep(0.05)
                 continue
                 
-            # Process frame through RealTimeAttendanceManager
-            result: RealTimeAttendanceResult = rt_manager.process_frame(frame, session_id=session_id)
+            # KEY FIX: Only run CV processing every Nth frame to reduce lag
+            # The expensive operations (face detection, embedding, recognition, liveness)
+            # run at ~6 fps while the camera preview stays smooth at 30 fps
+            if frame_count % cv_process_interval == 0:
+                # Process frame through RealTimeAttendanceManager
+                result: RealTimeAttendanceResult = rt_manager.process_frame(frame, session_id=session_id)
+                last_cv_result = result
+            else:
+                # Reuse previous CV result for smooth preview with stale detection boxes
+                # This maintains 30fps display while CV runs at lower rate
+                result = last_cv_result if last_cv_result is not None else RealTimeAttendanceResult(
+                    session_id=session_id,
+                    faces_detected=0,
+                    processed_faces=[],
+                    session_active=True,
+                    marked_count=0
+                )
             
-            # Draw overlays on display frame
+            # Draw overlays on display frame (uses cached result between CV updates)
             display_frame = _draw_attendance_overlays(frame, result)
-            
-            # Update video placeholder
+
+            # Diagnostics annotations on top of the mirrored preview.
+            # Returns the input unchanged unless FACE_DIAGNOSTICS_ENABLED=true.
+            display_frame = get_diagnostics().overlay(display_frame, _result_faces(result))
+
+            # Update video placeholder (only the image, no widget creation)
             video_placeholder.image(
                 cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB),
                 channels="RGB",
                 use_container_width=True
             )
             
-            # Update Metrics Placeholder
-            records = attendance_service.get_session_attendance(session_id)
-            present_cnt = sum(1 for r in records if r['status'] == AttendanceStatus.PRESENT)
-            late_cnt = sum(1 for r in records if r['status'] == AttendanceStatus.LATE)
-            total_cnt = len(records)
-            
-            with metrics_placeholder.container():
-                m_col1, m_col2, m_col3 = st.columns(3)
-                m_col1.metric("Total Marked", total_cnt)
-                m_col2.metric("Present", present_cnt)
-                m_col3.metric("Late", late_cnt)
+            # Refresh database cache periodically (every 30 frames = once per second at 30fps)
+            # This reduces database queries from 300/run to 10/run
+            if frame_count % 30 == 0:
+                cached_records = attendance_service.get_session_attendance(session_id)
+                cached_present_cnt = sum(1 for r in cached_records if r['status'] == AttendanceStatus.PRESENT)
+                cached_late_cnt = sum(1 for r in cached_records if r['status'] == AttendanceStatus.LATE)
+                cached_total_cnt = len(cached_records)
                 
-            # Update Last Detected Person Info
-            if result.processed_faces:
-                face_info = result.processed_faces[0]
-                with person_info_placeholder.container():
-                    if face_info.is_recognized:
-                        st.markdown(f"**Name:** {face_info.student_name or '—'}")
-                        st.markdown(f"**ID:** `{face_info.student_id}`")
-                        liveness_badge = "🟢 Live" if face_info.liveness_state == LivenessState.LIVE else "🟡 Pending"
-                        st.markdown(f"**Liveness:** {liveness_badge}")
-                        if face_info.attendance_marked:
-                            st.success(f"✅ Attendance Marked: **{face_info.attendance_status.upper()}**")
-                        elif face_info.already_marked:
-                            st.info("ℹ️ Already Marked for this session")
-                        else:
-                            st.warning(f"⚠️ {face_info.reason}")
-                    else:
-                        st.markdown("**Identity:** :red[**Unknown Person**]")
-                        st.markdown(f"**Confidence:** {face_info.detection_confidence:.2f}")
-                        st.info("No attendance record created for unknown face.")
-            else:
-                with person_info_placeholder.container():
-                    st.caption("No face currently detected in frame.")
+                # Update metrics using pre-formatted markdown (no st.columns creation per frame)
+                metrics_placeholder.markdown(
+                    f"**Total:** {cached_total_cnt} | **Present:** {cached_present_cnt} | **Late:** {cached_late_cnt}"
+                )
+                
+            # Update Last Detected Person Info (build markdown string, single update)
+            person_info_markdown = _build_person_info_markdown(result)
+            person_info_placeholder.markdown(person_info_markdown, unsafe_allow_html=False)
                     
-            # Update Records Table (periodically every 10 frames to avoid overhead)
-            if frame_count % 10 == 0:
-                _update_live_records_table(records_table_placeholder, records, student_service)
+            # Update Records Table (every 30 frames to match database refresh rate)
+            if frame_count % 30 == 0:
+                _update_live_records_table(records_table_placeholder, cached_records, student_service)
                 
             time.sleep(0.033)
             frame_count += 1
@@ -347,6 +379,84 @@ def _run_realtime_attendance_stream(
         if st.session_state.att_camera_active:
             time.sleep(0.2)
             st.rerun()
+
+
+def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
+    """
+    Build a single markdown string for person info display.
+    
+    Reduces per-frame Streamlit API calls from 6-8 widget creations
+    to a single markdown update.
+    """
+    if not result.processed_faces:
+        return "_No face currently detected in frame._"
+    
+    face_info = result.processed_faces[0]
+    
+    if face_info.is_recognized:
+        name = face_info.student_name or '—'
+        student_id = face_info.student_id or '—'
+        
+        # Build liveness status with instructions
+        if face_info.liveness_state == LivenessState.LIVE:
+            liveness_display = "🟢 **Live** — Verified"
+        else:
+            # Show actionable instructions based on actual detector state
+            blink_status = f"{face_info.blink_count}/{face_info.min_blinks_required} blinks"
+            
+            challenge_instruction = ""
+            if face_info.challenge_type != "none":
+                if face_info.challenge_state == "completed":
+                    challenge_instruction = "✅ Challenge completed"
+                elif face_info.challenge_state == "active":
+                    if face_info.challenge_type == "turn_left":
+                        challenge_instruction = f"👈 **Turn your head LEFT** ({int(face_info.challenge_progress * 100)}%)"
+                    elif face_info.challenge_type == "turn_right":
+                        challenge_instruction = f"👉 **Turn your head RIGHT** ({int(face_info.challenge_progress * 100)}%)"
+                    else:
+                        challenge_instruction = f"Challenge: {face_info.challenge_type}"
+                elif face_info.challenge_state == "inactive":
+                    challenge_instruction = "⏳ Initializing challenge..."
+                else:
+                    challenge_instruction = f"Challenge: {face_info.challenge_state}"
+            
+            # Determine what the user needs to do
+            needs_blinks = face_info.blink_count < face_info.min_blinks_required
+            needs_challenge = (face_info.challenge_type != "none" and 
+                             face_info.challenge_state != "completed")
+            
+            if needs_blinks and needs_challenge:
+                instruction = f"🔵 **Blink naturally** ({blink_status}) and {challenge_instruction}"
+            elif needs_blinks:
+                instruction = f"🔵 **Blink naturally** to verify liveness ({blink_status})"
+            elif needs_challenge:
+                instruction = f"🔵 {challenge_instruction}"
+            else:
+                instruction = "🟡 **Verifying...** Almost there!"
+            
+            liveness_display = instruction
+        
+        lines = [
+            f"**Name:** {name}",
+            f"**ID:** `{student_id}`",
+            f"**Liveness:** {liveness_display}",
+        ]
+        
+        if face_info.attendance_marked:
+            lines.append(f"✅ **Attendance Marked: {face_info.attendance_status.upper()}**")
+        elif face_info.already_marked:
+            lines.append("ℹ️ _Already Marked for this session_")
+        else:
+            lines.append(f"⚠️ _{face_info.reason}_")
+            
+        return "\n\n".join(lines)
+    else:
+        conf = face_info.detection_confidence
+        return (
+            f"**Identity:** :red[**Unknown Person**]\n\n"
+            f"**Confidence:** {conf:.2f}\n\n"
+            f"_No attendance record created for unknown face._"
+        )
 
 
 def _draw_attendance_overlays(
@@ -415,6 +525,19 @@ def _draw_attendance_overlays(
         )
         
     return display_frame
+
+
+def _result_faces(result) -> List[DetectedFace]:
+    """
+    Convert a RealTimeAttendanceResult into DetectedFace objects.
+
+    Lets the diagnostics overlay reuse the existing bbox/confidence values.
+    Returns an empty list when nothing was detected.
+    """
+    faces: List[DetectedFace] = []
+    for face in getattr(result, "processed_faces", []) or []:
+        faces.append(DetectedFace(tuple(face.bbox), float(face.detection_confidence)))
+    return faces
 
 
 def _update_live_records_table(
