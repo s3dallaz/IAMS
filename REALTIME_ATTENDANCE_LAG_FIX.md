@@ -1,6 +1,6 @@
 # Real-Time Attendance Camera Lag Fix
 
-**Date:** 2026-10-10  
+**Date:** 2026-10-10
 **Status:** ✅ **FIXED**
 
 ---
@@ -194,7 +194,7 @@ Automated tests verify correctness but cannot verify visual smoothness. Test wit
 - Liveness (EAR): ~5-10ms
 - **Total:** ~100-180ms per frame
 
-At 30 fps (33ms/frame), CV processing took longer than frame time = lag.  
+At 30 fps (33ms/frame), CV processing took longer than frame time = lag.
 At 6 fps (166ms/frame), CV has plenty of time to complete = smooth.
 
 ### Attendance Marking Reliability
@@ -217,13 +217,13 @@ At 6 fps (166ms/frame), CV has plenty of time to complete = smooth.
 ```python
 while frame_count < max_frames_per_run:
     frame = camera.read_frame()
-    
+
     # ❌ BOTTLENECK: Heavy CV pipeline on EVERY frame
     result = rt_manager.process_frame(frame, session_id=session_id)
-    
+
     display_frame = _draw_attendance_overlays(frame, result)
     video_placeholder.image(display_frame)  # Blocked waiting for CV
-    
+
     time.sleep(0.033)  # 30 fps target
 ```
 
@@ -236,17 +236,17 @@ cv_process_interval = 5
 
 while frame_count < max_frames_per_run:
     frame = camera.read_frame()
-    
+
     # ✅ FIX: Only process CV every 5th frame
     if frame_count % cv_process_interval == 0:
         result = rt_manager.process_frame(frame, session_id=session_id)
         last_cv_result = result
     else:
         result = last_cv_result or default_result
-    
+
     display_frame = _draw_attendance_overlays(frame, result)
     video_placeholder.image(display_frame)  # Never blocked
-    
+
     time.sleep(0.033)  # Actual 30 fps achieved
 ```
 

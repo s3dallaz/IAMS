@@ -155,7 +155,7 @@ def _render_footer_controls(assistant: AIAssistantService) -> None:
     col_clear, col_examples = st.columns([1, 3])
 
     with col_clear:
-        if st.button("🗑️ Clear Chat", use_container_width=True, key="ai_assistant_clear"):
+        if st.button("🗑️ Clear Chat", width="stretch", key="ai_assistant_clear"):
             st.session_state.chat_history = []
             assistant.reset_conversation()
             st.rerun()
@@ -170,7 +170,7 @@ def _render_footer_controls(assistant: AIAssistantService) -> None:
         ]
         for column, (label, prompt, key) in zip((b1, b2, b3), examples):
             with column:
-                if st.button(label, use_container_width=True, key=key):
+                if st.button(label, width="stretch", key=key):
                     st.session_state._pending_prompt = prompt
 
     pending = st.session_state.pop("_pending_prompt", None)

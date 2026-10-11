@@ -1,6 +1,6 @@
 # Real-Time Attendance Bug Fixes Report
 
-**Date:** 2026-10-10  
+**Date:** 2026-10-10
 **Status:** ✅ **BOTH BUGS FIXED**
 
 ---
@@ -127,7 +127,7 @@ if liveness_detector.enable_challenges and liveness_detector.require_challenge:
     # CRITICAL FIX: Must verify BOTH blinks AND challenge completion for LIVE state
     challenge_state = liveness_detector.challenge_state
     challenge_completed = (challenge_state == ChallengeState.COMPLETED)
-    
+
     # Only LIVE if BOTH conditions are met
     if blink_passed and challenge_completed:
         liveness_state = LivenessState.LIVE
@@ -163,7 +163,7 @@ from src.computer_vision.liveness_detector import (
 **Proper Validation Flow:**
 
 1. **Blink Check:** Verify `blink_count >= min_blinks`
-2. **Challenge Check (if enabled):** 
+2. **Challenge Check (if enabled):**
    - Get current `challenge_state` (enum, not string)
    - Compare with `ChallengeState.COMPLETED` (enum comparison)
 3. **BOTH Requirements:** Only mark as LIVE if BOTH conditions are met

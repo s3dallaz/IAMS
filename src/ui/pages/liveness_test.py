@@ -146,7 +146,7 @@ def render_liveness_test():
     
     with col1:
         if not st.session_state.camera_active:
-            if st.button("📹 Start Camera", use_container_width=True):
+            if st.button("📹 Start Camera", width="stretch"):
                 # Detectors should already be initialized at page load
                 if not st.session_state.detectors_initialized:
                     st.warning("⏳ Detectors still initializing, please wait...")
@@ -170,7 +170,7 @@ def render_liveness_test():
         else:
             # Camera is running - show Start/Reset Test button
             button_label = "🔄 Start/Reset Test" if st.session_state.test_completed else "▶️ Start Test"
-            if st.button(button_label, disabled=st.session_state.test_active, use_container_width=True):
+            if st.button(button_label, disabled=st.session_state.test_active, width="stretch"):
                 # Ensure detectors are ready
                 if not st.session_state.detectors_initialized:
                     st.warning("Detectors not ready yet, please wait...")
@@ -187,7 +187,7 @@ def render_liveness_test():
     
     with col2:
         if st.session_state.camera_active:
-            if st.button("⏹️ Stop Camera", use_container_width=True):
+            if st.button("⏹️ Stop Camera", width="stretch"):
                 # Stop camera session completely
                 st.session_state.camera_active = False
                 st.session_state.test_active = False

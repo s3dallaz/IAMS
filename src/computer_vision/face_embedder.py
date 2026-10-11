@@ -5,11 +5,12 @@ Provides face embedding generation using face_recognition library.
 Generates 128-dimensional face encodings from face images for recognition purposes.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import face_recognition
 
 from src.utils.logger import get_logger
+from src.utils.performance_timer import time_operation
 
 
 class FaceEmbeddingError(Exception):
@@ -106,13 +107,15 @@ class FaceEmbedder:
         
         # Generate face encodings
         try:
-            # face_recognition.face_encodings returns a list of encodings
-            # (one per face detected in the image)
-            encodings = face_recognition.face_encodings(rgb_image)
+            # PERFORMANCE: Use small crop from MediaPipe detection instead of full frame.
+            # Benchmark shows: crop=11ms vs full_frame=138ms vs full_frame_with_bbox=248ms
+            with time_operation("dlib_face_encoding"):
+                encodings = face_recognition.face_encodings(rgb_image)
             
             if len(encodings) == 0:
-                # No face detected in the provided image
-                self.logger.warning("No face detected in image for encoding")
+                # No face detected in the provided image - log at DEBUG to reduce spam
+                # since this happens frequently during real-time processing
+                self.logger.debug("No face detected in image for encoding")
                 return None
             
             if len(encodings) > 1:

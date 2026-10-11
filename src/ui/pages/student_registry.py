@@ -110,7 +110,7 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
     with col_hdr:
         st.subheader("📋 Student Directory")
     with col_btn:
-        if st.button("➕ Add New Student", type="primary", use_container_width=True, key="btn_open_add_student"):
+        if st.button("➕ Add New Student", type="primary", width="stretch", key="btn_open_add_student"):
             release_registration_camera()
             st.session_state['current_view'] = 'add'
             st.rerun()
@@ -163,7 +163,7 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
                 'Face Dataset': face_status,
                 'Enrolled At': format_datetime(s['enrolled_at'])
             })
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        st.dataframe(table_rows, width="stretch", hide_index=True)
 
         st.markdown("#### ⚡ Manage Students")
         
@@ -175,11 +175,11 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
                 st.warning(f"⚠️ **Are you sure you want to permanently delete {del_student['name']} (`{del_student['student_id']}`)?**\nThis will also remove all face samples and attendance records.")
                 col_d1, col_d2 = st.columns(2)
                 with col_d1:
-                    if st.button("❌ Cancel Deletion", key="btn_cancel_delete", use_container_width=True):
+                    if st.button("❌ Cancel Deletion", key="btn_cancel_delete", width="stretch"):
                         st.session_state['confirm_delete_id'] = None
                         st.rerun()
                 with col_d2:
-                    if st.button("🗑️ Yes, Delete Student", type="primary", key="btn_confirm_delete", use_container_width=True):
+                    if st.button("🗑️ Yes, Delete Student", type="primary", key="btn_confirm_delete", width="stretch"):
                         try:
                             # Clean up face samples folder first
                             enrollment_service.clear_student_face_dataset(del_target_id)
@@ -202,20 +202,20 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
             row_cols[1].write(f"**{s['name']}**")
             
             with row_cols[2]:
-                if st.button(face_badge, key=f"btn_face_{s['id']}", use_container_width=True):
+                if st.button(face_badge, key=f"btn_face_{s['id']}", width="stretch"):
                     release_registration_camera()
                     st.session_state['selected_student_id'] = s['id']
                     st.session_state['current_view'] = 'manage_face'
                     st.rerun()
                     
             with row_cols[3]:
-                if st.button("✏️ Edit", key=f"btn_edit_{s['id']}", use_container_width=True):
+                if st.button("✏️ Edit", key=f"btn_edit_{s['id']}", width="stretch"):
                     st.session_state['selected_student_id'] = s['id']
                     st.session_state['current_view'] = 'edit'
                     st.rerun()
                     
             with row_cols[4]:
-                if st.button("🗑️ Delete", key=f"btn_del_{s['id']}", use_container_width=True):
+                if st.button("🗑️ Delete", key=f"btn_del_{s['id']}", width="stretch"):
                     st.session_state['confirm_delete_id'] = s['id']
                     st.rerun()
                     
@@ -243,7 +243,7 @@ def render_add_student_view(service: StudentService):
     st.subheader("➕ Register New Student")
     st.markdown("Enter student information. The student will immediately be added to SQLite and available in the directory.")
     
-    if st.button("⬅️ Back to Student Directory", key="btn_back_add_top", use_container_width=False):
+    if st.button("⬅️ Back to Student Directory", key="btn_back_add_top", width="content"):
         st.session_state['current_view'] = 'directory'
         st.rerun()
         
@@ -262,7 +262,7 @@ def render_add_student_view(service: StudentService):
     
     col_save, col_cancel = st.columns([1, 1])
     with col_save:
-        if st.button("💾 Save Student Profile", type="primary", use_container_width=True, key="btn_save_new_student"):
+        if st.button("💾 Save Student Profile", type="primary", width="stretch", key="btn_save_new_student"):
             if not new_id or not str(new_id).strip():
                 st.error("❌ Student ID is required.")
                 return
@@ -310,7 +310,7 @@ def render_add_student_view(service: StudentService):
                 st.error(f"❌ Failed to register student: {e}")
 
     with col_cancel:
-        if st.button("Cancel", use_container_width=True, key="btn_cancel_new_student"):
+        if st.button("Cancel", width="stretch", key="btn_cancel_new_student"):
             st.session_state['current_view'] = 'directory'
             st.rerun()
 
@@ -331,7 +331,7 @@ def render_edit_student_view(service: StudentService, student_db_id: int):
 
     st.subheader(f"✏️ Edit Profile: {student['name']} (`{student['student_id']}`)")
     
-    if st.button("⬅️ Back to Student Directory", key="btn_back_edit_top", use_container_width=False):
+    if st.button("⬅️ Back to Student Directory", key="btn_back_edit_top", width="content"):
         st.session_state['current_view'] = 'directory'
         st.rerun()
         
@@ -350,7 +350,7 @@ def render_edit_student_view(service: StudentService, student_db_id: int):
     
     col_save, col_cancel = st.columns([1, 1])
     with col_save:
-        if st.button("💾 Save Changes", type="primary", use_container_width=True, key="btn_save_edit_student"):
+        if st.button("💾 Save Changes", type="primary", width="stretch", key="btn_save_edit_student"):
             if not edit_id or not str(edit_id).strip():
                 st.error("❌ Student ID is required.")
                 return
@@ -378,7 +378,7 @@ def render_edit_student_view(service: StudentService, student_db_id: int):
                 st.error(f"❌ Update failed: {e}")
                 
     with col_cancel:
-        if st.button("Cancel", use_container_width=True, key="btn_cancel_edit_student"):
+        if st.button("Cancel", width="stretch", key="btn_cancel_edit_student"):
             st.session_state['current_view'] = 'directory'
             st.rerun()
 
@@ -410,7 +410,7 @@ def render_manage_face_view(
 
     st.subheader(f"📸 Manage Face Dataset: {student['name']} (`{student['student_id']}`)")
     
-    if st.button("⬅️ Back to Student Directory", key="btn_back_face_top", use_container_width=False):
+    if st.button("⬅️ Back to Student Directory", key="btn_back_face_top", width="content"):
         release_registration_camera()
         st.session_state['confirm_reset_face_id'] = None
         st.session_state['current_view'] = 'directory'
@@ -440,11 +440,11 @@ def render_manage_face_view(
         st.warning(f"⚠️ **Permanently delete all {sample_count} enrolled face samples for {student['name']}?** This action cannot be undone.")
         col_res1, col_res2 = st.columns(2)
         with col_res1:
-            if st.button("❌ Cancel Reset", key="btn_cancel_reset_samples", use_container_width=True):
+            if st.button("❌ Cancel Reset", key="btn_cancel_reset_samples", width="stretch"):
                 st.session_state['confirm_reset_face_id'] = None
                 st.rerun()
         with col_res2:
-            if st.button("🗑️ Yes, Delete All Samples", type="primary", key="btn_confirm_reset_samples", use_container_width=True):
+            if st.button("🗑️ Yes, Delete All Samples", type="primary", key="btn_confirm_reset_samples", width="stretch"):
                 release_registration_camera()
                 enrollment_service.clear_student_face_dataset(student_db_id)
                 st.session_state['confirm_reset_face_id'] = None
@@ -476,7 +476,7 @@ def render_manage_face_view(
         
         if uploaded_files:
             st.caption(f"{len(uploaded_files)} file(s) selected")
-            if st.button("🔍 Process & Enroll Uploaded Faces", type="primary", use_container_width=True, key="btn_process_uploaded"):
+            if st.button("🔍 Process & Enroll Uploaded Faces", type="primary", width="stretch", key="btn_process_uploaded"):
                 with st.spinner("Analyzing and validating face samples..."):
                     success_count = 0
                     errors = []
@@ -545,7 +545,7 @@ def render_manage_face_view(
             else:
                 st.info("💡 Click **Take Photo** to start live preview, position face, and capture.")
             
-            if st.button("📸 Take Photo", type="primary", use_container_width=True, key="btn_start_enroll_camera"):
+            if st.button("📸 Take Photo", type="primary", width="stretch", key="btn_start_enroll_camera"):
                 cam = CameraManager(camera_index=0)
                 if cam.open():
                     st.session_state['reg_cam_manager'] = cam
@@ -564,7 +564,7 @@ def render_manage_face_view(
             if cam is None or not cam.is_open():
                 st.warning("Camera is not active.")
                 release_registration_camera()
-                if st.button("🔄 Open Camera Again", use_container_width=True, key="btn_reopen_cam"):
+                if st.button("🔄 Open Camera Again", width="stretch", key="btn_reopen_cam"):
                     st.rerun()
                 return
 
@@ -604,7 +604,7 @@ def render_manage_face_view(
                 st.image(
                     cv2.cvtColor(mirrored_captured, cv2.COLOR_BGR2RGB),
                     caption="Captured Frame Preview",
-                    use_container_width=True
+                    width="stretch"
                 )
                 
                 col_app, col_ret = st.columns(2)
@@ -612,7 +612,7 @@ def render_manage_face_view(
                     approve_label = "✓ Approve / Use Photo"
                     if is_multi_angle:
                         approve_label = f"✓ Approve {angle_steps[current_step]['name']}"
-                    if st.button(approve_label, type="primary", use_container_width=True, key="btn_approve_captured"):
+                    if st.button(approve_label, type="primary", width="stretch", key="btn_approve_captured"):
                         with st.spinner("Validating face and saving embedding..."):
                             try:
                                 # Validate and enroll the unmirrored original frame
@@ -646,13 +646,13 @@ def render_manage_face_view(
                                 st.error(f"❌ Error saving sample: {e}")
                                 
                 with col_ret:
-                    if st.button("↻ Retake", use_container_width=True, key="btn_retake_captured"):
+                    if st.button("↻ Retake", width="stretch", key="btn_retake_captured"):
                         # Discard frame and return immediately to live streaming without reopening camera
                         st.session_state['captured_photo_preview'] = None
                         st.rerun()
                         
                 st.markdown("---")
-                if st.button("⏹️ Stop / Close Camera", use_container_width=True, key="btn_stop_cam_on_preview"):
+                if st.button("⏹️ Stop / Close Camera", width="stretch", key="btn_stop_cam_on_preview"):
                     release_registration_camera()
                     st.rerun()
                 return
@@ -665,9 +665,9 @@ def render_manage_face_view(
             
             col_cap, col_cancel = st.columns(2)
             with col_cap:
-                capture_clicked = st.button("📸 Capture Photo", type="primary", use_container_width=True, key="btn_capture_frame_now")
+                capture_clicked = st.button("📸 Capture Photo", type="primary", width="stretch", key="btn_capture_frame_now")
             with col_cancel:
-                cancel_clicked = st.button("⏹️ Stop / Close Camera", use_container_width=True, key="btn_stop_cam_streaming")
+                cancel_clicked = st.button("⏹️ Stop / Close Camera", width="stretch", key="btn_stop_cam_streaming")
 
             if cancel_clicked:
                 release_registration_camera()
@@ -712,7 +712,7 @@ def render_manage_face_view(
                     video_placeholder.image(
                         cv2.cvtColor(mirrored_preview, cv2.COLOR_BGR2RGB),
                         caption=live_caption,
-                        use_container_width=True
+                        width="stretch"
                     )
                     
                     time.sleep(0.033)

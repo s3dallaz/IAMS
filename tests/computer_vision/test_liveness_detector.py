@@ -2229,6 +2229,378 @@ class TestBlinkBugRegression:
         # The evaluation logic must check BOTH conditions
 
 
+class TestYawSignConvention:
+    """
+    Tests for the yaw sign convention fix.
+
+    The camera frame fed to _estimate_head_yaw is the raw, UNMIRRORED frame
+    captured from OpenCV.  In a front-facing camera:
+
+      - MediaPipe landmark 33  (RIGHT_EYE_OUTER) is the subject's anatomical
+        right eye → appears on the IMAGE-LEFT side (smaller x pixel value).
+      - MediaPipe landmark 263 (LEFT_EYE_OUTER)  is the subject's anatomical
+        left eye  → appears on the IMAGE-RIGHT side (larger x pixel value).
+
+    When the user turns their head RIGHT:
+      • their nose moves toward their right eye (toward smaller image-x)
+      • nose_deviation  = -(nose_x - eye_center_x)  should be POSITIVE
+      • _estimate_head_yaw should return a POSITIVE value
+
+    When the user turns their head LEFT:
+      • their nose moves toward their left eye (toward larger image-x)
+      • nose_deviation  = -(nose_x - eye_center_x)  should be NEGATIVE
+      • _estimate_head_yaw should return a NEGATIVE value
+
+    The challenge checks are:
+      TURN_RIGHT  requires  yaw > +threshold   (positive)
+      TURN_LEFT   requires  yaw < -threshold   (negative)
+
+    These tests use a mock MediaPipe landmark result so they are deterministic
+    and do not depend on a camera or the MediaPipe model file.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _frame(width=640, height=480):
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
+    @staticmethod
+    def _face():
+        return DetectedFace(bbox=(220, 140, 200, 200), confidence=0.95)
+
+    @staticmethod
+    def _make_landmark(x_norm, y_norm=0.5):
+        """Return a minimal mock landmark with .x and .y normalised attributes."""
+        class _L:
+            pass
+        lm = _L()
+        lm.x = x_norm
+        lm.y = y_norm
+        return lm
+
+    def _landmarks_for_position(self, nose_x_norm, frame_width=640):
+        """
+        Build a 478-element mock landmark list whose relevant indices match the
+        sign-convention table in LivenessDetector:
+
+            NOSE_TIP        =   1   →  given nose_x_norm
+            RIGHT_EYE_OUTER =  33   →  image-left  (subject's right eye, small x)
+            LEFT_EYE_OUTER  = 263   →  image-right (subject's left eye,  large x)
+
+        We fix the eye positions symmetrically at 0.35 / 0.65 so the eye span
+        is non-zero and the centre is at 0.50.
+        """
+        right_eye_x = 0.35   # subject's right eye: image-left
+        left_eye_x  = 0.65   # subject's left eye:  image-right
+
+        lms = [self._make_landmark(0.5) for _ in range(478)]
+        lms[1]   = self._make_landmark(nose_x_norm)   # NOSE_TIP
+        lms[33]  = self._make_landmark(right_eye_x)   # RIGHT_EYE_OUTER
+        lms[263] = self._make_landmark(left_eye_x)    # LEFT_EYE_OUTER
+        return lms
+
+    def _patch_landmarks(self, detector, landmarks):
+        """
+        Force the per-frame landmark cache to return `landmarks` without running
+        the actual MediaPipe model.
+        """
+        detector._cached_frame_id = None   # will be overwritten on first call
+        detector._cached_landmarks = landmarks
+
+        # Patch _get_landmarks_for_frame to always return our landmarks
+        def _fake_get(frame):
+            detector._cached_frame_id = id(frame)
+            detector._cached_landmarks = landmarks
+            return landmarks
+
+        detector._get_landmarks_for_frame = _fake_get
+
+    # ── yaw sign tests ────────────────────────────────────────────────────────
+
+    def test_nose_at_centre_gives_zero_yaw(self):
+        """Nose exactly between the eyes → yaw ≈ 0."""
+        detector = LivenessDetector()
+        frame = self._frame()
+        face  = self._face()
+        self._patch_landmarks(detector, self._landmarks_for_position(0.50))
+
+        yaw = detector._estimate_head_yaw(frame, face)
+
+        assert yaw is not None
+        assert abs(yaw) < 1.0, f"Expected ~0, got {yaw}"
+
+    def test_right_turn_gives_positive_yaw(self):
+        """
+        User turns RIGHT: nose moves toward subject's right eye (image-left,
+        smaller x).  The fixed sign convention must return a POSITIVE yaw so
+        that the TURN_RIGHT challenge condition  (yaw > +threshold)  is met.
+        """
+        detector = LivenessDetector()
+        frame = self._frame()
+        face  = self._face()
+        # Nose shifted left of centre (toward image-left = subject's right eye)
+        self._patch_landmarks(detector, self._landmarks_for_position(0.38))
+
+        yaw = detector._estimate_head_yaw(frame, face)
+
+        assert yaw is not None, "Expected a numeric yaw, got None"
+        assert yaw > 0, (
+            f"RIGHT turn (nose at 0.38, eyes at 0.35/0.65) must give POSITIVE yaw; "
+            f"got {yaw:.2f}.  TURN_RIGHT challenge would never fire."
+        )
+
+    def test_left_turn_gives_negative_yaw(self):
+        """
+        User turns LEFT: nose moves toward subject's left eye (image-right,
+        larger x).  The fixed sign convention must return a NEGATIVE yaw so
+        that the TURN_LEFT challenge condition  (yaw < -threshold)  is met.
+        """
+        detector = LivenessDetector()
+        frame = self._frame()
+        face  = self._face()
+        # Nose shifted right of centre (toward image-right = subject's left eye)
+        self._patch_landmarks(detector, self._landmarks_for_position(0.62))
+
+        yaw = detector._estimate_head_yaw(frame, face)
+
+        assert yaw is not None, "Expected a numeric yaw, got None"
+        assert yaw < 0, (
+            f"LEFT turn (nose at 0.62, eyes at 0.35/0.65) must give NEGATIVE yaw; "
+            f"got {yaw:.2f}.  TURN_LEFT challenge would never fire."
+        )
+
+    def test_yaw_magnitude_increases_with_turn_angle(self):
+        """Larger head turn → larger absolute yaw value."""
+        detector = LivenessDetector()
+        frame = self._frame()
+        face  = self._face()
+
+        self._patch_landmarks(detector, self._landmarks_for_position(0.45))
+        yaw_small = detector._estimate_head_yaw(frame, face)
+
+        self._patch_landmarks(detector, self._landmarks_for_position(0.35))
+        yaw_large = detector._estimate_head_yaw(frame, face)
+
+        assert yaw_small is not None
+        assert yaw_large is not None
+        assert abs(yaw_large) > abs(yaw_small), (
+            f"Larger turn should give larger |yaw|: {abs(yaw_large):.2f} vs {abs(yaw_small):.2f}"
+        )
+
+    # ── challenge completion with physical movement ───────────────────────────
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_right_challenge_completed_by_right_turn(self, mock_yaw):
+        """
+        TURN_RIGHT challenge must be satisfied by a positive yaw value
+        (user physically turns right, nose toward image-left).
+        """
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3,
+        )
+        detector._current_challenge = ChallengeType.TURN_RIGHT
+        detector._challenge_state   = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 0
+
+        frame = self._frame()
+        face  = self._face()
+
+        # positive yaw = user turned right
+        mock_yaw.return_value = 30.0
+        for _ in range(3):
+            detector.update_temporal_state(0.30, frame, face)
+
+        assert detector._challenge_state == ChallengeState.COMPLETED, (
+            "TURN_RIGHT challenge must complete when yaw is +30 (right turn)"
+        )
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_right_challenge_not_completed_by_left_turn(self, mock_yaw):
+        """
+        TURN_RIGHT challenge must NOT be satisfied by a negative yaw value
+        (user physically turns left).
+        """
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3,
+        )
+        detector._current_challenge = ChallengeType.TURN_RIGHT
+        detector._challenge_state   = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 0
+
+        frame = self._frame()
+        face  = self._face()
+
+        # negative yaw = user turned left — must not satisfy TURN_RIGHT
+        mock_yaw.return_value = -30.0
+        for _ in range(5):
+            detector.update_temporal_state(0.30, frame, face)
+
+        assert detector._challenge_state != ChallengeState.COMPLETED, (
+            "TURN_RIGHT challenge must NOT complete when yaw is -30 (left turn)"
+        )
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_left_challenge_completed_by_left_turn(self, mock_yaw):
+        """
+        TURN_LEFT challenge must be satisfied by a negative yaw value
+        (user physically turns left, nose toward image-right).
+        """
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3,
+        )
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state   = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 0
+
+        frame = self._frame()
+        face  = self._face()
+
+        # negative yaw = user turned left
+        mock_yaw.return_value = -30.0
+        for _ in range(3):
+            detector.update_temporal_state(0.30, frame, face)
+
+        assert detector._challenge_state == ChallengeState.COMPLETED, (
+            "TURN_LEFT challenge must complete when yaw is -30 (left turn)"
+        )
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_left_challenge_not_completed_by_right_turn(self, mock_yaw):
+        """
+        TURN_LEFT challenge must NOT be satisfied by a positive yaw value
+        (user physically turns right).
+        """
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3,
+        )
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state   = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 0
+
+        frame = self._frame()
+        face  = self._face()
+
+        # positive yaw = user turned right — must not satisfy TURN_LEFT
+        mock_yaw.return_value = 30.0
+        for _ in range(5):
+            detector.update_temporal_state(0.30, frame, face)
+
+        assert detector._challenge_state != ChallengeState.COMPLETED, (
+            "TURN_LEFT challenge must NOT complete when yaw is +30 (right turn)"
+        )
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_insufficient_angle_does_not_complete_right_challenge(self, mock_yaw):
+        """Turn that does not reach head_turn_angle threshold must not complete."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3,
+        )
+        detector._current_challenge = ChallengeType.TURN_RIGHT
+        detector._challenge_state   = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 0
+
+        frame = self._frame()
+        face  = self._face()
+
+        # positive yaw but below the 25° threshold
+        mock_yaw.return_value = 20.0
+        for _ in range(5):
+            detector.update_temporal_state(0.30, frame, face)
+
+        assert detector._challenge_state != ChallengeState.COMPLETED
+
+    @patch('src.computer_vision.liveness_detector.LivenessDetector._estimate_head_yaw')
+    def test_insufficient_angle_does_not_complete_left_challenge(self, mock_yaw):
+        """Turn that does not reach head_turn_angle threshold must not complete."""
+        from src.computer_vision.liveness_detector import ChallengeType, ChallengeState
+
+        detector = LivenessDetector(
+            enable_challenges=True,
+            head_turn_angle=25.0,
+            head_hold_frames=3,
+        )
+        detector._current_challenge = ChallengeType.TURN_LEFT
+        detector._challenge_state   = ChallengeState.ACTIVE
+        detector._challenge_frames_held = 0
+
+        frame = self._frame()
+        face  = self._face()
+
+        # negative yaw but magnitude below the 25° threshold
+        mock_yaw.return_value = -20.0
+        for _ in range(5):
+            detector.update_temporal_state(0.30, frame, face)
+
+        assert detector._challenge_state != ChallengeState.COMPLETED
+
+    # ── landmark-level yaw sign derivation ───────────────────────────────────
+
+    def test_yaw_sign_derived_from_landmark_positions(self):
+        """
+        Black-box check: feed explicit landmark positions to _estimate_head_yaw
+        and verify the sign matches the expected user-perspective convention
+        without mocking the method itself.
+
+        Eye layout (normalised x, frame width 640):
+            RIGHT_EYE_OUTER (lm 33)  = 0.35  →  x = 224  (image-left)
+            LEFT_EYE_OUTER  (lm 263) = 0.65  →  x = 416  (image-right)
+            eye_center_x             = 0.50  →  x = 320
+
+        Right turn: nose_x = 0.38 → x = 243.2
+            raw deviation  = 243.2 - 320 = -76.8
+            after negation = +76.8  →  positive yaw  ✓ TURN_RIGHT fires
+
+        Left turn: nose_x = 0.62 → x = 396.8
+            raw deviation  = 396.8 - 320 = +76.8
+            after negation = -76.8  →  negative yaw  ✓ TURN_LEFT fires
+        """
+        detector = LivenessDetector()
+        frame    = self._frame(width=640)
+        face     = self._face()
+
+        # Right turn
+        self._patch_landmarks(detector, self._landmarks_for_position(0.38))
+        yaw_right = detector._estimate_head_yaw(frame, face)
+        assert yaw_right is not None
+        assert yaw_right > 0, (
+            f"Right turn (nose 0.38, eyes 0.35/0.65) must yield positive yaw; got {yaw_right:.3f}"
+        )
+
+        # Left turn
+        self._patch_landmarks(detector, self._landmarks_for_position(0.62))
+        yaw_left = detector._estimate_head_yaw(frame, face)
+        assert yaw_left is not None
+        assert yaw_left < 0, (
+            f"Left turn (nose 0.62, eyes 0.35/0.65) must yield negative yaw; got {yaw_left:.3f}"
+        )
+
+        # Symmetry: equal-and-opposite turns must give equal-and-opposite yaw
+        assert abs(abs(yaw_right) - abs(yaw_left)) < 0.01, (
+            f"Symmetric turns must give symmetric yaw: {yaw_right:.3f} vs {yaw_left:.3f}"
+        )
+
+
 # Run tests if executed directly
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

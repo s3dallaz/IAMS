@@ -375,6 +375,12 @@ class LivenessDetector:
         # MediaPipe Face Landmarker (lazy initialization)
         self._landmarker = None
 
+        # Per-frame landmark cache: avoids running MediaPipe twice on the same
+        # frame when both EAR extraction and head-yaw estimation are needed.
+        # Keyed by the id() of the numpy array; cleared after each frame.
+        self._cached_frame_id: Optional[int] = None
+        self._cached_landmarks = None  # raw face_landmarks list or None
+
         # Temporal state for blink detection
         self._reset_temporal_state()
 
@@ -532,6 +538,53 @@ class LivenessDetector:
             "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
         )
 
+    def _get_landmarks_for_frame(self, frame: np.ndarray):
+        """
+        Run MediaPipe Face Landmarker exactly once per unique frame object, caching
+        the raw face_landmarks list so both EAR extraction and head-yaw estimation
+        can reuse the same inference result without a second detector call.
+
+        Args:
+            frame: Input frame (BGR format from OpenCV)
+
+        Returns:
+            The first face's landmark list, or None if detection failed.
+        """
+        if self._landmarker is None:
+            self._initialize_landmarker()
+
+        if self._landmarker is None:
+            self.logger.warning("Face Landmarker not initialized, cannot extract landmarks")
+            return None
+
+        frame_id = id(frame)
+        if frame_id == self._cached_frame_id:
+            # Same frame object — reuse cached result, no second inference needed.
+            return self._cached_landmarks
+
+        try:
+            frame_rgb = self._convert_to_rgb(frame)
+            mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
+            detection_result = self._landmarker.detect(mp_image)
+
+            if (not detection_result.face_landmarks
+                    or len(detection_result.face_landmarks) == 0):
+                self.logger.debug("No face landmarks detected")
+                landmarks = None
+            else:
+                landmarks = detection_result.face_landmarks[0]
+
+            # Cache for this frame
+            self._cached_frame_id = frame_id
+            self._cached_landmarks = landmarks
+            return landmarks
+
+        except Exception as e:
+            self.logger.error(f"Error running Face Landmarker: {e}")
+            self._cached_frame_id = None
+            self._cached_landmarks = None
+            return None
+
     def _extract_eye_landmarks(
         self,
         frame: np.ndarray,
@@ -548,30 +601,11 @@ class LivenessDetector:
             Tuple of (left_eye_landmarks, right_eye_landmarks) as lists of (x, y) tuples,
             or None if landmarks cannot be extracted
         """
-        if self._landmarker is None:
-            self._initialize_landmarker()
-
-        if self._landmarker is None:
-            self.logger.warning("Face Landmarker not initialized, cannot extract landmarks")
+        face_landmarks = self._get_landmarks_for_frame(frame)
+        if face_landmarks is None:
             return None
 
         try:
-            # Convert BGR to RGB for MediaPipe
-            frame_rgb = self._convert_to_rgb(frame)
-
-            # Create MediaPipe Image
-            mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
-
-            # Detect landmarks
-            detection_result = self._landmarker.detect(mp_image)
-
-            if not detection_result.face_landmarks or len(detection_result.face_landmarks) == 0:
-                self.logger.debug("No face landmarks detected")
-                return None
-
-            # Use first face's landmarks
-            face_landmarks = detection_result.face_landmarks[0]
-
             # Extract eye landmarks in pixel coordinates
             height, width = frame.shape[:2]
 
@@ -676,25 +710,11 @@ class LivenessDetector:
         Returns:
             Yaw angle in degrees (negative=left, positive=right), or None if estimation fails
         """
-        if self._landmarker is None:
-            self._initialize_landmarker()
-
-        if self._landmarker is None:
+        face_landmarks = self._get_landmarks_for_frame(frame)
+        if face_landmarks is None:
             return None
 
         try:
-            # Convert BGR to RGB for MediaPipe
-            frame_rgb = self._convert_to_rgb(frame)
-            mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
-
-            # Detect landmarks
-            detection_result = self._landmarker.detect(mp_image)
-
-            if not detection_result.face_landmarks or len(detection_result.face_landmarks) == 0:
-                return None
-
-            # Use first face's landmarks
-            face_landmarks = detection_result.face_landmarks[0]
             height, width = frame.shape[:2]
 
             # Get key landmarks for head pose estimation
@@ -716,13 +736,23 @@ class LivenessDetector:
             if eye_span == 0:
                 return None
 
-            # Calculate nose deviation from eye center
-            nose_deviation = nose_x - eye_center_x
+            # Calculate nose deviation from eye center.
+            #
+            # Sign convention (user's perspective, matching challenge labels):
+            #   positive yaw  = user turned RIGHT
+            #   negative yaw  = user turned LEFT
+            #
+            # In an unmirrored front-facing camera frame MediaPipe's anatomical
+            # RIGHT_EYE_OUTER (landmark 33) sits on the IMAGE-LEFT side (small x)
+            # and LEFT_EYE_OUTER (landmark 263) sits on the IMAGE-RIGHT side
+            # (large x).  When the user turns their head RIGHT their nose moves
+            # toward their right eye, i.e. toward SMALLER x values, making
+            # (nose_x - eye_center_x) NEGATIVE.  We negate so that a rightward
+            # head turn yields a POSITIVE yaw value, matching TURN_RIGHT logic.
+            nose_deviation = -(nose_x - eye_center_x)
 
-            # Estimate yaw angle
-            # Positive deviation = turned right, negative = turned left
-            # Scale factor empirically determined for typical face geometry
-            yaw_angle = (nose_deviation / eye_span) * 60.0  # Scale to degrees
+            # Scale to approximate degrees using the inter-eye span as reference.
+            yaw_angle = (nose_deviation / eye_span) * 60.0
 
             return float(yaw_angle)
 

@@ -1,9 +1,9 @@
 # AUDIT: Real-Time Attendance Camera Performance
 ## Evidence-Based Analysis — Read-Only Investigation
 
-**Date:** October 11, 2026  
-**Scope:** Camera FPS degradation, startup latency, terminal warnings  
-**Status:** Investigation complete — No fixes implemented  
+**Date:** October 11, 2026
+**Scope:** Camera FPS degradation, startup latency, terminal warnings
+**Status:** Investigation complete — No fixes implemented
 **Confidence Levels:** Confirmed (code verified), Likely (strong evidence), Unconfirmed (requires runtime instrumentation)
 
 ---
@@ -50,8 +50,8 @@ This is the **correct pattern** and explains why the camera doesn't freeze: expe
 
 #### 1. **Active Liveness Verification — Highest Cost** [CONFIRMED]
 
-**Severity:** HIGH  
-**Confidence:** CONFIRMED (code verified)  
+**Severity:** HIGH
+**Confidence:** CONFIRMED (code verified)
 **Files:** `src/computer_vision/liveness_detector.py` (lines 519-840)
 
 **Evidence:**
@@ -82,8 +82,8 @@ This is the **correct pattern** and explains why the camera doesn't freeze: expe
 
 #### 2. **Face Embedding Generation** [CONFIRMED]
 
-**Severity:** MEDIUM  
-**Confidence:** CONFIRMED (code verified)  
+**Severity:** MEDIUM
+**Confidence:** CONFIRMED (code verified)
 **Files:** `src/computer_vision/face_embedder.py` (lines 62-136)
 
 **Evidence:**
@@ -99,8 +99,8 @@ This is the **correct pattern** and explains why the camera doesn't freeze: expe
 
 #### 3. **Face Recognition Gallery Matching** [CONFIRMED]
 
-**Severity:** LOW-MEDIUM  
-**Confidence:** CONFIRMED (code verified)  
+**Severity:** LOW-MEDIUM
+**Confidence:** CONFIRMED (code verified)
 **Files:** `src/services/real_time_attendance_service.py` (lines 507-511)
 
 **Evidence:**
@@ -114,11 +114,11 @@ This is the **correct pattern** and explains why the camera doesn't freeze: expe
 
 #### 4. **Database Queries** [CONFIRMED — ALREADY OPTIMIZED]
 
-**Severity:** LOW  
-**Confidence:** CONFIRMED (code verified)  
+**Severity:** LOW
+**Confidence:** CONFIRMED (code verified)
 **Files:** `src/ui/pages/realtime_attendance.py` (lines 350-354)
 
-**Before optimization:** Database queries every frame (~300+ per run)  
+**Before optimization:** Database queries every frame (~300+ per run)
 **After optimization:** Database queries every 30 frames (~10 per run)
 
 ```python
@@ -132,8 +132,8 @@ if frame_count % 30 == 0:
 
 #### 5. **Streamlit UI Rendering Overhead** [CONFIRMED — ALREADY OPTIMIZED]
 
-**Severity:** MEDIUM  
-**Confidence:** CONFIRMED (code verified)  
+**Severity:** MEDIUM
+**Confidence:** CONFIRMED (code verified)
 **Files:** `src/ui/pages/realtime_attendance.py` (lines 335-368)
 
 **Before optimization:**
@@ -163,7 +163,7 @@ Single markdown update, no widget recreation.
 - Result passed to loop for sequential face processing
 - No re-detection within frame
 
-#### ❌ Repeated Embedding Generation  
+#### ❌ Repeated Embedding Generation
 **Finding:** No duplicate embedding generation occurs.
 - `generate_embedding()` called once per detected face
 - Result immediately used for recognition
@@ -217,7 +217,7 @@ def _initialize_landmarker(self) -> None:
 if st.button("📹 Start Attendance Stream", ...):
     if st.session_state.att_camera_manager is None:
         st.session_state.att_camera_manager = CameraManager(camera_index=0)
-    
+
     if st.session_state.att_camera_manager.open():
         st.session_state.att_camera_active = True
         st.rerun()
@@ -360,7 +360,7 @@ if len(encodings) == 0:
 - Unknown faces trigger encoding attempt every frame they're visible
 - Recognized faces also trigger on first detection before recognition
 
-**Impact on FPS:** 
+**Impact on FPS:**
 - Each warning generation involves a disk I/O (logging) and dlib face detection
 - Estimated overhead per warning: ~5-15ms
 - If unknown face in frame for 5 frames before leaving: 5 warnings, 25-75ms cumulative
@@ -394,7 +394,7 @@ if len(encodings) == 0:
 
 **Warning trigger:** Each deprecated parameter usage logs a warning to stderr. Terminal shows one warning per page render.
 
-**Performance impact:** 
+**Performance impact:**
 - Warning generation is fast (~1ms)
 - But logged to stderr, which may flush to console (variable latency)
 - If page reruns every 30 frames at 30fps, warning fires every ~1 second
@@ -484,7 +484,7 @@ if st.session_state.att_camera_active:
 
 ### 1. Streamlit Deprecation Fixes (Low Priority, Non-Critical)
 
-**File:** All UI pages  
+**File:** All UI pages
 **Change:** Replace 46 instances of `use_container_width` with `width` parameter
 
 **Files affected:**
@@ -498,7 +498,7 @@ if st.session_state.att_camera_active:
 
 ### 2. Face-Encoding Warning Suppression (Optional)
 
-**File:** `src/computer_vision/face_embedder.py`  
+**File:** `src/computer_vision/face_embedder.py`
 **Current behavior:** Warns every time dlib face_encodings() fails to find face in crop
 
 **Options:**
@@ -534,23 +534,23 @@ logger.info(f"Detection: {(time.perf_counter()-t_det)*1000:.2f}ms")
 
 for detected_face in detected_faces:
     t_face = time.perf_counter()
-    
+
     t_emb = time.perf_counter()
     embedding = face_embedder.generate_embedding(face_crop)
     logger.info(f"Embedding: {(time.perf_counter()-t_emb)*1000:.2f}ms")
-    
+
     t_rec = time.perf_counter()
     rec_result = face_recognizer.recognize(embedding, self._gallery)
     logger.info(f"Recognition: {(time.perf_counter()-t_rec)*1000:.2f}ms")
-    
+
     t_ear = time.perf_counter()
     ear = liveness_detector.extract_ear(frame, detected_face)
     logger.info(f"EAR extraction: {(time.perf_counter()-t_ear)*1000:.2f}ms")
-    
+
     t_live = time.perf_counter()
     liveness_detector.update_temporal_state(ear, frame, detected_face)
     logger.info(f"Temporal update: {(time.perf_counter()-t_live)*1000:.2f}ms")
-    
+
     logger.info(f"Total face processing: {(time.perf_counter()-t_face)*1000:.2f}ms")
 
 logger.info(f"Total frame: {(time.perf_counter()-t_start)*1000:.2f}ms")

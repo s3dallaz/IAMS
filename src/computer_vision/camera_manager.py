@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from src.utils.logger import get_logger
+from src.utils.performance_timer import time_operation
 
 
 class CameraManager:
@@ -58,33 +59,40 @@ class CameraManager:
 
         try:
             self.logger.info(f"Opening camera {self.camera_index}")
-            self._capture = cv2.VideoCapture(self.camera_index)
 
-            if not self._capture.isOpened():
+            with time_operation("camera_constructor"):
+                self._capture = cv2.VideoCapture(self.camera_index)
+
+            with time_operation("camera_isOpened_check"):
+                is_opened = self._capture.isOpened()
+
+            if not is_opened:
                 self.logger.error(f"Failed to open camera {self.camera_index}")
                 self._capture = None
                 return False
 
-            # Set resolution if specified
-            if self.width is not None:
-                self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            if self.height is not None:
-                self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            with time_operation("camera_configuration"):
+                # Set resolution if specified
+                if self.width is not None:
+                    self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                if self.height is not None:
+                    self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
-            # Optimize camera settings to reduce frame capture latency
-            # Based on diagnostic measurements showing 70ms capture spikes
-            self._capture.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
-            self._capture.set(cv2.CAP_PROP_FPS, 30)
+                # Optimize camera settings to reduce frame capture latency
+                # Based on diagnostic measurements showing 70ms capture spikes
+                self._capture.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+                self._capture.set(cv2.CAP_PROP_FPS, 30)
 
-            # Disable auto-exposure if possible to reduce processing variance
-            # Note: Not all cameras support these settings
-            try:
-                self._capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
-            except:
-                pass  # Silently ignore if not supported
+                # Disable auto-exposure if possible to reduce processing variance
+                # Note: Not all cameras support these settings
+                try:
+                    self._capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
+                except:
+                    pass  # Silently ignore if not supported
 
             self._is_open = True
-            self.logger.info(f"Camera {self.camera_index} opened successfully")
+            backend_name = self._capture.getBackendName() if hasattr(self._capture, 'getBackendName') else "unknown"
+            self.logger.info(f"Camera {self.camera_index} opened successfully (backend: {backend_name})")
             return True
 
         except Exception as e:

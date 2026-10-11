@@ -85,7 +85,7 @@ def render_sessions_list_tab(
     with col_refresh:
         st.write("")
         st.write("")
-        if st.button("🔄 Refresh Sessions", use_container_width=True):
+        if st.button("🔄 Refresh Sessions", width="stretch"):
             st.rerun()
             
     try:
@@ -126,7 +126,7 @@ def render_sessions_list_tab(
             
         st.dataframe(
             table_data,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 'ID': st.column_config.NumberColumn('ID', width='small'),
@@ -151,16 +151,16 @@ def render_sessions_list_tab(
             
             with cols[3]:
                 if s['status'] == SessionStatus.SCHEDULED:
-                    if st.button("▶️ Start", key=f"start_{s['id']}", use_container_width=True, type="primary"):
+                    if st.button("▶️ Start", key=f"start_{s['id']}", width="stretch", type="primary"):
                         handle_activate_session(session_service, s['id'])
                 elif s['status'] == SessionStatus.ACTIVE:
-                    if st.button("⏹️ Close", key=f"close_{s['id']}", use_container_width=True):
+                    if st.button("⏹️ Close", key=f"close_{s['id']}", width="stretch"):
                         handle_close_session(session_service, s['id'])
                 else:
                     st.caption("—")
                     
             with cols[4]:
-                if st.button("👁️ View", key=f"view_{s['id']}", use_container_width=True):
+                if st.button("👁️ View", key=f"view_{s['id']}", width="stretch"):
                     st.session_state['selected_session_id'] = s['id']
                     st.rerun()
                     
@@ -222,7 +222,7 @@ def render_create_session_tab(session_service: SessionService):
         submitted = st.form_submit_button(
             "Create Session",
             type="primary",
-            use_container_width=True
+            width="stretch"
         )
         
         if submitted:
@@ -366,7 +366,7 @@ def render_session_details_tab(
         
     st.dataframe(
         records_display,
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
