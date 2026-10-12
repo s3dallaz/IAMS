@@ -120,7 +120,8 @@ class EnrollmentService:
         self,
         student_db_id: int,
         face_image: np.ndarray,
-        enrollment_method: str = 'camera'
+        enrollment_method: str = 'camera',
+        view_angle: str = 'unknown'
     ) -> int:
         """
         Add a single face sample for a student, generate embedding, and record in database.
@@ -130,6 +131,7 @@ class EnrollmentService:
             student_db_id: Student database ID
             face_image: Full or cropped face image as numpy array
             enrollment_method: 'camera' or 'upload'
+            view_angle: Face angle ('frontal', 'left', 'right', 'unknown')
             
         Returns:
             Enrollment record database ID
@@ -178,6 +180,7 @@ class EnrollmentService:
             enrollment_method=enrollment_method,
             image_count=1,
             quality_score=confidence,
+            view_angle=view_angle,
             is_active=True
         )
         
@@ -224,6 +227,32 @@ class EnrollmentService:
         """Get the number of active enrolled face samples for a student."""
         enrollments = self.enrollment_repo.get_by_student_id(student_db_id, active_only=True)
         return len(enrollments)
+        
+    def get_student_enrollment_coverage(self, student_db_id: int) -> Dict[str, bool]:
+        """
+        Get enrollment coverage information for a student.
+        
+        Args:
+            student_db_id: Student database ID
+            
+        Returns:
+            Dict with coverage info: {'frontal': bool, 'left': bool, 'right': bool, 'total_samples': int}
+        """
+        enrollments = self.enrollment_repo.get_by_student_id(student_db_id, active_only=True)
+        
+        angles_present = set()
+        for enrollment in enrollments:
+            angle = enrollment.get('view_angle', 'unknown')
+            if angle in ['frontal', 'left', 'right']:
+                angles_present.add(angle)
+        
+        return {
+            'frontal': 'frontal' in angles_present,
+            'left': 'left' in angles_present, 
+            'right': 'right' in angles_present,
+            'total_samples': len(enrollments),
+            'angles_present': list(angles_present)
+        }
         
     def load_active_gallery(self) -> List[Tuple[str, FaceEmbedding]]:
         """

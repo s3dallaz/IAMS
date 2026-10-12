@@ -489,10 +489,16 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
         return "\n\n".join(lines)
     else:
         conf = face_info.detection_confidence
+        # Check if we can provide enrollment guidance
+        enrollment_guidance = ""
+        if conf >= 0.7:  # Good detection quality suggests enrollable face
+            enrollment_guidance = "\n\n💡 _This appears to be a clear face detection. Consider enrolling this person in the Student Registry if they should have access._"
+        
         return (
             f"**Identity:** :red[**Unknown Person**]\n\n"
             f"**Confidence:** {conf:.2f}\n\n"
             f"_No attendance record created for unknown face._"
+            f"{enrollment_guidance}"
         )
 
 

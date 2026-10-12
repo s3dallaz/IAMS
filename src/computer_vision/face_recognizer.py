@@ -104,14 +104,23 @@ class FaceRecognizer:
                     f"128-dimensional, got {embedding.encoding.shape}"
                 )
         
-        # Compute distances to all gallery embeddings
-        distances = []
+        # Compute distances to all gallery embeddings and aggregate by identity
+        from collections import defaultdict
+        identity_distances = defaultdict(list)
+        
         for identity, embedding in gallery:
             distance = self._compute_distance(query_embedding.encoding, embedding.encoding)
-            distances.append((identity, distance))
+            identity_distances[identity].append(distance)
         
-        # Find the closest match (deterministic: first occurrence if tied)
-        best_identity, best_distance = min(distances, key=lambda x: x[1])
+        # For each identity, use the minimum distance across all their samples
+        # This ensures multi-sample students get the best possible match
+        identity_min_distances = []
+        for identity, distances in identity_distances.items():
+            min_distance = min(distances)
+            identity_min_distances.append((identity, min_distance))
+        
+        # Find the closest identity based on their best sample
+        best_identity, best_distance = min(identity_min_distances, key=lambda x: x[1])
         
         # Check if distance is below threshold
         if best_distance <= self.threshold:
