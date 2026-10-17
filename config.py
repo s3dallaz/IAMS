@@ -194,6 +194,14 @@ FACE_DETECTION_CONFIDENCE: Final[float] = _env_float("FACE_DETECTION_CONFIDENCE"
 # Lower values = stricter matching
 FACE_RECOGNITION_THRESHOLD: Final[float] = 0.6
 
+# Minimum distance gap between the best match and the best match of a DIFFERENT
+# enrolled identity. When a query face is too close to call (nearly the same
+# distance to two students), the match is ambiguous and is reported as
+# "Unknown" instead of being assigned to the likely-wrong student.
+# Only applies when at least two distinct identities are enrolled.
+# Set FACE_RECOGNITION_MARGIN=0.0 in .env to disable the ambiguity check.
+FACE_RECOGNITION_MARGIN: Final[float] = _env_float("FACE_RECOGNITION_MARGIN", 0.1)
+
 # ============================================================================
 # Phase 3: Liveness Detection Configuration
 # ============================================================================

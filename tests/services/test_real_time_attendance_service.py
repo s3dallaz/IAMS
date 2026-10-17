@@ -432,6 +432,51 @@ def test_unknown_face_no_attendance_marked(
     assert "Unknown person" in face_res.reason
 
 
+def test_ambiguous_recognition_does_not_mark_attendance(
+    temp_db, active_session, sample_frame, mock_cv_components
+):
+    """A face almost equally close to two students is not attributed.
+
+    Uses the real FaceRecognizer so the whole path is exercised: the query
+    embedding is nearly the same distance to two enrolled identities, the
+    recognizer reports "Unknown", and no attendance may be recorded.
+    """
+    detector = mock_cv_components['detector']
+    embedder = mock_cv_components['embedder']
+    liveness = mock_cv_components['liveness']
+
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    embedder.generate_embedding.return_value = FaceEmbedding(np.zeros(128))
+
+    enc_enrolled = np.zeros(128)
+    enc_enrolled[0] = 0.30
+    enc_other = np.zeros(128)
+    enc_other[0] = 0.32
+
+    recognizer = FaceRecognizer()  # real: threshold 0.6, margin 0.1
+
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        face_detector=detector,
+        face_embedder=embedder,
+        face_recognizer=recognizer,
+        liveness_detector=liveness
+    )
+    manager.set_gallery([
+        ("2021001", FaceEmbedding(enc_enrolled)),
+        ("2021002", FaceEmbedding(enc_other))
+    ])
+
+    result = manager.process_frame(sample_frame)
+
+    assert result.marked_count == 0
+    face_res = result.processed_faces[0]
+    assert face_res.is_recognized is False
+    assert face_res.identity == "Unknown"
+    assert face_res.attendance_marked is False
+
+
 def test_failed_liveness_no_attendance_marked(
     temp_db, active_session, sample_student, sample_frame, mock_cv_components
 ):

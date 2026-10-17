@@ -1,0 +1,11 @@
+# Development / test tooling for the Intelligent Attendance Monitoring
+# System. These packages are NOT required to run the application - they
+# are only needed to execute the pytest suite in tests/.
+#
+# Install with:
+#   .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=9.1.1,<10.0.0
+pytest-cov>=7.1.0,<8.0.0

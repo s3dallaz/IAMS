@@ -1,24 +1,43 @@
-# Core dependencies for Phase 1A
-streamlit>=1.30.0
+# Runtime dependencies for the Intelligent Attendance Monitoring System.
+#
+# Verified environment: Python 3.10.11 (Windows) with exactly the versions
+# installed by this file's lower bounds. On a machine where a requirement is
+# already satisfied at a newer version, pip keeps it untouched and only a
+# fresh environment resolves to the newest release allowed by the range.
+#
+# Supported Python: 3.10 (verified on this project), 3.11 and 3.12
+# (dependency constraints checked against PyPI wheel metadata, not
+# machine-tested). Python 3.13+ is NOT supported - face_recognition failed
+# to install on 3.14; see PHASE_2A_INSTALLATION_NOTES.txt.
+#
+# Test-only tools live in requirements-dev.txt and are not needed to run
+# the application.
 
-# Environment variables
-python-dotenv>=1.0.0
+# --- User interface ---------------------------------------------------
+streamlit>=1.64.0,<2.0.0
 
-# Phase 6: AI Assistant (OmniRoute LLM client)
-requests>=2.31.0
+# --- Configuration / network ------------------------------------------
+python-dotenv>=1.2.3,<2.0.0
+requests>=2.34.2,<3.0.0
 
-# Testing (for test foundation)
-pytest>=7.4.0
-pytest-cov>=4.1.0
+# --- Computer vision ---------------------------------------------------
+opencv-python>=5.0.0.93,<6.0.0
+# mediapipe hard-requires opencv-contrib-python with no upper bound. Both
+# distributions install the same cv2 package, so they must stay in
+# lockstep: the identical range guarantees matching builds.
+opencv-contrib-python>=5.0.0.93,<6.0.0
+mediapipe>=1.0.1,<1.1.0
+face-recognition>=1.3.0,<1.4.0
+# face_recognition_models imports pkg_resources at runtime, which was
+# removed from setuptools 81+. Python 3.12+ virtual environments ship
+# without setuptools at all, so this requirement guarantees pkg_resources
+# exists everywhere. Already-satisfied bundled setuptools is left alone.
+setuptools>=65.5.0,<81.0
 
-# Phase 2: Computer Vision dependencies
-opencv-python>=4.8.0
-face-recognition>=1.3.0
-mediapipe>=0.10.0
-numpy>=1.24.0
-Pillow>=10.0.0
+# --- Data / numerics ---------------------------------------------------
+numpy>=2.2.6,<3.0.0
+pandas>=2.3.3,<3.0.0
+Pillow>=12.3.0,<13.0.0
 
-# Phase 5: Statistics & Reports
-pandas>=2.0.0
-matplotlib>=3.7.0
-fpdf2>=2.8.0
+# --- PDF reports -------------------------------------------------------
+fpdf2>=2.8.9,<3.0.0

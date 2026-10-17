@@ -19,22 +19,40 @@ class RecognitionResult:
     
     Attributes:
         identity: The matched identity name, or "Unknown" if no match
-        distance: The Euclidean distance to the matched embedding
-        is_match: True if a match was found below threshold, False otherwise
+        distance: The Euclidean distance to the match, or to the closest
+            conflicting identity when no confident match was found.
+            float('inf') for an empty gallery
+        is_match: True if a confident, unambiguous match was found
+        second_best_distance: Distance to the closest embedding that belongs to
+            a DIFFERENT identity, or float('inf') when the gallery holds only
+            one distinct identity. Used by the ambiguity check
+        reason: Short code explaining the outcome - "matched",
+            "above_threshold", "ambiguous_match" or "empty_gallery"
     """
-    
-    def __init__(self, identity: str, distance: float, is_match: bool):
+
+    def __init__(
+        self,
+        identity: str,
+        distance: float,
+        is_match: bool,
+        second_best_distance: float = float('inf'),
+        reason: str = ""
+    ):
         """
         Initialize a recognition result.
-        
+
         Args:
             identity: Identity name or "Unknown"
             distance: Distance to the matched embedding
             is_match: Whether this is a valid match
+            second_best_distance: Distance to the runner-up identity, if any
+            reason: Short code describing why the outcome was reached
         """
         self.identity = identity
         self.distance = distance
         self.is_match = is_match
+        self.second_best_distance = second_best_distance
+        self.reason = reason
     
     def __repr__(self) -> str:
         match_str = "Match" if self.is_match else "No match"
@@ -46,20 +64,29 @@ class FaceRecognizer:
     Recognizes faces by comparing embeddings against a gallery of known identities.
     
     Uses Euclidean distance for comparison with a configurable threshold.
-    Returns the closest matching identity or "Unknown" if no match is found.
+    Matches closer than the threshold are additionally required to be
+    clearly ahead of the runner-up identity (FACE_RECOGNITION_MARGIN),
+    otherwise they are treated as "Unknown".
     """
-    
-    def __init__(self, threshold: Optional[float] = None):
+
+    def __init__(self, threshold: Optional[float] = None, margin: Optional[float] = None):
         """
         Initialize the FaceRecognizer.
-        
+
         Args:
             threshold: Distance threshold for recognition. Distances below this
                       are considered matches. If None, uses config.FACE_RECOGNITION_THRESHOLD
+            margin: Minimum required distance gap to a DIFFERENT enrolled
+                    identity. Below this the match is ambiguous. If None, uses
+                    config.FACE_RECOGNITION_MARGIN
         """
         self.threshold = threshold if threshold is not None else config.FACE_RECOGNITION_THRESHOLD
+        self.margin = margin if margin is not None else config.FACE_RECOGNITION_MARGIN
         self.logger = get_logger(__name__)
-        self.logger.info(f"FaceRecognizer initialized with threshold: {self.threshold}")
+        self.logger.info(
+            f"FaceRecognizer initialized with threshold: {self.threshold}, "
+            f"ambiguous-match margin: {self.margin}"
+        )
     
     def recognize(
         self,
@@ -92,7 +119,12 @@ class FaceRecognizer:
         # Handle empty gallery
         if not gallery:
             self.logger.debug("Empty gallery, returning Unknown")
-            return RecognitionResult(identity="Unknown", distance=float('inf'), is_match=False)
+            return RecognitionResult(
+                identity="Unknown",
+                distance=float('inf'),
+                is_match=False,
+                reason="empty_gallery"
+            )
         
         # Validate gallery embeddings
         for idx, (identity, embedding) in enumerate(gallery):
@@ -112,27 +144,58 @@ class FaceRecognizer:
         
         # Find the closest match (deterministic: first occurrence if tied)
         best_identity, best_distance = min(distances, key=lambda x: x[1])
-        
-        # Check if distance is below threshold
-        if best_distance <= self.threshold:
+
+        # Best distance belonging to a DIFFERENT identity. Embeddings of the
+        # same student are one identity, so the runner-up must come from
+        # someone else - do not fabricate a conflict from the same person.
+        second_best_distance = float('inf')
+        for identity, distance in distances:
+            if identity == best_identity:
+                continue
+            if distance < second_best_distance:
+                second_best_distance = distance
+
+        if best_distance > self.threshold:
             self.logger.debug(
-                f"Match found: {best_identity} (distance: {best_distance:.4f})"
-            )
-            return RecognitionResult(
-                identity=best_identity,
-                distance=best_distance,
-                is_match=True
-            )
-        else:
-            self.logger.debug(
-                f"No match found. Closest: {best_identity} (distance: {best_distance:.4f}, "
-                f"threshold: {self.threshold})"
+                f"No match. Closest: {best_identity} (distance: {best_distance:.4f}, "
+                f"threshold: {self.threshold}, second best: {second_best_distance:.4f})"
             )
             return RecognitionResult(
                 identity="Unknown",
                 distance=best_distance,
-                is_match=False
+                is_match=False,
+                second_best_distance=second_best_distance,
+                reason="above_threshold"
             )
+
+        # Ambiguity guard: someone else is nearly as close as the winner.
+        # Compare against the runner-up only when it exists (float('inf')
+        # means a single-identity gallery, so the guard is skipped).
+        if second_best_distance - best_distance < self.margin:
+            self.logger.debug(
+                f"Ambiguous match rejected: {best_identity} "
+                f"(distance: {best_distance:.4f}) vs {second_best_distance:.4f} "
+                f"(margin: {self.margin})"
+            )
+            return RecognitionResult(
+                identity="Unknown",
+                distance=best_distance,
+                is_match=False,
+                second_best_distance=second_best_distance,
+                reason="ambiguous_match"
+            )
+
+        self.logger.debug(
+            f"Match found: {best_identity} (distance: {best_distance:.4f}, "
+            f"second best: {second_best_distance:.4f}, margin: {self.margin})"
+        )
+        return RecognitionResult(
+            identity=best_identity,
+            distance=best_distance,
+            is_match=True,
+            second_best_distance=second_best_distance,
+            reason="matched"
+        )
     
     def _compute_distance(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
         """

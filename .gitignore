@@ -32,9 +32,14 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Face / Biometric Data
-data/face_encodings/*.npy
+# Per-student subfolders (data/face_encodings/<student_id>/) included
+data/face_encodings/*
+!data/face_encodings/.gitkeep
 data/enrollment_images/*
 !data/enrollment_images/.gitkeep
 data/unknown_faces/*
@@ -93,3 +98,6 @@ Desktop.ini
 
 # Local liveness diagnostic data
 manual_tests/liveness_detection/ear_diagnostic_data.csv
+
+# Accidentally installed third-party tool (removed from the project)
+deepseek-harness/

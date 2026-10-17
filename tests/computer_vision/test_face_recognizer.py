@@ -286,16 +286,38 @@ class TestFaceRecognizerInputValidation:
 
 
 class TestFaceRecognizerDeterministicBehavior:
-    """Test FaceRecognizer deterministic behavior with ties."""
+    """Test FaceRecognizer behavior when gallery distances are tied."""
     
-    def test_equal_distance_selects_first(self):
-        """Test that equal distances select the first occurrence."""
+    def test_equal_distance_is_ambiguous_and_rejected(self):
+        """Two distinct identities at the same distance cannot be told apart."""
         recognizer = FaceRecognizer(threshold=0.6)
         
-        # Create query and two gallery entries with identical distance
+        # Both have distance = 0.3, from two different people
         query_enc = np.zeros(128)
+        enc1 = np.zeros(128)
+        enc1[0] = 0.3
+        enc2 = np.zeros(128)
+        enc2[0] = 0.3
+        
+        query = FaceEmbedding(query_enc)
+        gallery = [
+            ("First", FaceEmbedding(enc1)),
+            ("Second", FaceEmbedding(enc2))
+        ]
+        
+        result = recognizer.recognize(query, gallery)
+        
+        assert result.is_match is False
+        assert result.identity == "Unknown"
+        assert result.reason == "ambiguous_match"
+        assert abs(result.distance - 0.3) < 1e-10
+    
+    def test_equal_distance_stays_deterministic_when_margin_disabled(self):
+        """With the ambiguity check disabled, the first occurrence wins."""
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.0)
         
         # Both have distance = 0.3
+        query_enc = np.zeros(128)
         enc1 = np.zeros(128)
         enc1[0] = 0.3
         enc2 = np.zeros(128)
@@ -391,3 +413,211 @@ class TestFaceRecognizerDistanceComputation:
         result = recognizer.recognize(query, gallery)
         
         assert abs(result.distance - 5.0) < 1e-10
+
+
+class TestFaceRecognizerAmbiguityRejection:
+    """Test that a query equally close to two enrolled people is rejected."""
+
+    def test_ambiguous_match_between_two_identities_rejected(self):
+        """Nearly equal distances to two different people -> Unknown."""
+        recognizer = FaceRecognizer(threshold=0.6)  # default margin 0.1
+
+        query = FaceEmbedding(np.zeros(128))
+        enc_a = np.zeros(128)
+        enc_a[0] = 0.30
+        enc_b = np.zeros(128)
+        enc_b[0] = 0.32
+
+        gallery = [
+            ("2021001", FaceEmbedding(enc_a)),
+            ("2021002", FaceEmbedding(enc_b))
+        ]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is False
+        assert result.identity == "Unknown"
+        assert result.reason == "ambiguous_match"
+        assert abs(result.distance - 0.30) < 1e-10
+        assert abs(result.second_best_distance - 0.32) < 1e-10
+
+    def test_clear_winner_is_accepted(self):
+        """A clearly closest identity is still recognized."""
+        recognizer = FaceRecognizer(threshold=0.6)
+
+        query = FaceEmbedding(np.zeros(128))
+        enc_a = np.zeros(128)
+        enc_a[0] = 0.30
+        enc_b = np.zeros(128)
+        enc_b[0] = 0.55
+
+        gallery = [
+            ("2021001", FaceEmbedding(enc_a)),
+            ("2021002", FaceEmbedding(enc_b))
+        ]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is True
+        assert result.identity == "2021001"
+        assert result.reason == "matched"
+        assert abs(result.distance - 0.30) < 1e-10
+        assert abs(result.second_best_distance - 0.55) < 1e-10
+
+    def test_gap_exactly_at_margin_is_accepted(self):
+        """A runner-up exactly one margin behind is still accepted.
+
+        Uses values that are exact in binary floating point so the boundary
+        itself is tested, not float rounding noise.
+        """
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.5)
+
+        query = FaceEmbedding(np.zeros(128))
+        enc_a = np.zeros(128)          # distance 0.0
+        enc_b = np.zeros(128)
+        enc_b[0] = 0.5                 # distance 0.5 -> gap is exactly 0.5
+
+        gallery = [("A", FaceEmbedding(enc_a)), ("B", FaceEmbedding(enc_b))]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is True
+        assert result.identity == "A"
+
+    def test_single_identity_gallery_skips_ambiguity_check(self):
+        """One enrolled person cannot be ambiguous; no runner-up is invented."""
+        recognizer = FaceRecognizer(threshold=0.6)
+
+        query = FaceEmbedding(np.zeros(128))
+        enc = np.zeros(128)
+        enc[0] = 0.3
+
+        gallery = [("Only", FaceEmbedding(enc))]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is True
+        assert result.identity == "Only"
+        assert result.second_best_distance == float('inf')
+
+    def test_repeated_samples_of_one_identity_are_not_a_conflict(self):
+        """Multiple samples of the same student never invent a runner-up."""
+        recognizer = FaceRecognizer(threshold=0.6)
+
+        query = FaceEmbedding(np.zeros(128))
+        own1 = np.zeros(128)
+        own1[0] = 0.30
+        own2 = np.zeros(128)
+        own2[0] = 0.31
+        other = np.zeros(128)
+        other[0] = 0.55
+
+        gallery = [
+            ("Same", FaceEmbedding(own1)),
+            ("Same", FaceEmbedding(own2)),
+            ("Other", FaceEmbedding(other))
+        ]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is True
+        assert result.identity == "Same"
+        # The runner-up is the OTHER student, not a second sample of "Same".
+        assert abs(result.second_best_distance - 0.55) < 1e-10
+
+    def test_same_identity_samples_do_not_mask_a_real_conflict(self):
+        """Two samples of A plus a nearly-equal B is still ambiguous."""
+        recognizer = FaceRecognizer(threshold=0.6)
+
+        query = FaceEmbedding(np.zeros(128))
+        own1 = np.zeros(128)
+        own1[0] = 0.30
+        own2 = np.zeros(128)
+        own2[0] = 0.31
+        conflicting = np.zeros(128)
+        conflicting[0] = 0.32
+
+        gallery = [
+            ("A", FaceEmbedding(own1)),
+            ("A", FaceEmbedding(own2)),
+            ("B", FaceEmbedding(conflicting))
+        ]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is False
+        assert result.identity == "Unknown"
+        assert result.reason == "ambiguous_match"
+
+
+class TestFaceRecognizerMarginConfiguration:
+    """Test the margin configuration and backward-compatible behaviour."""
+
+    def test_default_margin_from_config(self):
+        """The default margin comes from config and does not alter threshold."""
+        recognizer = FaceRecognizer()
+
+        assert recognizer.threshold == 0.6
+        assert recognizer.margin == 0.1
+
+    def test_custom_margin(self):
+        """The margin can be set explicitly for tests and tuning."""
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.25)
+
+        assert recognizer.margin == 0.25
+
+    def test_zero_margin_restores_plain_threshold_behaviour(self):
+        """A 0.0 margin disables the ambiguity check."""
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.0)
+
+        query = FaceEmbedding(np.zeros(128))
+        enc1 = np.zeros(128)
+        enc1[0] = 0.3
+        enc2 = np.zeros(128)
+        enc2[0] = 0.3
+
+        gallery = [("First", FaceEmbedding(enc1)), ("Second", FaceEmbedding(enc2))]
+
+        result = recognizer.recognize(query, gallery)
+
+        assert result.is_match is True
+        assert result.identity == "First"
+        assert result.reason == "matched"
+
+
+class TestRecognitionResultDiagnostics:
+    """Test the diagnostic fields of RecognitionResult."""
+
+    def test_backward_compatible_construction(self):
+        """Existing callers that pass only 3 values keep working."""
+        result = RecognitionResult(identity="Alice", distance=0.35, is_match=True)
+
+        assert result.is_match is True
+        assert result.second_best_distance == float('inf')
+        assert result.reason == ""
+
+    def test_above_threshold_reports_reason(self):
+        """An unknown face is reported with the closest distance and a reason."""
+        recognizer = FaceRecognizer(threshold=0.6)
+
+        query = FaceEmbedding(np.zeros(128))
+        enc = np.zeros(128)
+        enc[0] = 0.85
+
+        result = recognizer.recognize(query, [("Eve", FaceEmbedding(enc))])
+
+        assert result.is_match is False
+        assert result.identity == "Unknown"
+        assert result.reason == "above_threshold"
+        assert abs(result.distance - 0.85) < 1e-10
+
+    def test_empty_gallery_reports_reason(self):
+        """An empty gallery is reported as Unknown, not as an error."""
+        recognizer = FaceRecognizer(threshold=0.6)
+
+        result = recognizer.recognize(FaceEmbedding(np.random.rand(128)), [])
+
+        assert result.is_match is False
+        assert result.identity == "Unknown"
+        assert result.distance == float('inf')
+        assert result.reason == "empty_gallery"
