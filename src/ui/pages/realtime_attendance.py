@@ -501,7 +501,10 @@ def _draw_attendance_overlays(
     result: RealTimeAttendanceResult
 ) -> np.ndarray:
     """
-    Draw bounding boxes and attendance status text overlays on video frame.
+    Draw attendance status text overlays on video frame.
+
+    No rectangle is drawn around the face; the bounding box is only used to
+    position the name and liveness labels next to it.
 
     Applies horizontal mirror (cv2.flip(frame, 1)) to the display preview
     so natural user movements visually match a front-facing camera/mirror,
@@ -524,9 +527,6 @@ def _draw_attendance_overlays(
             color = (0, 255, 255)  # Yellow for recognized but pending liveness
         else:
             color = (0, 0, 255)  # Red for unknown
-
-        # Draw bounding box on mirrored frame
-        cv2.rectangle(display_frame, (mirrored_x, y), (mirrored_x + w, y + h), color, 2)
 
         # Header text
         if face.is_recognized:

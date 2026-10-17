@@ -217,6 +217,39 @@ def test_draw_attendance_overlays():
     assert isinstance(output_frame, np.ndarray)
 
 
+def test_draw_attendance_overlays_draws_labels_without_face_rectangle():
+    """The preview shows name/liveness labels but no box around the face."""
+    dummy_frame = np.zeros((200, 300, 3), dtype=np.uint8)
+    face = FaceProcessingResult(
+        bbox=(20, 20, 50, 50),
+        detection_confidence=0.95,
+        identity="Unknown",
+        is_recognized=False,
+        liveness_state=LivenessState.UNKNOWN,
+        attendance_marked=False
+    )
+    res = RealTimeAttendanceResult(
+        session_id=1,
+        faces_detected=1,
+        processed_faces=[face],
+        session_active=True,
+        marked_count=0
+    )
+
+    with patch("src.ui.pages.realtime_attendance.cv2.rectangle") as mock_rectangle, \
+         patch("src.ui.pages.realtime_attendance.cv2.putText") as mock_put_text:
+        _draw_attendance_overlays(dummy_frame, res)
+
+    mock_rectangle.assert_not_called()
+    labels = [call.args[1] for call in mock_put_text.call_args_list]
+    assert labels == ["Unknown", "Live: unknown"]
+    # Label is positioned from the mirrored bbox: 300 - (20 + 50) = 230
+    assert mock_put_text.call_args_list[0].args[2] == (230, 20)
+    # The bbox is only read, never modified, and the input frame is untouched
+    assert face.bbox == (20, 20, 50, 50)
+    assert not dummy_frame.any()
+
+
 # ============================================================================
 # Streamlit Render Function Tests (Mocked UI Environment)
 # ============================================================================
