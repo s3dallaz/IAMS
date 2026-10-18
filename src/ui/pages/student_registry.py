@@ -419,6 +419,7 @@ def render_manage_face_view(
     st.markdown("---")
     
     sample_count = enrollment_service.get_student_samples_count(student_db_id)
+    coverage_info = enrollment_service.get_student_enrollment_coverage(student_db_id)
     
     # Status Card & Reset Button
     col_card1, col_card2 = st.columns([3, 1])
@@ -426,6 +427,23 @@ def render_manage_face_view(
         st.markdown(f"**Managing Face Data For:** `{student['student_id']}` — **{student['name']}** ({student['department'] or 'No Department'})")
         if sample_count > 0:
             st.success(f"✅ **{sample_count} Active Face Sample(s)** enrolled in recognition gallery.")
+            
+            # Show angle coverage information
+            angles_present = coverage_info['angles_present']
+            if len(angles_present) >= 2:
+                angle_icons = {"frontal": "🎯", "left": "👈", "right": "👉"}
+                coverage_display = " ".join([f"{angle_icons.get(angle, '📐')} {angle.title()}" for angle in angles_present])
+                st.info(f"📐 **Multi-Angle Coverage:** {coverage_display}")
+            elif len(angles_present) == 1:
+                missing_angles = []
+                if not coverage_info['frontal']:
+                    missing_angles.append("Frontal 🎯")
+                if not coverage_info['left']:
+                    missing_angles.append("Left Turn 👈")
+                if not coverage_info['right']:
+                    missing_angles.append("Right Turn 👉")
+                if missing_angles:
+                    st.warning(f"⚠️ **Limited Angle Coverage.** Consider adding: {', '.join(missing_angles)}")
         else:
             st.warning("⚠️ **0 Face Samples.** This student cannot be recognized until at least one face sample is enrolled.")
             
@@ -616,10 +634,22 @@ def render_manage_face_view(
                         with st.spinner("Validating face and saving embedding..."):
                             try:
                                 # Validate and enroll the unmirrored original frame
+                                # Determine view angle for multi-angle mode
+                                view_angle = "unknown"
+                                if is_multi_angle and current_step < len(angle_steps):
+                                    angle_name = angle_steps[current_step]['name']
+                                    if angle_name == "Frontal":
+                                        view_angle = "frontal"
+                                    elif angle_name == "Left Turn":
+                                        view_angle = "left"
+                                    elif angle_name == "Right Turn":
+                                        view_angle = "right"
+                                
                                 enrollment_service.add_face_sample(
                                     student_db_id=student_db_id,
                                     face_image=captured_frame,
-                                    enrollment_method="camera"
+                                    enrollment_method="camera",
+                                    view_angle=view_angle
                                 )
                                 st.session_state['captured_photo_preview'] = None
                                 

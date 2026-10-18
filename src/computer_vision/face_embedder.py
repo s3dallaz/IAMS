@@ -109,8 +109,16 @@ class FaceEmbedder:
         try:
             # PERFORMANCE: Use small crop from MediaPipe detection instead of full frame.
             # Benchmark shows: crop=11ms vs full_frame=138ms vs full_frame_with_bbox=248ms
+            #
+            # ROBUSTNESS FIX: Pass known_face_locations to bypass dlib's internal face detection.
+            # MediaPipe already detected the face and provided the crop. Telling dlib where
+            # the face is prevents failures when the crop is rotated/turned (head turn scenario).
+            # Format: [(top, right, bottom, left)] in CSS order
+            h, w = rgb_image.shape[:2]
+            known_face_locations = [(0, w, h, 0)]  # Entire crop is the face
+            
             with time_operation("dlib_face_encoding"):
-                encodings = face_recognition.face_encodings(rgb_image)
+                encodings = face_recognition.face_encodings(rgb_image, known_face_locations=known_face_locations)
             
             if len(encodings) == 0:
                 # No face detected in the provided image - log at DEBUG to reduce spam

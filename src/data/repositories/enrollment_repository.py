@@ -38,6 +38,7 @@ class EnrollmentRepository:
         enrollment_method: str = 'camera',
         image_count: int = 1,
         quality_score: Optional[float] = None,
+        view_angle: str = 'unknown',
         is_active: bool = True
     ) -> int:
         """
@@ -49,6 +50,7 @@ class EnrollmentRepository:
             enrollment_method: 'camera' or 'upload'
             image_count: Number of sample images used
             quality_score: Optional embedding quality / confidence score
+            view_angle: Angle of the face sample ('frontal', 'left', 'right', 'unknown')
             is_active: Whether this enrollment is active
             
         Returns:
@@ -57,9 +59,9 @@ class EnrollmentRepository:
         query = """
             INSERT INTO enrollments (
                 student_id, encoding_path, enrollment_method,
-                image_count, quality_score, is_active
+                image_count, quality_score, view_angle, is_active
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         
         try:
@@ -67,7 +69,7 @@ class EnrollmentRepository:
                 cursor = conn.cursor()
                 cursor.execute(
                     query,
-                    (student_id, encoding_path, enrollment_method, image_count, quality_score, 1 if is_active else 0)
+                    (student_id, encoding_path, enrollment_method, image_count, quality_score, view_angle, 1 if is_active else 0)
                 )
                 enrollment_id = cursor.lastrowid
                 logger.info(f"Created enrollment for student DB ID {student_id} (Enrollment ID: {enrollment_id})")

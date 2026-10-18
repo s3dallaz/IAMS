@@ -477,6 +477,45 @@ def test_ambiguous_recognition_does_not_mark_attendance(
     assert face_res.attendance_marked is False
 
 
+def test_new_face_in_same_spot_is_recognised_again(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """A stranger stepping into the spot a student just left must not inherit
+    that student's identity: every processed frame is recognised from scratch.
+    """
+    detector = mock_cv_components['detector']
+    embedder = mock_cv_components['embedder']
+    recognizer = mock_cv_components['recognizer']
+    liveness = mock_cv_components['liveness']
+    liveness.blink_count = 0  # liveness pending, so nothing is marked
+
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    embedder.generate_embedding.return_value = FaceEmbedding(np.random.rand(128))
+    recognizer.recognize.side_effect = [
+        RecognitionResult(identity="2021001", distance=0.3, is_match=True),
+        RecognitionResult(identity="Unknown", distance=0.85, is_match=False),
+    ]
+
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        face_detector=detector,
+        face_embedder=embedder,
+        face_recognizer=recognizer,
+        liveness_detector=liveness
+    )
+    manager.set_gallery([("2021001", FaceEmbedding(np.random.rand(128)))])
+
+    first = manager.process_frame(sample_frame)
+    second = manager.process_frame(sample_frame)  # same bbox, immediately after
+
+    assert first.processed_faces[0].identity == "2021001"
+    assert recognizer.recognize.call_count == 2
+    assert second.processed_faces[0].identity == "Unknown"
+    assert second.processed_faces[0].is_recognized is False
+    assert second.marked_count == 0
+
+
 def test_failed_liveness_no_attendance_marked(
     temp_db, active_session, sample_student, sample_frame, mock_cv_components
 ):

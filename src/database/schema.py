@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS enrollments (
     enrollment_method TEXT DEFAULT 'camera',
     image_count INTEGER DEFAULT 1,
     quality_score REAL,
+    view_angle TEXT DEFAULT 'unknown',
     is_active BOOLEAN DEFAULT 1,
     FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
 )

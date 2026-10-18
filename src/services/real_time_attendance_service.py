@@ -8,6 +8,8 @@ and anti-spoofing enforcement for live video attendance monitoring.
 """
 
 import time
+import threading
+from queue import Queue, Empty
 from typing import Optional, List, Tuple, Dict, Any, Set
 from pathlib import Path
 import numpy as np
@@ -249,10 +251,38 @@ class RealTimeAttendanceManager:
         self._marked_students: Set[int] = set()  # Set of student_db_id already marked for current session
         self._cooldown_tracker: Dict[int, float] = {}  # student_db_id -> last_processed_timestamp
 
+        # Per-session student-record cache: identity_string -> student dict (or None if not found).
+        # Avoids a SQLite round-trip on every CV frame for the same recognized identity.
+        # Cleared whenever the session changes so stale data cannot persist across sessions.
+        self._student_record_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
+        # Short-lived recognition result cache keyed by bbox grid-cell.
+        # Stores (identity, distance, embedding_ok, timestamp) so that the expensive
+        # dlib embedding + gallery scan is skipped for a stable face that was just
+        # recognised on the previous CV-processed frame (~167 ms ago at 6 fps CV rate).
+        # Entries expire after _recognition_cache_ttl seconds so a different person
+        # stepping into the same camera region is still re-evaluated promptly.
+        # SAFETY: liveness processing always runs; only recognition is cached.
+        # DISABLED (ttl 0.0): a person who steps into the spot another student
+        # just left would inherit that student's identity for up to the TTL,
+        # weakening unknown-person rejection. With ttl 0.0 every processed
+        # frame is recognised from scratch. Raise the TTL to re-enable.
+        self._recognition_cache: Dict[str, tuple] = {}     # cell_key -> (identity, distance, embedding_ok, ts)
+        self._recognition_cache_ttl: float = 0.0           # seconds; 0.0 = never reuse a recognition
+
         # Session status cache to avoid DB query on every CV frame (~6/sec)
         self._session_status_cache: Optional[Dict[str, Any]] = None
         self._session_status_cache_time: float = 0.0
         self._session_status_cache_ttl: float = 1.0  # Cache for 1 second
+
+        # Async processing for camera smoothness
+        # Allows frame capture/display to continue while CV processing runs in background
+        self._bg_worker_enabled: bool = False
+        self._bg_worker_thread: Optional[threading.Thread] = None
+        self._bg_pending_frame: Optional[Tuple[np.ndarray, int, Optional[str]]] = None  # (frame, session_id, marked_at)
+        self._bg_latest_result: Optional[RealTimeAttendanceResult] = None
+        self._bg_lock = threading.Lock()
+        self._bg_stop_flag = threading.Event()
 
         if session_id is not None:
             self.set_session(session_id)
@@ -303,6 +333,8 @@ class RealTimeAttendanceManager:
         self._session_id = session_id
         self._marked_students.clear()
         self._cooldown_tracker.clear()
+        self._student_record_cache.clear()
+        self._recognition_cache.clear()
 
         # Pre-load existing attendance records for this session into in-memory cache
         # This prevents redundant database lookups on every video frame
@@ -401,6 +433,109 @@ class RealTimeAttendanceManager:
         return self.liveness_detector
 
     # ------------------------------------------------------------------------
+    # Background Worker for Async Processing
+    # ------------------------------------------------------------------------
+
+    def enable_background_processing(self) -> None:
+        """
+        Enable background processing mode for camera smoothness.
+        
+        When enabled, process_frame_async() returns immediately with the latest
+        cached result while processing the new frame in a background thread.
+        This prevents CV processing from blocking frame capture/display.
+        """
+        if self._bg_worker_enabled:
+            return
+            
+        self._bg_worker_enabled = True
+        self._bg_stop_flag.clear()
+        self._bg_worker_thread = threading.Thread(target=self._background_worker, daemon=True)
+        self._bg_worker_thread.start()
+        logger.info("Background processing enabled for camera smoothness")
+
+    def disable_background_processing(self) -> None:
+        """Stop the background worker thread."""
+        if not self._bg_worker_enabled:
+            return
+            
+        self._bg_worker_enabled = False
+        self._bg_stop_flag.set()
+        
+        if self._bg_worker_thread is not None:
+            self._bg_worker_thread.join(timeout=1.0)
+            self._bg_worker_thread = None
+            
+        logger.info("Background processing disabled")
+
+    def _background_worker(self) -> None:
+        """Background thread that processes frames asynchronously."""
+        while not self._bg_stop_flag.is_set():
+            # Check for pending frame
+            with self._bg_lock:
+                pending = self._bg_pending_frame
+                self._bg_pending_frame = None
+            
+            if pending is not None:
+                frame, session_id, marked_at = pending
+                
+                # Process frame synchronously in background thread
+                try:
+                    result = self._process_frame_sync(frame, session_id, marked_at)
+                    
+                    # Publish result
+                    with self._bg_lock:
+                        self._bg_latest_result = result
+                        
+                except Exception as e:
+                    logger.error(f"Background worker error: {e}")
+            else:
+                # No pending frame, sleep briefly
+                time.sleep(0.001)
+
+    def process_frame_async(
+        self,
+        frame: np.ndarray,
+        session_id: Optional[int] = None,
+        marked_at: Optional[str] = None
+    ) -> RealTimeAttendanceResult:
+        """
+        Process frame asynchronously for camera smoothness.
+        
+        Returns immediately with the latest cached result while submitting
+        the new frame for background processing. This prevents CV processing
+        from blocking frame capture and display updates.
+        
+        Args:
+            frame: Input image array (BGR format from OpenCV)
+            session_id: Session ID to process (if None, uses current session)
+            marked_at: Optional explicit ISO timestamp for attendance
+            
+        Returns:
+            Latest available RealTimeAttendanceResult (may be from previous frame)
+        """
+        if not self._bg_worker_enabled:
+            # Fallback to synchronous processing if background worker not enabled
+            return self.process_frame(frame, session_id, marked_at)
+        
+        # Submit new frame for background processing (replaces any pending frame)
+        target_session = session_id if session_id is not None else self._session_id
+        with self._bg_lock:
+            self._bg_pending_frame = (frame.copy(), target_session, marked_at)
+            result = self._bg_latest_result
+        
+        # Return latest available result or empty result
+        if result is None:
+            result = RealTimeAttendanceResult(
+                session_id=target_session,
+                faces_detected=0,
+                processed_faces=[],
+                session_active=True,
+                marked_count=0
+            )
+        
+        return result
+
+    # ------------------------------------------------------------------------
     # Real-Time Frame Processing Pipeline
     # ------------------------------------------------------------------------
 
@@ -411,31 +546,31 @@ class RealTimeAttendanceManager:
         marked_at: Optional[str] = None
     ) -> RealTimeAttendanceResult:
         """
-        Process a single video frame for face detection, recognition, liveness,
-        and attendance marking.
-
-        Complete Flow:
-        1. Validate frame & session
-        2. Detect faces using FaceDetector
-        3. For each detected face:
-           a. Crop face and compute embedding via FaceEmbedder
-           b. Match against gallery via FaceRecognizer
-           c. Verify liveness via LivenessDetector (EAR / temporal state / challenge)
-           d. If recognized as known student + liveness verified + not already marked:
-              - Call AttendanceService.record_attendance()
-              - Cache student in _marked_students
-        4. Return structured RealTimeAttendanceResult
-
+        Process a single video frame synchronously (blocks until complete).
+        
+        For non-blocking processing that allows smooth camera preview,
+        use enable_background_processing() and process_frame_async() instead.
+        
         Args:
             frame: Input image array (BGR format from OpenCV)
             session_id: Session ID to process (if None, uses current session)
             marked_at: Optional explicit ISO timestamp for attendance
-
+            
         Returns:
             RealTimeAttendanceResult with details for each detected face
+        """
+        return self._process_frame_sync(frame, session_id, marked_at)
 
-        Raises:
-            RealTimeAttendanceError: If input frame is invalid
+    def _process_frame_sync(
+        self,
+        frame: np.ndarray,
+        session_id: Optional[int] = None,
+        marked_at: Optional[str] = None
+    ) -> RealTimeAttendanceResult:
+        """
+        Internal synchronous frame processing implementation.
+        
+        Called by both process_frame() (synchronous) and the background worker thread.
         """
         # Validate frame
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
@@ -530,12 +665,29 @@ class RealTimeAttendanceManager:
         face_crop = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
 
         # Step A: Generate embedding & Recognize face
+        # PERFORMANCE: Use a short-lived recognition cache keyed by bbox grid-cell so
+        # the expensive dlib embedding (~11ms) + gallery scan are skipped for a stable
+        # face that was recognised on the immediately preceding CV-processed frame.
+        # The key snaps bbox to a 40-pixel grid to tolerate small positional jitter.
+        # The cache expires after _recognition_cache_ttl seconds (default 1 s) so a
+        # different person stepping into the same region is re-evaluated promptly.
+        # SAFETY: liveness processing still runs every frame regardless of cache.
         identity = "Unknown"
         is_recognized = False
         distance = float('inf')
         embedding_ok = False
 
-        if face_crop.size > 0 and len(self._gallery) > 0:
+        _cell_key = f"{x // 40},{y // 40}"
+        _cached = self._recognition_cache.get(_cell_key)
+        _cache_hit = (
+            _cached is not None
+            and (current_time - _cached[3]) < self._recognition_cache_ttl
+        )
+
+        if _cache_hit:
+            identity, distance, embedding_ok, _ = _cached
+            is_recognized = identity != "Unknown"
+        elif face_crop.size > 0 and len(self._gallery) > 0:
             try:
                 # PERFORMANCE: Use the MediaPipe face crop for dlib encoding.
                 # Benchmark confirmed: crop (11ms) >> full_frame+bbox (248ms) >> full_frame (138ms)
@@ -551,6 +703,10 @@ class RealTimeAttendanceManager:
                             identity = rec_result.identity
                             is_recognized = True
                             distance = rec_result.distance
+
+                # Store result (including "Unknown") so the next frame can reuse it
+                self._recognition_cache[_cell_key] = (identity, distance, embedding_ok, current_time)
+
             except FaceEmbeddingError as e:
                 logger.debug(f"Face embedding generation skipped: {e}")
             except Exception as e:
@@ -622,15 +778,21 @@ class RealTimeAttendanceManager:
                 liveness_state = LivenessState.UNKNOWN
                 liveness_confidence = 0.0
 
-        # Step C: Resolve student identity from database
+        # Step C: Resolve student identity from database (cached to avoid per-frame SQLite hits).
+        # The cache maps identity_string -> student dict (or None when not found).
+        # It is cleared on session change so deactivation changes are not permanently hidden.
         student_db_id = None
         student_id_str = None
         student_name = None
 
         if is_recognized:
             try:
-                with time_operation("student_db_lookup"):
-                    student_record = self.student_service.get_student_by_student_id(identity)
+                if identity in self._student_record_cache:
+                    student_record = self._student_record_cache[identity]
+                else:
+                    with time_operation("student_db_lookup"):
+                        student_record = self.student_service.get_student_by_student_id(identity)
+                    self._student_record_cache[identity] = student_record
                 if student_record:
                     # Check if student is active
                     if not student_record.get('is_active', 1):
@@ -912,6 +1074,11 @@ class RealTimeAttendanceManager:
                 attendance_marked=False,
                 reason=f"Failed to record attendance: {e}"
             )
+
+    def __del__(self):
+        """Cleanup: stop background worker thread if running."""
+        if self._bg_worker_enabled:
+            self.disable_background_processing()
 
 
 # Alias for backward compatibility / API flexibility
