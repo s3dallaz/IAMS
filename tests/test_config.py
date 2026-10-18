@@ -97,3 +97,33 @@ def test_logger_import():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _msmf_flag_after_importing_config(preset=None):
+    """Import config in a fresh interpreter and report the MSMF flag value."""
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items()
+           if k != "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"}
+    if preset is not None:
+        env["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = preset
+    code = ("import config, os; "
+            "print(os.environ.get('OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS'))")
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def test_config_disables_msmf_hw_transforms_for_fast_camera_start():
+    """Importing config sets the flag that makes the camera open in ~1 s."""
+    assert _msmf_flag_after_importing_config() == "0"
+
+
+def test_config_keeps_user_msmf_hw_transforms_setting():
+    """A value set in the environment (or .env) is not overwritten."""
+    assert _msmf_flag_after_importing_config(preset="1") == "1"

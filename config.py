@@ -66,6 +66,21 @@ def load_environment() -> bool:
 
 ENV_FILE_LOADED: bool = load_environment()
 
+# ============================================================================
+# Camera startup (Windows Media Foundation backend)
+# ============================================================================
+# OpenCV's default Windows camera backend (MSMF) spends ~7 s setting up
+# hardware-accelerated format conversion when the camera opens, and the same
+# again when CameraManager sets the FPS - about 15 s before the first frame
+# on the development laptop. With the transforms disabled the camera starts
+# in under 1 s at the same resolution and frame rate
+# (measured with manual_tests/camera_open_timing.py).
+# OpenCV reads this flag from the environment, so it must be set before cv2
+# is imported; config is the first project module app.py imports.
+# Set OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS=1 in .env to restore OpenCV's
+# default behaviour.
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+
 
 def _env_float(name: str, default: float) -> float:
     """Read a float environment variable, falling back to `default`."""

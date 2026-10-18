@@ -7,6 +7,8 @@ Handles opening, reading, and releasing camera resources safely.
 
 import logging
 from typing import Optional, Tuple
+
+import config  # noqa: F401 - must precede cv2: sets the MSMF camera startup flag
 import cv2
 import numpy as np
 
