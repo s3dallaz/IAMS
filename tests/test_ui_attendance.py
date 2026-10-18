@@ -217,9 +217,12 @@ def test_draw_attendance_overlays():
     assert isinstance(output_frame, np.ndarray)
 
 
-def test_draw_attendance_overlays_draws_labels_without_face_rectangle():
-    """The preview shows name/liveness labels but no box around the face."""
+def test_draw_attendance_overlays_shows_clean_mirrored_camera_view():
+    """The preview is the plain mirrored camera image: no box, name or status
+    is drawn on the face (those are shown in the panel next to the camera).
+    """
     dummy_frame = np.zeros((200, 300, 3), dtype=np.uint8)
+    dummy_frame[:, :10] = 255  # bright strip on the left edge to check the mirror
     face = FaceProcessingResult(
         bbox=(20, 20, 50, 50),
         detection_confidence=0.95,
@@ -236,18 +239,18 @@ def test_draw_attendance_overlays_draws_labels_without_face_rectangle():
         marked_count=0
     )
 
+    original = dummy_frame.copy()
     with patch("src.ui.pages.realtime_attendance.cv2.rectangle") as mock_rectangle, \
          patch("src.ui.pages.realtime_attendance.cv2.putText") as mock_put_text:
-        _draw_attendance_overlays(dummy_frame, res)
+        output = _draw_attendance_overlays(dummy_frame, res)
 
     mock_rectangle.assert_not_called()
-    labels = [call.args[1] for call in mock_put_text.call_args_list]
-    assert labels == ["Unknown", "Live: unknown"]
-    # Label is positioned from the mirrored bbox: 300 - (20 + 50) = 230
-    assert mock_put_text.call_args_list[0].args[2] == (230, 20)
-    # The bbox is only read, never modified, and the input frame is untouched
+    mock_put_text.assert_not_called()
+    # Exactly the mirrored camera image: the left strip is now on the right
+    assert np.array_equal(output, original[:, ::-1])
+    # The bbox stays available for the pipeline and the input frame is untouched
     assert face.bbox == (20, 20, 50, 50)
-    assert not dummy_frame.any()
+    assert np.array_equal(dummy_frame, original)
 
 
 def test_stream_reloads_gallery_for_existing_manager():

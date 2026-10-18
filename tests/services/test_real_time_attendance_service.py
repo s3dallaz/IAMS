@@ -477,43 +477,134 @@ def test_ambiguous_recognition_does_not_mark_attendance(
     assert face_res.attendance_marked is False
 
 
-def test_new_face_in_same_spot_is_recognised_again(
-    temp_db, active_session, sample_student, sample_frame, mock_cv_components
-):
-    """A stranger stepping into the spot a student just left must not inherit
-    that student's identity: every processed frame is recognised from scratch.
-    """
-    detector = mock_cv_components['detector']
-    embedder = mock_cv_components['embedder']
-    recognizer = mock_cv_components['recognizer']
-    liveness = mock_cv_components['liveness']
-    liveness.blink_count = 0  # liveness pending, so nothing is marked
-
-    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
-    embedder.generate_embedding.return_value = FaceEmbedding(np.random.rand(128))
-    recognizer.recognize.side_effect = [
-        RecognitionResult(identity="2021001", distance=0.3, is_match=True),
-        RecognitionResult(identity="Unknown", distance=0.85, is_match=False),
-    ]
-
+def _tracking_manager(temp_db, active_session, mock_cv_components):
+    """Manager with a one-student gallery and liveness still pending."""
+    mock_cv_components['liveness'].blink_count = 0  # nothing is marked yet
     manager = RealTimeAttendanceManager(
         session_id=active_session,
         database_path=temp_db,
-        face_detector=detector,
-        face_embedder=embedder,
-        face_recognizer=recognizer,
-        liveness_detector=liveness
+        face_detector=mock_cv_components['detector'],
+        face_embedder=mock_cv_components['embedder'],
+        face_recognizer=mock_cv_components['recognizer'],
+        liveness_detector=mock_cv_components['liveness']
     )
     manager.set_gallery([("2021001", FaceEmbedding(np.random.rand(128)))])
+    mock_cv_components['embedder'].generate_embedding.return_value = FaceEmbedding(np.random.rand(128))
+    return manager
+
+
+ALICE = RecognitionResult(identity="2021001", distance=0.3, is_match=True)
+STRANGER = RecognitionResult(identity="Unknown", distance=0.85, is_match=False)
+
+
+def test_followed_face_reuses_identity_without_new_embedding(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """The same face staying in view is recognised once, not on every frame."""
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    recognizer.recognize.return_value = ALICE
+    manager = _tracking_manager(temp_db, active_session, mock_cv_components)
 
     first = manager.process_frame(sample_frame)
-    second = manager.process_frame(sample_frame)  # same bbox, immediately after
+    detector.detect_faces.return_value = [DetectedFace(bbox=(14, 12, 50, 50), confidence=0.9)]
+    second = manager.process_frame(sample_frame)  # face moved slightly
 
+    assert recognizer.recognize.call_count == 1
     assert first.processed_faces[0].identity == "2021001"
+    assert second.processed_faces[0].identity == "2021001"
+
+
+def test_stranger_is_never_marked_from_followed_identity(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """Even if a stranger takes over a followed face, the re-check on the
+    marking frame stops attendance being recorded for the student.
+    """
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    liveness = mock_cv_components['liveness']
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    recognizer.recognize.side_effect = [ALICE, STRANGER]
+    manager = _tracking_manager(temp_db, active_session, mock_cv_components)
+
+    manager.process_frame(sample_frame)    # Alice recognised, liveness pending
+    liveness.blink_count = 1               # liveness now passes
+    result = manager.process_frame(sample_frame)
+
+    face = result.processed_faces[0]
+    assert recognizer.recognize.call_count == 2   # fresh check on the marking frame
+    assert result.marked_count == 0
+    assert face.attendance_marked is False
+    assert face.identity == "Unknown"
+
+
+def test_followed_identity_is_confirmed_before_marking(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """When the fresh check confirms the student, attendance is marked."""
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    liveness = mock_cv_components['liveness']
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    recognizer.recognize.return_value = ALICE
+    manager = _tracking_manager(temp_db, active_session, mock_cv_components)
+
+    manager.process_frame(sample_frame)
+    liveness.blink_count = 1
+    result = manager.process_frame(sample_frame)
+
     assert recognizer.recognize.call_count == 2
-    assert second.processed_faces[0].identity == "Unknown"
-    assert second.processed_faces[0].is_recognized is False
-    assert second.marked_count == 0
+    assert result.marked_count == 1
+    assert result.processed_faces[0].attendance_marked is True
+
+
+@pytest.mark.parametrize("second_frame_faces", [
+    [],                                                        # face left the view
+    [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9),
+     DetectedFace(bbox=(200, 10, 50, 50), confidence=0.9)],    # a second face appeared
+    [DetectedFace(bbox=(300, 200, 50, 50), confidence=0.9)],   # box jumped elsewhere
+])
+def test_face_is_recognised_again_when_following_breaks(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    second_frame_faces
+):
+    """Losing the face, a second face, or a jump all force a new recognition."""
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    face = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    recognizer.recognize.return_value = ALICE
+    manager = _tracking_manager(temp_db, active_session, mock_cv_components)
+
+    detector.detect_faces.return_value = face
+    manager.process_frame(sample_frame)
+    detector.detect_faces.return_value = second_frame_faces
+    manager.process_frame(sample_frame)
+
+    calls_before_last_frame = recognizer.recognize.call_count
+    detector.detect_faces.return_value = face
+    manager.process_frame(sample_frame)
+
+    # The face in the last frame was recognised again, not taken from the track
+    assert recognizer.recognize.call_count == calls_before_last_frame + 1
+
+
+def test_followed_face_is_reverified_periodically(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """After track_reverify_seconds the face is recognised again."""
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    recognizer.recognize.return_value = ALICE
+    manager = _tracking_manager(temp_db, active_session, mock_cv_components)
+    manager.track_reverify_seconds = 0.0
+
+    manager.process_frame(sample_frame)
+    manager.process_frame(sample_frame)
+
+    assert recognizer.recognize.call_count == 2
 
 
 def test_failed_liveness_no_attendance_marked(

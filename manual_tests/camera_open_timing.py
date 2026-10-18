@@ -41,6 +41,8 @@ VARIANTS = [
     ("MSMF, HW transforms on (OpenCV default)", "CAP_ANY", {MSMF_FLAG: "1"}, False),
 ]
 
+APP_LOOP_FRAMES = 60  # ~3 s of app-style reading per variant
+
 # Same calls, same order as CameraManager.open() with its default arguments
 APP_SETTINGS = [
     ("CAP_PROP_BUFFERSIZE", 1),
@@ -81,6 +83,18 @@ def measure(backend: str, camera_index: int, import_config: bool) -> dict:
         start = time.perf_counter()
         cap.read()
         later_reads.append((time.perf_counter() - start) * 1000.0)
+
+    # App-style loop: the Real-Time page reads a frame, does its work and
+    # then sleeps 33 ms before the next read. Back-to-back reads (above) can
+    # hide backends that only fetch a frame when read() is called.
+    app_reads = []
+    loop_start = time.perf_counter()
+    for _ in range(APP_LOOP_FRAMES):
+        start = time.perf_counter()
+        cap.read()
+        app_reads.append((time.perf_counter() - start) * 1000.0)
+        time.sleep(0.033)
+    loop_seconds = time.perf_counter() - loop_start
     timed("release", cap.release)
 
     return {
@@ -90,6 +104,9 @@ def measure(backend: str, camera_index: int, import_config: bool) -> dict:
         "resolution": f"{frame.shape[1]}x{frame.shape[0]}" if ok else "-",
         "brightness": round(float(frame.mean()), 1) if ok else None,
         "avg_read_ms": round(sum(later_reads) / len(later_reads), 1),
+        "app_read_avg_ms": round(sum(app_reads) / len(app_reads), 1),
+        "app_read_max_ms": round(max(app_reads), 1),
+        "app_fps": round(APP_LOOP_FRAMES / loop_seconds, 1),
         "steps": steps,
     }
 
@@ -137,6 +154,9 @@ def main() -> None:
         print(f"  backend={result['backend']}  resolution={result['resolution']}  "
               f"brightness={result['brightness']}  avg later read={result['avg_read_ms']} ms  "
               f"(OpenCV {result['opencv']})")
+        print(f"  app-style loop ({APP_LOOP_FRAMES} frames, 33 ms sleep): "
+              f"read avg {result['app_read_avg_ms']} ms, max {result['app_read_max_ms']} ms, "
+              f"preview ~{result['app_fps']} fps")
 
     if totals:
         print("\n=== Summary: time until the first frame ===")

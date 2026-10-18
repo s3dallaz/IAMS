@@ -512,67 +512,17 @@ def _draw_attendance_overlays(
     result: RealTimeAttendanceResult
 ) -> np.ndarray:
     """
-    Draw attendance status text overlays on video frame.
+    Prepare the camera frame for the preview.
 
-    No rectangle is drawn around the face; the bounding box is only used to
-    position the name and liveness labels next to it.
+    The preview is a clean, mirrored camera view: no box, name, or status
+    is drawn on the face. Name, ID, liveness and attendance status are shown
+    in the "Last Detected Person" panel to the right of the camera instead.
+    `result` is accepted so the call site stays the same.
 
-    Applies horizontal mirror (cv2.flip(frame, 1)) to the display preview
-    so natural user movements visually match a front-facing camera/mirror,
-    while correctly translating bounding box coordinates: mirrored_x = width - (x + w).
+    Applies horizontal mirror (cv2.flip(frame, 1)) so natural user movements
+    visually match a front-facing camera/mirror.
     """
-    # Flip the displayed frame horizontally (left <-> right)
-    display_frame = cv2.flip(frame, 1)
-    frame_w = display_frame.shape[1]
-
-    for face in result.processed_faces:
-        x, y, w, h = face.bbox
-
-        # Calculate mirrored bounding box x coordinate
-        mirrored_x = frame_w - (x + w)
-
-        # Color coding
-        if face.attendance_marked or face.already_marked:
-            color = (0, 255, 0)  # Green for marked/present
-        elif face.is_recognized and face.liveness_state != LivenessState.LIVE:
-            color = (0, 255, 255)  # Yellow for recognized but pending liveness
-        else:
-            color = (0, 0, 255)  # Red for unknown
-
-        # Header text
-        if face.is_recognized:
-            display_name = face.student_name or face.student_id or "Recognized"
-            label = f"{display_name}"
-            if face.attendance_status:
-                label += f" ({face.attendance_status})"
-            elif face.already_marked:
-                label += " (Marked)"
-        else:
-            label = "Unknown"
-
-        cv2.putText(
-            display_frame,
-            label,
-            (mirrored_x, max(20, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
-
-        # Footer text: Liveness status
-        liveness_text = f"Live: {face.liveness_state.value}"
-        cv2.putText(
-            display_frame,
-            liveness_text,
-            (mirrored_x, y + h + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1
-        )
-
-    return display_frame
+    return cv2.flip(frame, 1)
 
 
 def _result_faces(result) -> List[DetectedFace]:

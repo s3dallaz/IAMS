@@ -171,6 +171,17 @@ class RealTimeAttendanceResult:
         )
 
 
+def _bbox_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
+    """Intersection-over-union of two (x, y, w, h) boxes: 1.0 = identical, 0.0 = no overlap."""
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    inter_w = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    inter_h = max(0, min(ay + ah, by + bh) - max(ay, by))
+    intersection = inter_w * inter_h
+    union = aw * ah + bw * bh - intersection
+    return intersection / union if union > 0 else 0.0
+
+
 # ============================================================================
 # Real-Time Attendance Manager / Service
 # ============================================================================
@@ -256,19 +267,17 @@ class RealTimeAttendanceManager:
         # Cleared whenever the session changes so stale data cannot persist across sessions.
         self._student_record_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
-        # Short-lived recognition result cache keyed by bbox grid-cell.
-        # Stores (identity, distance, embedding_ok, timestamp) so that the expensive
-        # dlib embedding + gallery scan is skipped for a stable face that was just
-        # recognised on the previous CV-processed frame (~167 ms ago at 6 fps CV rate).
-        # Entries expire after _recognition_cache_ttl seconds so a different person
-        # stepping into the same camera region is still re-evaluated promptly.
-        # SAFETY: liveness processing always runs; only recognition is cached.
-        # DISABLED (ttl 0.0): a person who steps into the spot another student
-        # just left would inherit that student's identity for up to the TTL,
-        # weakening unknown-person rejection. With ttl 0.0 every processed
-        # frame is recognised from scratch. Raise the TTL to re-enable.
-        self._recognition_cache: Dict[str, tuple] = {}     # cell_key -> (identity, distance, embedding_ok, ts)
-        self._recognition_cache_ttl: float = 0.0           # seconds; 0.0 = never reuse a recognition
+        # Recognise once, then follow the face.
+        # The dlib embedding costs ~230 ms on the CPU and blocks the preview, so
+        # it is not recomputed for every processed frame. While exactly one face
+        # stays in view and its box keeps overlapping the previous one, its
+        # identity is reused. It is recomputed when the face is lost, a second
+        # face appears, the box jumps, or track_reverify_seconds have passed.
+        # SAFETY: attendance is never marked from a reused identity - the face
+        # is recognised again on the marking frame and must still match.
+        self._tracked_face: Optional[Dict[str, Any]] = None
+        self.track_reverify_seconds: float = 2.0
+        self.track_min_iou: float = 0.5
 
         # Session status cache to avoid DB query on every CV frame (~6/sec)
         self._session_status_cache: Optional[Dict[str, Any]] = None
@@ -307,6 +316,8 @@ class RealTimeAttendanceManager:
             self._gallery = []
         else:
             self._gallery = list(gallery)
+        # Identities may have changed (enrolment / deactivation): re-recognise
+        self._tracked_face = None
         logger.info(f"Gallery updated with {len(self._gallery)} identities")
 
     def get_gallery(self) -> List[Tuple[str, FaceEmbedding]]:
@@ -334,7 +345,7 @@ class RealTimeAttendanceManager:
         self._marked_students.clear()
         self._cooldown_tracker.clear()
         self._student_record_cache.clear()
-        self._recognition_cache.clear()
+        self._tracked_face = None
 
         # Pre-load existing attendance records for this session into in-memory cache
         # This prevents redundant database lookups on every video frame
@@ -431,6 +442,50 @@ class RealTimeAttendanceManager:
             # Update existing detector with new angle if changed
             self.liveness_detector.head_turn_angle = self.head_turn_angle
         return self.liveness_detector
+
+    def _recognize_crop(
+        self,
+        face_crop: np.ndarray,
+        face_embedder: FaceEmbedder,
+        face_recognizer: FaceRecognizer
+    ) -> Tuple[str, bool, float, bool]:
+        """
+        Compute the face embedding and match it against the gallery.
+
+        Returns:
+            (identity, is_recognized, distance, embedding_ok); identity is
+            "Unknown" unless the recognizer reports a confident match.
+        """
+        identity = "Unknown"
+        is_recognized = False
+        distance = float('inf')
+        embedding_ok = False
+
+        if face_crop.size == 0 or len(self._gallery) == 0:
+            return identity, is_recognized, distance, embedding_ok
+
+        try:
+            # PERFORMANCE: Use the MediaPipe face crop for dlib encoding.
+            # Benchmark confirmed: crop (11ms) >> full_frame+bbox (248ms) >> full_frame (138ms)
+            # The crop approach is 22x faster than the "optimized" bbox approach.
+            with time_operation("face_embedding"):
+                embedding = face_embedder.generate_embedding(face_crop)
+
+            if embedding is not None:
+                embedding_ok = True
+                with time_operation("face_recognition"):
+                    rec_result = face_recognizer.recognize(embedding, self._gallery)
+                if rec_result.is_match and rec_result.identity != "Unknown":
+                    identity = rec_result.identity
+                    is_recognized = True
+                    distance = rec_result.distance
+
+        except FaceEmbeddingError as e:
+            logger.debug(f"Face embedding generation skipped: {e}")
+        except Exception as e:
+            logger.error(f"Face recognition error: {e}")
+
+        return identity, is_recognized, distance, embedding_ok
 
     # ------------------------------------------------------------------------
     # Background Worker for Async Processing
@@ -592,6 +647,7 @@ class RealTimeAttendanceManager:
         detected_faces = face_detector.detect_faces(frame)
 
         if not detected_faces:
+            self._tracked_face = None  # face left the view: re-recognise next time
             # Diagnostics: record the post-detection stages for a missed frame,
             # which separates "not detected" from "detected but unusable".
             get_diagnostics().record(frame.shape, [], stage="no_detection")
@@ -612,6 +668,11 @@ class RealTimeAttendanceManager:
         face_recognizer = self._get_face_recognizer()
         liveness_detector = self._get_liveness_detector()
 
+        # Identities are only followed while exactly one face is in view
+        single_face = len(detected_faces) == 1
+        if not single_face:
+            self._tracked_face = None
+
         for detected_face in detected_faces:
             face_result = self._process_single_face(
                 frame=frame,
@@ -622,7 +683,8 @@ class RealTimeAttendanceManager:
                 face_recognizer=face_recognizer,
                 liveness_detector=liveness_detector,
                 current_time=current_time,
-                marked_at=marked_at
+                marked_at=marked_at,
+                allow_tracking=single_face
             )
 
             if face_result.attendance_marked:
@@ -649,7 +711,8 @@ class RealTimeAttendanceManager:
         face_recognizer: FaceRecognizer,
         liveness_detector: LivenessDetector,
         current_time: float,
-        marked_at: Optional[str]
+        marked_at: Optional[str],
+        allow_tracking: bool = False
     ) -> FaceProcessingResult:
         """Process a single face through recognition, liveness, and attendance marking."""
         bbox = detected_face.bbox
@@ -664,53 +727,30 @@ class RealTimeAttendanceManager:
         crop_h = max(1, min(h, frame_h - crop_y))
         face_crop = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
 
-        # Step A: Generate embedding & Recognize face
-        # PERFORMANCE: Use a short-lived recognition cache keyed by bbox grid-cell so
-        # the expensive dlib embedding (~11ms) + gallery scan are skipped for a stable
-        # face that was recognised on the immediately preceding CV-processed frame.
-        # The key snaps bbox to a 40-pixel grid to tolerate small positional jitter.
-        # The cache expires after _recognition_cache_ttl seconds (default 1 s) so a
-        # different person stepping into the same region is re-evaluated promptly.
-        # SAFETY: liveness processing still runs every frame regardless of cache.
-        identity = "Unknown"
-        is_recognized = False
-        distance = float('inf')
-        embedding_ok = False
-
-        _cell_key = f"{x // 40},{y // 40}"
-        _cached = self._recognition_cache.get(_cell_key)
-        _cache_hit = (
-            _cached is not None
-            and (current_time - _cached[3]) < self._recognition_cache_ttl
+        # Step A: Recognise the face, or reuse the identity of the face being followed
+        track = self._tracked_face if allow_tracking else None
+        recognition_reused = (
+            track is not None
+            and _bbox_iou(track['bbox'], bbox) >= self.track_min_iou
+            and current_time - track['verified_at'] < self.track_reverify_seconds
         )
 
-        if _cache_hit:
-            identity, distance, embedding_ok, _ = _cached
+        if recognition_reused:
+            identity, distance = track['identity'], track['distance']
+            embedding_ok = True
             is_recognized = identity != "Unknown"
-        elif face_crop.size > 0 and len(self._gallery) > 0:
-            try:
-                # PERFORMANCE: Use the MediaPipe face crop for dlib encoding.
-                # Benchmark confirmed: crop (11ms) >> full_frame+bbox (248ms) >> full_frame (138ms)
-                # The crop approach is 22x faster than the "optimized" bbox approach.
-                with time_operation("face_embedding"):
-                    embedding = face_embedder.generate_embedding(face_crop)
-
-                if embedding is not None:
-                    embedding_ok = True
-                    with time_operation("face_recognition"):
-                        rec_result = face_recognizer.recognize(embedding, self._gallery)
-                        if rec_result.is_match and rec_result.identity != "Unknown":
-                            identity = rec_result.identity
-                            is_recognized = True
-                            distance = rec_result.distance
-
-                # Store result (including "Unknown") so the next frame can reuse it
-                self._recognition_cache[_cell_key] = (identity, distance, embedding_ok, current_time)
-
-            except FaceEmbeddingError as e:
-                logger.debug(f"Face embedding generation skipped: {e}")
-            except Exception as e:
-                logger.error(f"Face recognition error: {e}")
+            track['bbox'] = bbox  # follow the face as it moves
+        else:
+            identity, is_recognized, distance, embedding_ok = self._recognize_crop(
+                face_crop, face_embedder, face_recognizer
+            )
+            # Only follow faces that produced an embedding; otherwise retry next frame
+            self._tracked_face = {
+                'bbox': bbox,
+                'identity': identity,
+                'distance': distance,
+                'verified_at': current_time,
+            } if (allow_tracking and embedding_ok) else None
 
         # Step B: Liveness analysis
         # CRITICAL FIX: Start challenge if enabled and not yet started
@@ -961,6 +1001,38 @@ class RealTimeAttendanceManager:
                 attendance_marked=False,
                 reason="Cooldown in progress"
             )
+
+        # SAFETY: never mark attendance from a reused identity. Recognise the
+        # face again on this exact frame; it must still be the same student.
+        if recognition_reused:
+            fresh_identity, _, fresh_distance, _ = self._recognize_crop(
+                face_crop, face_embedder, face_recognizer
+            )
+            if fresh_identity != identity:
+                self._tracked_face = None
+                logger.info(
+                    f"Re-check before marking did not confirm '{identity}' "
+                    f"(got '{fresh_identity}'); attendance not marked"
+                )
+                return FaceProcessingResult(
+                    bbox=bbox,
+                    detection_confidence=det_conf,
+                    identity=fresh_identity,
+                    is_recognized=fresh_identity != "Unknown",
+                    recognition_distance=fresh_distance,
+                    liveness_state=liveness_state,
+                    liveness_confidence=liveness_confidence,
+                    blink_count=blinks_detected,
+                    min_blinks_required=min_blinks,
+                    challenge_type=challenge_progress['challenge_type'],
+                    challenge_state=challenge_progress['challenge_state'],
+                    challenge_progress=challenge_progress['progress_percent'],
+                    attendance_marked=False,
+                    reason="Identity re-check before marking failed - verifying again"
+                )
+            distance = fresh_distance
+            if self._tracked_face is not None:
+                self._tracked_face.update(distance=fresh_distance, verified_at=current_time)
 
         self._cooldown_tracker[student_db_id] = current_time
 
