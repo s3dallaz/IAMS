@@ -250,6 +250,39 @@ def test_draw_attendance_overlays_draws_labels_without_face_rectangle():
     assert not dummy_frame.any()
 
 
+def test_stream_reloads_gallery_for_existing_manager():
+    """Students enrolled during an active session reach the running manager."""
+    from types import SimpleNamespace
+    from src.ui.pages.realtime_attendance import _run_realtime_attendance_stream
+
+    camera = MagicMock()
+    camera.is_open.return_value = True
+    rt_manager = MagicMock()
+    rt_manager.current_session_id = 7
+    state = SimpleNamespace(
+        att_camera_manager=camera,
+        att_rt_manager=rt_manager,
+        att_camera_active=False,  # stop before the frame loop starts
+    )
+    new_gallery = [("2021001", MagicMock()), ("2021002", MagicMock())]
+
+    with patch("streamlit.session_state", state), \
+         patch("src.ui.pages.realtime_attendance.EnrollmentService") as mock_enrollment:
+        mock_enrollment.return_value.load_active_gallery.return_value = new_gallery
+        _run_realtime_attendance_stream(
+            session_id=7,
+            require_liveness=True,
+            cooldown_seconds=5.0,
+            session_service=MagicMock(),
+            attendance_service=MagicMock(),
+            student_service=MagicMock(),
+            head_turn_angle=15.0,
+        )
+
+    assert state.att_rt_manager is rt_manager  # same manager, not recreated
+    rt_manager.set_gallery.assert_called_once_with(new_gallery)
+
+
 # ============================================================================
 # Streamlit Render Function Tests (Mocked UI Environment)
 # ============================================================================

@@ -127,3 +127,28 @@ def test_config_disables_msmf_hw_transforms_for_fast_camera_start():
 def test_config_keeps_user_msmf_hw_transforms_setting():
     """A value set in the environment (or .env) is not overwritten."""
     assert _msmf_flag_after_importing_config(preset="1") == "1"
+
+
+def test_face_recognition_threshold_can_be_set_from_environment():
+    """FACE_RECOGNITION_THRESHOLD in .env/environment overrides the 0.6 default."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "FACE_RECOGNITION_THRESHOLD": "0.5"}
+    result = subprocess.run(
+        [sys.executable, "-c", "import config; print(config.FACE_RECOGNITION_THRESHOLD)"],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "0.5"
+
+
+def test_face_recognition_threshold_default_is_unchanged():
+    """Without an override the threshold stays at the original 0.6."""
+    import os
+    import config
+
+    if "FACE_RECOGNITION_THRESHOLD" in os.environ:
+        pytest.skip("FACE_RECOGNITION_THRESHOLD is set in this environment")
+    assert config.FACE_RECOGNITION_THRESHOLD == 0.6

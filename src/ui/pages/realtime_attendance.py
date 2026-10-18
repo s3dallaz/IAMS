@@ -269,6 +269,11 @@ def _run_realtime_attendance_stream(
         rt_manager.require_liveness = require_liveness
         rt_manager.cooldown_seconds = cooldown_seconds
         rt_manager.head_turn_angle = head_turn_angle
+        # Reload the gallery on every page run (about every 30 s while
+        # streaming) so students enrolled or deactivated during an active
+        # session are picked up without restarting it. Loading takes only
+        # a few milliseconds.
+        rt_manager.set_gallery(EnrollmentService().load_active_gallery())
 
     # Layout placeholders
     col_video, col_live_status = st.columns([3, 2])

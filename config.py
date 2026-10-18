@@ -207,7 +207,8 @@ FACE_DETECTION_CONFIDENCE: Final[float] = _env_float("FACE_DETECTION_CONFIDENCE"
 
 # Face recognition distance threshold (face_recognition/dlib)
 # Lower values = stricter matching
-FACE_RECOGNITION_THRESHOLD: Final[float] = 0.6
+# Set FACE_RECOGNITION_THRESHOLD in .env to override the default of 0.6.
+FACE_RECOGNITION_THRESHOLD: Final[float] = _env_float("FACE_RECOGNITION_THRESHOLD", 0.6)
 
 # Minimum distance gap between the best match and the best match of a DIFFERENT
 # enrolled identity. When a query face is too close to call (nearly the same
