@@ -295,6 +295,43 @@ def test_person_panel_already_marked_student_not_asked_to_blink():
     assert "Turn your head" not in text
 
 
+def _pending_student(**overrides):
+    fields = dict(
+        bbox=(10, 10, 40, 40), detection_confidence=0.9, identity="2021001",
+        is_recognized=True, student_id="2021001", student_name="Alice Smith",
+        blink_count=1, min_blinks_required=3, challenge_type="turn_right",
+        challenge_state="active", reason="Liveness verification pending / not confirmed"
+    )
+    fields.update(overrides)
+    return FaceProcessingResult(**fields)
+
+
+def _panel(face):
+    return _build_person_info_markdown(RealTimeAttendanceResult(
+        session_id=1, faces_detected=1, processed_faces=[face], session_active=True
+    ))
+
+
+def test_person_panel_states_the_random_blink_count_and_time_left():
+    face = _pending_student()
+    face.challenge_seconds_left = 6.2
+    face.spoof_score = 0.93
+
+    text = _panel(face)
+
+    assert "Blink 3 times" in text and "1/3 blinks" in text
+    assert "Turn your head RIGHT" in text
+    assert "7 s left" in text
+    assert "Real-face score:** 0.93" in text
+
+
+def test_person_panel_shows_a_suspected_spoof_instead_of_instructions():
+    text = _panel(_pending_student(reason="Spoof suspected: face looks like a photo or screen"))
+
+    assert "🔴" in text and "face looks like a photo or screen" in text
+    assert "Blink 3 times" not in text
+
+
 def test_stream_reloads_gallery_for_existing_manager():
     """Students enrolled during an active session reach the running manager."""
     from types import SimpleNamespace

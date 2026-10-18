@@ -44,6 +44,7 @@ data/enrollment_images/*
 !data/enrollment_images/.gitkeep
 data/unknown_faces/*
 !data/unknown_faces/.gitkeep
+data/attendance_snapshots/
 
 # Test biometric images
 tests/fixtures/face_recognition/known/*

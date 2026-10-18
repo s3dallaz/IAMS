@@ -7,17 +7,25 @@ Provides real-time frame processing, caching/debouncing, lifecycle verification,
 and anti-spoofing enforcement for live video attendance monitoring.
 """
 
+import random
+import re
 import time
 import threading
+from collections import deque
+from datetime import datetime
 from queue import Queue, Empty
 from typing import Optional, List, Tuple, Dict, Any, Set
 from pathlib import Path
+
+import config
+import cv2
 import numpy as np
 
 from src.computer_vision.face_detector import FaceDetector, DetectedFace
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding, FaceEmbeddingError
 from src.computer_vision.face_recognizer import FaceRecognizer, RecognitionResult
 from src.computer_vision.detection_diagnostics import get_diagnostics
+from src.computer_vision.spoof_detection import AntiSpoofDetector, ScreenDetector, crop_around_face
 from src.computer_vision.liveness_detector import (
     LivenessDetector,
     LivenessResult,
@@ -121,6 +129,9 @@ class FaceProcessingResult:
         self.attendance_status = attendance_status
         self.already_marked = already_marked
         self.reason = reason
+        # Filled in by the manager for the face in view (None = not available)
+        self.spoof_score: Optional[float] = None             # mean real-face probability
+        self.challenge_seconds_left: Optional[float] = None  # time left for the challenge
 
     def __repr__(self) -> str:
         return (
@@ -226,6 +237,8 @@ class RealTimeAttendanceManager:
         face_embedder: Optional[FaceEmbedder] = None,
         face_recognizer: Optional[FaceRecognizer] = None,
         liveness_detector: Optional[LivenessDetector] = None,
+        anti_spoof_detector: Optional[AntiSpoofDetector] = None,
+        screen_detector: Optional[ScreenDetector] = None,
         require_liveness: bool = True,
         cooldown_seconds: float = 3.0,
         marked_by: str = 'system',
@@ -244,7 +257,9 @@ class RealTimeAttendanceManager:
             face_embedder: Injected FaceEmbedder instance (optional)
             face_recognizer: Injected FaceRecognizer instance (optional)
             liveness_detector: Injected LivenessDetector instance (optional)
-            require_liveness: If True, only LIVE faces can be marked present
+            anti_spoof_detector: Injected AntiSpoofDetector instance (optional)
+            screen_detector: Injected ScreenDetector instance (optional)
+            require_liveness: If True, only LIVE faces that pass the spoof checks can be marked present
             cooldown_seconds: Real-time debounce cooldown in seconds per student
             marked_by: Method identifier passed to attendance records ('system', 'cv_live', etc.)
             head_turn_angle: Required head turn angle in degrees for liveness challenges (default: from config)
@@ -261,6 +276,8 @@ class RealTimeAttendanceManager:
         self.face_embedder = face_embedder
         self.face_recognizer = face_recognizer
         self.liveness_detector = liveness_detector
+        self.anti_spoof_detector = anti_spoof_detector
+        self.screen_detector = screen_detector
 
         self.require_liveness = require_liveness
         self.cooldown_seconds = cooldown_seconds
@@ -300,6 +317,16 @@ class RealTimeAttendanceManager:
         # Holds the identity (including "Unknown") the current liveness
         # evidence was collected for; None = nobody yet.
         self._liveness_identity: Optional[str] = None
+
+        # Spoof evidence for the same person, reset together with liveness.
+        # Blinks and head turns can be replayed from a video, so the face must
+        # also look real to the anti-spoof model, and no phone / laptop / TV
+        # may be seen covering it (sticky until the person leaves the view).
+        self._spoof_scores: deque = deque(maxlen=max(1, config.ANTI_SPOOF_WINDOW))
+        self._screen_label: str = ""
+        # When the current random challenge started; it must be finished
+        # within config.LIVENESS_CHALLENGE_TIMEOUT. None = no challenge yet.
+        self._challenge_started_at: Optional[float] = None
 
         # Session status cache to avoid DB query on every CV frame (~6/sec)
         self._session_status_cache: Optional[Dict[str, Any]] = None
@@ -400,10 +427,90 @@ class RealTimeAttendanceManager:
         logger.debug("Tracking state reset")
 
     def _reset_liveness(self) -> None:
-        """Start liveness from scratch: no blinks, no challenge, no owner."""
+        """Start liveness from scratch: no blinks, no challenge, no spoof evidence, no owner."""
         if self.liveness_detector is not None:
             self.liveness_detector.reset_temporal_state()
         self._liveness_identity = None
+        self._spoof_scores.clear()
+        self._screen_label = ""
+        self._challenge_started_at = None
+
+    def _update_spoof_evidence(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
+        """Add this frame's anti-spoof score and screen check for the person in view."""
+        anti_spoof = self._get_anti_spoof_detector()
+        if anti_spoof is not None:
+            with time_operation("anti_spoof_score"):
+                score = anti_spoof.real_score(frame, bbox)
+            if score is not None:
+                self._spoof_scores.append(score)
+
+        screen_detector = self._get_screen_detector()
+        if screen_detector is not None and not self._screen_label:
+            with time_operation("screen_detection"):
+                label = screen_detector.screen_covering_face(frame, bbox)
+            if label:
+                self._screen_label = label
+                logger.warning(f"Spoof suspected: face shown on a {label}; marking blocked")
+
+    def _spoof_score(self) -> Optional[float]:
+        """Mean real-face probability over the recent frames, or None if not measured."""
+        return sum(self._spoof_scores) / len(self._spoof_scores) if self._spoof_scores else None
+
+    def _spoof_rejection_reason(self) -> Optional[str]:
+        """Reason the face looks like a spoof, or None if no spoof has been seen."""
+        if self._screen_label:
+            return f"Spoof suspected: face shown on a {self._screen_label} - step out of view and try again"
+        score = self._spoof_score()
+        if (score is not None
+                and self._get_anti_spoof_detector() is not None
+                and len(self._spoof_scores) >= config.ANTI_SPOOF_MIN_FRAMES
+                and score < config.ANTI_SPOOF_THRESHOLD):
+            return "Spoof suspected: face looks like a photo or screen"
+        return None
+
+    def _spoof_check_pending(self) -> bool:
+        """True while too few anti-spoof frames have been scored to decide."""
+        return (self._get_anti_spoof_detector() is not None
+                and len(self._spoof_scores) < config.ANTI_SPOOF_MIN_FRAMES)
+
+    def _challenge_seconds_left(self, current_time: float) -> Optional[float]:
+        if self._challenge_started_at is None or config.LIVENESS_CHALLENGE_TIMEOUT <= 0:
+            return None
+        return max(0.0, config.LIVENESS_CHALLENGE_TIMEOUT - (current_time - self._challenge_started_at))
+
+    def _save_snapshot(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        session_id: int,
+        student_id: Optional[str],
+        timestamp: float
+    ) -> Optional[Path]:
+        """
+        Save a small photo of the face and its surroundings for audit review:
+        data/attendance_snapshots/session_<id>/<student_id>_<YYYYmmdd_HHMMSS>.jpg.
+        A failure is logged and never blocks the attendance mark.
+        """
+        if not config.ATTENDANCE_SNAPSHOTS_ENABLED:
+            return None
+        try:
+            # 3x the face box shows hands and anything held up to the camera
+            crop = crop_around_face(frame, bbox, 3.0)
+            if crop is None or crop.size == 0:
+                return None
+            scale = 320 / max(crop.shape[:2])
+            if scale < 1.0:
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            folder = Path(config.ATTENDANCE_SNAPSHOTS_DIR) / f"session_{session_id}"
+            folder.mkdir(parents=True, exist_ok=True)
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(student_id))
+            path = folder / f"{safe_id}_{datetime.fromtimestamp(timestamp):%Y%m%d_%H%M%S}.jpg"
+            if not cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+                raise IOError(f"cv2.imwrite failed for {path}")
+            return path
+        except Exception as e:
+            logger.error(f"Could not save attendance snapshot: {e}")
+            return None
 
     def _note_liveness_identity(self, identity: str) -> None:
         """
@@ -486,6 +593,22 @@ class RealTimeAttendanceManager:
             # Update existing detector with new angle if changed
             self.liveness_detector.head_turn_angle = self.head_turn_angle
         return self.liveness_detector
+
+    def _get_anti_spoof_detector(self) -> Optional[AntiSpoofDetector]:
+        """The anti-spoof model, or None if disabled in config or its model file is missing."""
+        if not config.ANTI_SPOOF_ENABLED:
+            return None
+        if self.anti_spoof_detector is None:
+            self.anti_spoof_detector = AntiSpoofDetector()
+        return self.anti_spoof_detector if self.anti_spoof_detector.available else None
+
+    def _get_screen_detector(self) -> Optional[ScreenDetector]:
+        """The phone / screen detector, or None if disabled in config or its model file is missing."""
+        if not config.SCREEN_DETECTION_ENABLED:
+            return None
+        if self.screen_detector is None:
+            self.screen_detector = ScreenDetector()
+        return self.screen_detector if self.screen_detector.available else None
 
     def _recognize_crop(
         self,
@@ -745,6 +868,8 @@ class RealTimeAttendanceManager:
             marked_at=marked_at,
             allow_tracking=True
         )
+        face_result.spoof_score = self._spoof_score()
+        face_result.challenge_seconds_left = self._challenge_seconds_left(current_time)
 
         return RealTimeAttendanceResult(
             session_id=target_session,
@@ -811,12 +936,22 @@ class RealTimeAttendanceManager:
         if embedding_ok:
             self._note_liveness_identity(identity)
 
+        # Spoof evidence for this person: a replayed video blinks and turns too
+        if self.require_liveness:
+            self._update_spoof_evidence(frame, bbox)
+
         # Step B: Liveness analysis
         # CRITICAL FIX: Start challenge if enabled and not yet started
         if (liveness_detector.enable_challenges and
             liveness_detector.require_challenge and
             liveness_detector.current_challenge == ChallengeType.NONE):
-            liveness_detector.start_new_challenge()
+            liveness_detector.start_new_challenge()  # random head-turn direction
+            # ...and a random number of blinks, so the required actions differ
+            # every time and cannot be pre-recorded
+            liveness_detector.min_blinks = random.randint(
+                config.LIVENESS_MIN_BLINKS, max(config.LIVENESS_MIN_BLINKS, config.LIVENESS_MAX_BLINKS)
+            )
+            self._challenge_started_at = current_time
 
         # Update temporal state for the face
         # PERFORMANCE FIX: MediaPipe landmarks are now cached per-frame to avoid double inference
@@ -876,6 +1011,14 @@ class RealTimeAttendanceManager:
             else:
                 liveness_state = LivenessState.UNKNOWN
                 liveness_confidence = 0.0
+
+        # Time limit: an unfinished challenge is replaced by a new random one
+        # (the next frame starts it). Spoof evidence for the person is kept.
+        seconds_left = self._challenge_seconds_left(current_time)
+        if liveness_state != LivenessState.LIVE and seconds_left == 0.0:
+            logger.debug("Liveness challenge timed out; a new random challenge starts")
+            liveness_detector.reset_temporal_state()
+            self._challenge_started_at = None
 
         # Step C: Resolve student identity from database (cached to avoid per-frame SQLite hits).
         # The cache maps identity_string -> student dict (or None when not found).
@@ -996,8 +1139,15 @@ class RealTimeAttendanceManager:
                 reason="Attendance already recorded for this session"
             )
 
-        # Step E: Verify Liveness Requirement
-        if self.require_liveness and liveness_state != LivenessState.LIVE:
+        # Step E: Verify Liveness Requirement: spoof checks, blinks + challenge
+        liveness_reason = None
+        if self.require_liveness:
+            liveness_reason = self._spoof_rejection_reason()
+            if liveness_reason is None and liveness_state != LivenessState.LIVE:
+                liveness_reason = "Liveness verification pending / not confirmed"
+            if liveness_reason is None and self._spoof_check_pending():
+                liveness_reason = "Checking for photo / screen spoofing - please hold still"
+        if liveness_reason is not None:
             return FaceProcessingResult(
                 bbox=bbox,
                 detection_confidence=det_conf,
@@ -1015,7 +1165,7 @@ class RealTimeAttendanceManager:
                 challenge_state=challenge_progress['challenge_state'],
                 challenge_progress=challenge_progress['progress_percent'],
                 attendance_marked=False,
-                reason="Liveness verification pending / not confirmed"
+                reason=liveness_reason
             )
 
         # Step F: Verify Session Status
@@ -1113,6 +1263,9 @@ class RealTimeAttendanceManager:
 
             # Update cache
             self._marked_students.add(student_db_id)
+
+            # Audit photo of who was marked (for teacher review)
+            self._save_snapshot(frame, bbox, target_session, student_id_str, current_time)
 
             # This student's liveness evidence is used up: the next person
             # must blink and complete a new head-turn challenge themselves.

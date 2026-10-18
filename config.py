@@ -154,6 +154,7 @@ FACE_ENCODINGS_DIR: Final[Path] = DATA_DIR / "face_encodings"
 ENROLLMENT_IMAGES_DIR: Final[Path] = DATA_DIR / "enrollment_images"
 UNKNOWN_FACES_DIR: Final[Path] = DATA_DIR / "unknown_faces"
 LOGS_DIR: Final[Path] = DATA_DIR / "logs"
+ATTENDANCE_SNAPSHOTS_DIR: Final[Path] = DATA_DIR / "attendance_snapshots"
 
 # Database configuration
 DATABASE_NAME: Final[str] = "attendance.db"
@@ -271,8 +272,16 @@ LIVENESS_EAR_SMOOTHING_WINDOW: Final[int] = 0
 LIVENESS_ENABLE_ACTIVE_CHALLENGES: Final[bool] = True
 
 # Challenge timeout in seconds
-# User must complete the challenge within this time
-LIVENESS_CHALLENGE_TIMEOUT: Final[float] = 5.0
+# The person must finish the blinks + head turn within this time, otherwise a
+# new random challenge starts. A pre-recorded video cannot know the challenge
+# in advance; a relayed one (video call) has little time to react.
+# Set LIVENESS_CHALLENGE_TIMEOUT=0 in .env to disable the time limit.
+LIVENESS_CHALLENGE_TIMEOUT: Final[float] = _env_float("LIVENESS_CHALLENGE_TIMEOUT", 10.0)
+
+# Each challenge asks for a random number of blinks between LIVENESS_MIN_BLINKS
+# and this value (and a random head-turn direction), so the required actions
+# differ from person to person and cannot be pre-recorded.
+LIVENESS_MAX_BLINKS: Final[int] = int(_env_float("LIVENESS_MAX_BLINKS", 3))
 
 # Head turn angle thresholds (in degrees)
 # Yaw angle required to complete left/right turn challenges
@@ -291,6 +300,33 @@ LIVENESS_HEAD_HOLD_FRAMES: Final[int] = 3
 # Require challenge completion along with blink detection for LIVE state
 # If False, blink detection alone is sufficient (Phase 3B behavior)
 LIVENESS_REQUIRE_CHALLENGE: Final[bool] = True
+
+# ----------------------------------------------------------------------------
+# Spoof (presentation attack) detection - part of the liveness requirement
+# ----------------------------------------------------------------------------
+# Blinks and head turns can be replayed from a video, so with liveness required
+# a face must also pass these checks (src/computer_vision/spoof_detection.py).
+# Each check is skipped, with a warning, if its model file is missing.
+
+# Anti-spoof model (MiniFASNet): real-face probability averaged over the last
+# ANTI_SPOOF_WINDOW CV frames must be at least ANTI_SPOOF_THRESHOLD, after at
+# least ANTI_SPOOF_MIN_FRAMES frames. Tune with manual_tests/spoof_check_live.py.
+ANTI_SPOOF_ENABLED: bool = os.getenv("ANTI_SPOOF_ENABLED", "true").lower() == "true"
+ANTI_SPOOF_THRESHOLD: float = _env_float("ANTI_SPOOF_THRESHOLD", 0.6)
+ANTI_SPOOF_MIN_FRAMES: int = int(_env_float("ANTI_SPOOF_MIN_FRAMES", 5))
+ANTI_SPOOF_WINDOW: int = int(_env_float("ANTI_SPOOF_WINDOW", 10))
+
+# Screen detector (MediaPipe EfficientDet-Lite0): a phone, laptop or TV whose
+# box covers at least SCREEN_FACE_OVERLAP of the face box blocks marking until
+# the person leaves the view.
+SCREEN_DETECTION_ENABLED: bool = os.getenv("SCREEN_DETECTION_ENABLED", "true").lower() == "true"
+SCREEN_DETECTION_CONFIDENCE: float = _env_float("SCREEN_DETECTION_CONFIDENCE", 0.4)
+SCREEN_FACE_OVERLAP: float = _env_float("SCREEN_FACE_OVERLAP", 0.5)
+
+# Audit snapshot: a small photo of the face is saved with every real-time
+# attendance mark (data/attendance_snapshots/session_<id>/) so a teacher can
+# review who was marked. These are biometric images and are git-ignored.
+ATTENDANCE_SNAPSHOTS_ENABLED: bool = os.getenv("ATTENDANCE_SNAPSHOTS_ENABLED", "true").lower() == "true"
 
 # Number of enrollment images required per student (to be implemented in Phase 2B)
 # ENROLLMENT_IMAGES_REQUIRED: int = 5

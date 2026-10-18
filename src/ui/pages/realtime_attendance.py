@@ -8,6 +8,8 @@ FaceRecognizer, LivenessDetector, SessionService, and AttendanceService.
 Runs continuous frame processing loop with st.empty() without full script rerun per frame.
 """
 
+import math
+
 import streamlit as st
 import cv2
 import numpy as np
@@ -456,6 +458,9 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
         else:
             # Show actionable instructions based on actual detector state
             blink_status = f"{face_info.blink_count}/{face_info.min_blinks_required} blinks"
+            # The number of blinks is random per challenge, so say it explicitly
+            times = "time" if face_info.min_blinks_required == 1 else "times"
+            blink_request = f"**Blink {face_info.min_blinks_required} {times}**"
 
             challenge_instruction = ""
             if face_info.challenge_type != "none":
@@ -479,21 +484,33 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
                              face_info.challenge_state != "completed")
 
             if needs_blinks and needs_challenge:
-                instruction = f"🔵 **Blink naturally** ({blink_status}) and {challenge_instruction}"
+                instruction = f"🔵 {blink_request} ({blink_status}) and {challenge_instruction}"
             elif needs_blinks:
-                instruction = f"🔵 **Blink naturally** to verify liveness ({blink_status})"
+                instruction = f"🔵 {blink_request} to verify liveness ({blink_status})"
             elif needs_challenge:
                 instruction = f"🔵 {challenge_instruction}"
             else:
                 instruction = "🟡 **Verifying...** Almost there!"
 
+            # The challenge has a time limit; a new random one replaces it
+            seconds_left = getattr(face_info, "challenge_seconds_left", None)
+            if seconds_left is not None and (needs_blinks or needs_challenge):
+                instruction += f" — ⏱ {math.ceil(seconds_left)} s left"
+
             liveness_display = instruction
+
+        # A suspected photo / screen replay overrides the instructions
+        if face_info.reason.startswith("Spoof suspected"):
+            liveness_display = f"🔴 **{face_info.reason}**"
 
         lines = [
             f"**Name:** {name}",
             f"**ID:** `{student_id}`",
             f"**Liveness:** {liveness_display}",
         ]
+        spoof_score = getattr(face_info, "spoof_score", None)
+        if spoof_score is not None and not face_info.already_marked:
+            lines.append(f"**Real-face score:** {spoof_score:.2f}")
 
         if face_info.attendance_marked:
             lines.append(f"✅ **Attendance Marked: {face_info.attendance_status.upper()}**")

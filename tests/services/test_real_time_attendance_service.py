@@ -853,8 +853,8 @@ def stateful_liveness(mock_cv_components):
 
 
 def _pass_liveness(liveness):
-    """The person in front of the camera blinks and completes the head turn."""
-    liveness.blink_count = 1
+    """The person in front of the camera blinks (as often as the challenge asks) and turns."""
+    liveness.blink_count = liveness.min_blinks
     liveness.challenge_state = ChallengeState.COMPLETED
 
 
@@ -1167,3 +1167,214 @@ def test_head_turn_angle_validated(temp_db, active_session):
     # Negative angle should fail
     with pytest.raises(ValueError, match="head_turn_angle must be positive"):
         LivenessDetector(head_turn_angle=-10.0)
+
+
+# ============================================================================
+# Spoof checks, random timed challenges and audit snapshots
+# ============================================================================
+
+import config  # noqa: E402
+import cv2  # noqa: E402
+from src.computer_vision.spoof_detection import AntiSpoofDetector, ScreenDetector  # noqa: E402
+
+
+def _fake_anti_spoof(score):
+    fake = MagicMock(spec=AntiSpoofDetector)
+    fake.available = True
+    fake.real_score.return_value = score
+    return fake
+
+
+def _fake_screen(label=None):
+    fake = MagicMock(spec=ScreenDetector)
+    fake.available = True
+    fake.screen_covering_face.return_value = label
+    return fake
+
+
+@pytest.fixture
+def spoof_checks_on(monkeypatch):
+    """Enable both spoof checks (conftest turns them off) and decide after 3 frames."""
+    monkeypatch.setattr(config, "ANTI_SPOOF_ENABLED", True)
+    monkeypatch.setattr(config, "SCREEN_DETECTION_ENABLED", True)
+    monkeypatch.setattr(config, "ANTI_SPOOF_MIN_FRAMES", 3)
+
+
+def _spoof_manager(temp_db, active_session, mock_cv_components, liveness, anti_spoof, screen,
+                   face=FACE):
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+    manager.anti_spoof_detector = anti_spoof
+    manager.screen_detector = screen
+    mock_cv_components['detector'].detect_faces.return_value = [face]
+    mock_cv_components['recognizer'].recognize.return_value = ALICE
+    return manager
+
+
+def test_replayed_face_is_not_marked_even_after_blink_and_turn(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, spoof_checks_on
+):
+    """A video replay passes blink + head turn; the anti-spoof model still blocks it."""
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                             _fake_anti_spoof(0.2), _fake_screen())
+    manager.process_frame(sample_frame)          # challenge starts
+    _pass_liveness(stateful_liveness)
+    for _ in range(3):
+        face = manager.process_frame(sample_frame).processed_faces[0]
+
+    assert face.attendance_marked is False
+    assert face.reason == "Spoof suspected: face looks like a photo or screen"
+    assert face.spoof_score == pytest.approx(0.2)
+
+
+def test_real_face_is_marked_once_enough_frames_are_scored(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, spoof_checks_on
+):
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                             _fake_anti_spoof(0.95), _fake_screen())
+    manager.process_frame(sample_frame)          # score 1, challenge starts
+    _pass_liveness(stateful_liveness)
+
+    pending = manager.process_frame(sample_frame).processed_faces[0]   # score 2 of 3
+    assert pending.attendance_marked is False
+    assert pending.reason.startswith("Checking for photo / screen spoofing")
+
+    marked = manager.process_frame(sample_frame).processed_faces[0]    # score 3
+    assert marked.attendance_marked is True
+
+
+def test_face_on_a_phone_blocks_marking_until_the_person_leaves(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, spoof_checks_on
+):
+    screen = _fake_screen("cell phone")
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                             _fake_anti_spoof(0.95), screen)
+    detector = mock_cv_components['detector']
+
+    manager.process_frame(sample_frame)          # phone seen covering the face
+    screen.screen_covering_face.return_value = None
+    _pass_liveness(stateful_liveness)
+    for _ in range(3):
+        face = manager.process_frame(sample_frame).processed_faces[0]
+    assert face.attendance_marked is False
+    assert "cell phone" in face.reason and face.reason.startswith("Spoof suspected")
+
+    # Leaving the view clears it; a real face then verifies normally
+    detector.detect_faces.return_value = []
+    manager.process_frame(sample_frame)
+    detector.detect_faces.return_value = [FACE]
+    manager.process_frame(sample_frame)
+    _pass_liveness(stateful_liveness)
+    manager.process_frame(sample_frame)
+    assert manager.process_frame(sample_frame).processed_faces[0].attendance_marked is True
+
+
+def test_spoof_evidence_restarts_when_the_person_changes(
+    temp_db, active_session, sample_student, second_student, sample_frame,
+    mock_cv_components, stateful_liveness, spoof_checks_on
+):
+    anti_spoof = _fake_anti_spoof(0.2)
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                             anti_spoof, _fake_screen())
+    for _ in range(3):
+        manager.process_frame(sample_frame)      # Alice: three low scores
+
+    # Bob steps in at a different position, so he is recognised afresh
+    mock_cv_components['detector'].detect_faces.return_value = [
+        DetectedFace(bbox=(55, 55, 40, 40), confidence=0.9)
+    ]
+    mock_cv_components['recognizer'].recognize.return_value = BOB
+    anti_spoof.real_score.return_value = 0.9
+    bob = manager.process_frame(sample_frame).processed_faces[0]
+
+    assert bob.spoof_score == pytest.approx(0.9)  # none of Alice's scores
+    assert not bob.reason.startswith("Spoof suspected")
+
+
+def test_spoof_checks_are_skipped_when_liveness_is_not_required(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, spoof_checks_on
+):
+    anti_spoof, screen = _fake_anti_spoof(0.1), _fake_screen("tv")
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                             anti_spoof, screen)
+    manager.require_liveness = False
+
+    face = manager.process_frame(sample_frame).processed_faces[0]
+
+    assert face.attendance_marked is True
+    anti_spoof.real_score.assert_not_called()
+    screen.screen_covering_face.assert_not_called()
+
+
+def test_each_challenge_asks_for_a_random_number_of_blinks(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, monkeypatch
+):
+    monkeypatch.setattr(config, "LIVENESS_MIN_BLINKS", 1)
+    monkeypatch.setattr(config, "LIVENESS_MAX_BLINKS", 3)
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness, None, None)
+
+    with patch("src.services.real_time_attendance_service.random.randint", return_value=3) as randint:
+        face = manager.process_frame(sample_frame).processed_faces[0]
+
+    randint.assert_called_once_with(1, 3)
+    assert stateful_liveness.min_blinks == 3
+    assert face.min_blinks_required == 3
+    stateful_liveness.blink_count = 1                # one blink is not enough now
+    stateful_liveness.challenge_state = ChallengeState.COMPLETED
+    assert manager.process_frame(sample_frame).processed_faces[0].attendance_marked is False
+
+
+def test_unfinished_challenge_is_replaced_after_the_time_limit(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, monkeypatch
+):
+    monkeypatch.setattr(config, "LIVENESS_CHALLENGE_TIMEOUT", 10.0)
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness, None, None)
+
+    first = manager.process_frame(sample_frame).processed_faces[0]
+    assert first.challenge_seconds_left == pytest.approx(10.0, abs=0.5)
+    assert stateful_liveness.start_new_challenge.call_count == 1
+
+    manager._challenge_started_at -= 11.0         # the person took too long
+    stateful_liveness.blink_count = stateful_liveness.min_blinks  # blinked, but never turned
+    manager.process_frame(sample_frame)
+    assert stateful_liveness.blink_count == 0     # progress discarded
+    manager.process_frame(sample_frame)
+    assert stateful_liveness.start_new_challenge.call_count == 2  # a fresh random challenge
+
+
+def test_audit_snapshot_is_saved_when_a_student_is_marked(
+    temp_db, active_session, sample_student, mock_cv_components, stateful_liveness,
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "ATTENDANCE_SNAPSHOTS_ENABLED", True)
+    monkeypatch.setattr(config, "ATTENDANCE_SNAPSHOTS_DIR", tmp_path)
+    frame = (np.random.rand(480, 640, 3) * 255).astype(np.uint8)
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness, None, None,
+                             face=DetectedFace(bbox=(250, 150, 140, 170), confidence=0.9))
+    manager.process_frame(frame)
+    _pass_liveness(stateful_liveness)
+    assert manager.process_frame(frame).processed_faces[0].attendance_marked is True
+
+    snapshots = list((tmp_path / f"session_{active_session}").glob("2021001_*.jpg"))
+    assert len(snapshots) == 1
+    image = cv2.imread(str(snapshots[0]))
+    assert image is not None and max(image.shape[:2]) <= 320
+
+
+def test_failed_snapshot_never_blocks_the_attendance_mark(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "ATTENDANCE_SNAPSHOTS_ENABLED", True)
+    monkeypatch.setattr(config, "ATTENDANCE_SNAPSHOTS_DIR", tmp_path)
+    monkeypatch.setattr(cv2, "imwrite", lambda *args, **kwargs: False)
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness, None, None)
+    manager.process_frame(sample_frame)
+    _pass_liveness(stateful_liveness)
+
+    assert manager.process_frame(sample_frame).processed_faces[0].attendance_marked is True
