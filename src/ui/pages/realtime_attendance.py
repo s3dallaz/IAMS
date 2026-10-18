@@ -430,6 +430,14 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
     Reduces per-frame Streamlit API calls from 6-8 widget creations
     to a single markdown update.
     """
+    if result.multiple_faces:
+        # One person at a time: nobody is recognised or marked meanwhile
+        return (
+            f"👥 **{result.faces_detected} faces in view**\n\n"
+            f"⚠️ **{result.message}**\n\n"
+            f"_Nobody is marked while more than one face is in front of the camera._"
+        )
+
     if not result.processed_faces:
         return "_No face currently detected in frame._"
 
@@ -440,7 +448,10 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
         student_id = face_info.student_id or '—'
 
         # Build liveness status with instructions
-        if face_info.liveness_state == LivenessState.LIVE:
+        if face_info.already_marked:
+            # Liveness restarts after each mark; no need to ask again
+            liveness_display = "— not needed, already marked"
+        elif face_info.liveness_state == LivenessState.LIVE:
             liveness_display = "🟢 **Live** — Verified"
         else:
             # Show actionable instructions based on actual detector state

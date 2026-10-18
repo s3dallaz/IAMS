@@ -144,6 +144,9 @@ class RealTimeAttendanceResult:
         session_active: Whether the session was active during processing
         marked_count: Number of new attendance records created in this frame
         timestamp: Time when frame was processed
+        multiple_faces: True if more than one face was in view, so nobody was
+            recognised or marked (one person at a time)
+        message: Frame-level message for the UI (e.g. MULTIPLE_FACES_MESSAGE)
     """
 
     def __init__(
@@ -153,7 +156,9 @@ class RealTimeAttendanceResult:
         processed_faces: List[FaceProcessingResult],
         session_active: bool,
         marked_count: int = 0,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        multiple_faces: bool = False,
+        message: str = ""
     ):
         self.session_id = session_id
         self.faces_detected = faces_detected
@@ -161,6 +166,8 @@ class RealTimeAttendanceResult:
         self.session_active = session_active
         self.marked_count = marked_count
         self.timestamp = timestamp if timestamp is not None else time.time()
+        self.multiple_faces = multiple_faces
+        self.message = message
 
     def __repr__(self) -> str:
         return (
@@ -169,6 +176,12 @@ class RealTimeAttendanceResult:
             f"marked={self.marked_count}, "
             f"active={self.session_active})"
         )
+
+
+# Shown when more than one face is in view. Attendance works like a kiosk:
+# one person at a time, so one person's blink or head turn can never verify
+# somebody else (for example a photo held up next to a live face).
+MULTIPLE_FACES_MESSAGE = "Multiple faces detected — please step up one at a time"
 
 
 def _bbox_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
@@ -279,6 +292,15 @@ class RealTimeAttendanceManager:
         self.track_reverify_seconds: float = 2.0
         self.track_min_iou: float = 0.5
 
+        # Liveness belongs to one person. The detector's blink count and
+        # head-turn challenge are reset after a student is marked, when the
+        # face leaves the view, when several faces are in view, and when the
+        # identity in front of the camera changes. Without this, the first
+        # student's blink + turn would verify everyone who came after them.
+        # Holds the identity (including "Unknown") the current liveness
+        # evidence was collected for; None = nobody yet.
+        self._liveness_identity: Optional[str] = None
+
         # Session status cache to avoid DB query on every CV frame (~6/sec)
         self._session_status_cache: Optional[Dict[str, Any]] = None
         self._session_status_cache_time: float = 0.0
@@ -374,9 +396,31 @@ class RealTimeAttendanceManager:
         self._cooldown_tracker.clear()
         self._session_status_cache = None
         self._session_status_cache_time = 0.0
+        self._reset_liveness()
+        logger.debug("Tracking state reset")
+
+    def _reset_liveness(self) -> None:
+        """Start liveness from scratch: no blinks, no challenge, no owner."""
         if self.liveness_detector is not None:
             self.liveness_detector.reset_temporal_state()
-        logger.debug("Tracking state reset")
+        self._liveness_identity = None
+
+    def _note_liveness_identity(self, identity: str) -> None:
+        """
+        Reset liveness if a different person is now in front of the camera.
+
+        Called only for frames whose identity is backed by an embedding, so a
+        frame where the embedding failed does not wipe a student's progress.
+        "Unknown" counts as an identity: an unenrolled live person cannot
+        collect the blink + turn and then hand over to a photo of a student.
+        """
+        if self._liveness_identity is not None and identity != self._liveness_identity:
+            logger.info(
+                f"Person changed ('{self._liveness_identity}' -> '{identity}'); "
+                f"liveness restarted"
+            )
+            self._reset_liveness()
+        self._liveness_identity = identity
 
     def _get_session_status_cached(self, session_id: int) -> bool:
         """
@@ -648,6 +692,7 @@ class RealTimeAttendanceManager:
 
         if not detected_faces:
             self._tracked_face = None  # face left the view: re-recognise next time
+            self._reset_liveness()     # the next person starts liveness afresh
             # Diagnostics: record the post-detection stages for a missed frame,
             # which separates "not detected" from "detected but unusable".
             get_diagnostics().record(frame.shape, [], stage="no_detection")
@@ -659,45 +704,54 @@ class RealTimeAttendanceManager:
                 marked_count=0
             )
 
-        # Step 2: Process each detected face
-        processed_faces: List[FaceProcessingResult] = []
-        newly_marked_count = 0
         current_time = time.time()
 
-        face_embedder = self._get_face_embedder()
-        face_recognizer = self._get_face_recognizer()
-        liveness_detector = self._get_liveness_detector()
-
-        # Identities are only followed while exactly one face is in view
-        single_face = len(detected_faces) == 1
-        if not single_face:
+        # Step 2: One person at a time. With several faces in view nobody is
+        # recognised, liveness-checked or marked: the eye/head landmarks come
+        # from a single face, so one person's blink and head turn would
+        # otherwise verify every face in the frame. Skipping recognition here
+        # also avoids a ~230 ms embedding per face on every CV frame.
+        if len(detected_faces) > 1:
             self._tracked_face = None
-
-        for detected_face in detected_faces:
-            face_result = self._process_single_face(
-                frame=frame,
-                detected_face=detected_face,
-                target_session=target_session,
+            self._reset_liveness()
+            return RealTimeAttendanceResult(
+                session_id=target_session,
+                faces_detected=len(detected_faces),
+                processed_faces=[
+                    FaceProcessingResult(
+                        bbox=face.bbox,
+                        detection_confidence=float(face.confidence),
+                        reason=MULTIPLE_FACES_MESSAGE
+                    )
+                    for face in detected_faces
+                ],
                 session_active=session_active,
-                face_embedder=face_embedder,
-                face_recognizer=face_recognizer,
-                liveness_detector=liveness_detector,
-                current_time=current_time,
-                marked_at=marked_at,
-                allow_tracking=single_face
+                marked_count=0,
+                timestamp=current_time,
+                multiple_faces=True,
+                message=MULTIPLE_FACES_MESSAGE
             )
 
-            if face_result.attendance_marked:
-                newly_marked_count += 1
-
-            processed_faces.append(face_result)
+        # Step 3: Process the single face in view
+        face_result = self._process_single_face(
+            frame=frame,
+            detected_face=detected_faces[0],
+            target_session=target_session,
+            session_active=session_active,
+            face_embedder=self._get_face_embedder(),
+            face_recognizer=self._get_face_recognizer(),
+            liveness_detector=self._get_liveness_detector(),
+            current_time=current_time,
+            marked_at=marked_at,
+            allow_tracking=True
+        )
 
         return RealTimeAttendanceResult(
             session_id=target_session,
-            faces_detected=len(detected_faces),
-            processed_faces=processed_faces,
+            faces_detected=1,
+            processed_faces=[face_result],
             session_active=session_active,
-            marked_count=newly_marked_count,
+            marked_count=1 if face_result.attendance_marked else 0,
             timestamp=current_time
         )
 
@@ -751,6 +805,11 @@ class RealTimeAttendanceManager:
                 'distance': distance,
                 'verified_at': current_time,
             } if (allow_tracking and embedding_ok) else None
+
+        # A different person restarts liveness before this frame's blink and
+        # head-turn data are counted, so the evidence belongs to them alone.
+        if embedding_ok:
+            self._note_liveness_identity(identity)
 
         # Step B: Liveness analysis
         # CRITICAL FIX: Start challenge if enabled and not yet started
@@ -912,51 +971,9 @@ class RealTimeAttendanceManager:
                 reason="Unknown person - not enrolled"
             )
 
-        # Step D: Verify Liveness Requirement
-        if self.require_liveness and liveness_state != LivenessState.LIVE:
-            return FaceProcessingResult(
-                bbox=bbox,
-                detection_confidence=det_conf,
-                identity=identity,
-                is_recognized=True,
-                recognition_distance=distance,
-                student_id=student_id_str,
-                student_db_id=student_db_id,
-                student_name=student_name,
-                liveness_state=liveness_state,
-                liveness_confidence=liveness_confidence,
-                blink_count=blinks_detected,
-                min_blinks_required=min_blinks,
-                challenge_type=challenge_progress['challenge_type'],
-                challenge_state=challenge_progress['challenge_state'],
-                challenge_progress=challenge_progress['progress_percent'],
-                attendance_marked=False,
-                reason="Liveness verification pending / not confirmed"
-            )
-
-        # Step E: Verify Session Status
-        if not session_active:
-            return FaceProcessingResult(
-                bbox=bbox,
-                detection_confidence=det_conf,
-                identity=identity,
-                is_recognized=True,
-                recognition_distance=distance,
-                student_id=student_id_str,
-                student_db_id=student_db_id,
-                student_name=student_name,
-                liveness_state=liveness_state,
-                liveness_confidence=liveness_confidence,
-                blink_count=blinks_detected,
-                min_blinks_required=min_blinks,
-                challenge_type=challenge_progress['challenge_type'],
-                challenge_state=challenge_progress['challenge_state'],
-                challenge_progress=challenge_progress['progress_percent'],
-                attendance_marked=False,
-                reason="Session is not active (scheduled or closed)"
-            )
-
-        # Step F: Check In-Memory Duplicate Cache & Cooldown
+        # Step D: In-memory duplicate cache. Checked before liveness because
+        # liveness restarts after each mark: a student who is already marked
+        # is told so instead of being asked to blink and turn again.
         if student_db_id in self._marked_students:
             return FaceProcessingResult(
                 bbox=bbox,
@@ -979,7 +996,51 @@ class RealTimeAttendanceManager:
                 reason="Attendance already recorded for this session"
             )
 
-        # Check cooldown debounce to avoid rapid repeated DB calls
+        # Step E: Verify Liveness Requirement
+        if self.require_liveness and liveness_state != LivenessState.LIVE:
+            return FaceProcessingResult(
+                bbox=bbox,
+                detection_confidence=det_conf,
+                identity=identity,
+                is_recognized=True,
+                recognition_distance=distance,
+                student_id=student_id_str,
+                student_db_id=student_db_id,
+                student_name=student_name,
+                liveness_state=liveness_state,
+                liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
+                attendance_marked=False,
+                reason="Liveness verification pending / not confirmed"
+            )
+
+        # Step F: Verify Session Status
+        if not session_active:
+            return FaceProcessingResult(
+                bbox=bbox,
+                detection_confidence=det_conf,
+                identity=identity,
+                is_recognized=True,
+                recognition_distance=distance,
+                student_id=student_id_str,
+                student_db_id=student_db_id,
+                student_name=student_name,
+                liveness_state=liveness_state,
+                liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
+                attendance_marked=False,
+                reason="Session is not active (scheduled or closed)"
+            )
+
+        # Step G: Check cooldown debounce to avoid rapid repeated DB calls
         last_time = self._cooldown_tracker.get(student_db_id, 0.0)
         if current_time - last_time < self.cooldown_seconds:
             return FaceProcessingResult(
@@ -1005,11 +1066,13 @@ class RealTimeAttendanceManager:
         # SAFETY: never mark attendance from a reused identity. Recognise the
         # face again on this exact frame; it must still be the same student.
         if recognition_reused:
-            fresh_identity, _, fresh_distance, _ = self._recognize_crop(
+            fresh_identity, _, fresh_distance, fresh_embedding_ok = self._recognize_crop(
                 face_crop, face_embedder, face_recognizer
             )
             if fresh_identity != identity:
                 self._tracked_face = None
+                if fresh_embedding_ok:
+                    self._note_liveness_identity(fresh_identity)  # someone else: restart
                 logger.info(
                     f"Re-check before marking did not confirm '{identity}' "
                     f"(got '{fresh_identity}'); attendance not marked"
@@ -1036,7 +1099,7 @@ class RealTimeAttendanceManager:
 
         self._cooldown_tracker[student_db_id] = current_time
 
-        # Step G: Mark Attendance via AttendanceService
+        # Step H: Mark Attendance via AttendanceService
         try:
             attendance_id = self.attendance_service.record_attendance(
                 session_id=target_session,
@@ -1050,6 +1113,10 @@ class RealTimeAttendanceManager:
 
             # Update cache
             self._marked_students.add(student_db_id)
+
+            # This student's liveness evidence is used up: the next person
+            # must blink and complete a new head-turn challenge themselves.
+            self._reset_liveness()
 
             # Fetch recorded status
             record = self.attendance_service.get_attendance(attendance_id)
@@ -1085,6 +1152,7 @@ class RealTimeAttendanceManager:
 
         except DuplicateAttendanceError:
             self._marked_students.add(student_db_id)
+            self._reset_liveness()
             return FaceProcessingResult(
                 bbox=bbox,
                 detection_confidence=det_conf,

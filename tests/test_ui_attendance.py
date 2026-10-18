@@ -24,11 +24,13 @@ from src.ui.pages.session_management import (
 )
 from src.ui.pages.realtime_attendance import (
     render_realtime_attendance,
-    _draw_attendance_overlays
+    _draw_attendance_overlays,
+    _build_person_info_markdown
 )
 from src.services.real_time_attendance_service import (
     RealTimeAttendanceResult,
-    FaceProcessingResult
+    FaceProcessingResult,
+    MULTIPLE_FACES_MESSAGE
 )
 from src.computer_vision.liveness_detector import LivenessState
 
@@ -251,6 +253,46 @@ def test_draw_attendance_overlays_shows_clean_mirrored_camera_view():
     # The bbox stays available for the pipeline and the input frame is untouched
     assert face.bbox == (20, 20, 50, 50)
     assert np.array_equal(dummy_frame, original)
+
+
+def test_person_panel_asks_for_one_person_at_a_time():
+    """With several faces in view the panel says so instead of showing a person."""
+    faces = [
+        FaceProcessingResult(bbox=(10, 10, 40, 40), detection_confidence=0.9,
+                             reason=MULTIPLE_FACES_MESSAGE),
+        FaceProcessingResult(bbox=(60, 10, 40, 40), detection_confidence=0.9,
+                             reason=MULTIPLE_FACES_MESSAGE),
+    ]
+    res = RealTimeAttendanceResult(
+        session_id=1, faces_detected=2, processed_faces=faces, session_active=True,
+        multiple_faces=True, message=MULTIPLE_FACES_MESSAGE
+    )
+
+    text = _build_person_info_markdown(res)
+
+    assert MULTIPLE_FACES_MESSAGE in text
+    assert "2 faces" in text
+    assert "Unknown Person" not in text
+
+
+def test_person_panel_already_marked_student_not_asked_to_blink():
+    """A marked student still in view is not told to blink or turn again."""
+    face = FaceProcessingResult(
+        bbox=(10, 10, 40, 40), detection_confidence=0.9, identity="2021001",
+        is_recognized=True, student_id="2021001", student_name="Alice Smith",
+        blink_count=0, min_blinks_required=1, challenge_type="turn_left",
+        challenge_state="active", already_marked=True,
+        reason="Attendance already recorded for this session"
+    )
+    res = RealTimeAttendanceResult(
+        session_id=1, faces_detected=1, processed_faces=[face], session_active=True
+    )
+
+    text = _build_person_info_markdown(res)
+
+    assert "Already Marked" in text
+    assert "Blink" not in text
+    assert "Turn your head" not in text
 
 
 def test_stream_reloads_gallery_for_existing_manager():

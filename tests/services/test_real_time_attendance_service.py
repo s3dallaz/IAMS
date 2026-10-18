@@ -30,7 +30,8 @@ from src.services.real_time_attendance_service import (
     RealTimeAttendanceService,
     RealTimeAttendanceResult,
     FaceProcessingResult,
-    RealTimeAttendanceError
+    RealTimeAttendanceError,
+    MULTIPLE_FACES_MESSAGE
 )
 from src.database.schema import initialize_database
 
@@ -735,30 +736,32 @@ def test_duplicate_student_not_marked_multiple_times(
     assert len(records) == 1
 
 
-def test_multiple_distinct_students_in_single_frame(
+def test_multiple_faces_in_frame_nobody_marked(
     temp_db, active_session, sample_student, second_student, sample_frame, mock_cv_components
 ):
-    """Test that multiple distinct students in the same frame are both marked independently."""
+    """Two enrolled, live-looking faces in one frame: nobody is marked.
+
+    Liveness landmarks come from one face only, so one person's blink and
+    head turn must not verify a second face (e.g. a photo held up beside
+    them). The kiosk asks people to step up one at a time instead.
+    """
     detector = mock_cv_components['detector']
     embedder = mock_cv_components['embedder']
     recognizer = mock_cv_components['recognizer']
     liveness = mock_cv_components['liveness']
-    
-    # 2 faces detected
+
     detector.detect_faces.return_value = [
         DetectedFace(bbox=(10, 10, 40, 40), confidence=0.92),
         DetectedFace(bbox=(50, 50, 40, 40), confidence=0.91)
     ]
-    
     enc1 = np.random.rand(128)
     enc2 = np.random.rand(128)
     embedder.generate_embedding.side_effect = [FaceEmbedding(enc1), FaceEmbedding(enc2)]
-    
     recognizer.recognize.side_effect = [
         RecognitionResult(identity="2021001", distance=0.2, is_match=True),
         RecognitionResult(identity="2021002", distance=0.22, is_match=True)
     ]
-    
+
     manager = RealTimeAttendanceManager(
         session_id=active_session,
         database_path=temp_db,
@@ -771,20 +774,260 @@ def test_multiple_distinct_students_in_single_frame(
         ("2021001", FaceEmbedding(enc1)),
         ("2021002", FaceEmbedding(enc2))
     ])
-    
+
     result = manager.process_frame(sample_frame)
-    
+
     assert result.faces_detected == 2
-    assert result.marked_count == 2
-    assert result.processed_faces[0].student_id == "2021001"
-    assert result.processed_faces[0].attendance_marked is True
-    assert result.processed_faces[1].student_id == "2021002"
-    assert result.processed_faces[1].attendance_marked is True
-    
-    # Verify in DB
+    assert result.marked_count == 0
+    assert result.multiple_faces is True
+    assert result.message == MULTIPLE_FACES_MESSAGE
+    assert len(result.processed_faces) == 2
+    assert all(not f.attendance_marked and not f.is_recognized for f in result.processed_faces)
+    assert all(f.reason == MULTIPLE_FACES_MESSAGE for f in result.processed_faces)
+    # No embedding, recognition or liveness work while several faces are in view
+    embedder.generate_embedding.assert_not_called()
+    recognizer.recognize.assert_not_called()
+    liveness.update_temporal_state.assert_not_called()
+    # ... and any liveness progress so far is discarded
+    liveness.reset_temporal_state.assert_called()
+
     att_service = AttendanceService(temp_db)
-    records = att_service.get_session_attendance(active_session)
-    assert len(records) == 2
+    assert att_service.get_session_attendance(active_session) == []
+
+
+def test_single_face_result_has_no_multi_face_message(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """The single-face path is unchanged and carries no multi-face flag."""
+    detector = mock_cv_components['detector']
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)]
+    mock_cv_components['recognizer'].recognize.return_value = ALICE
+    mock_cv_components['embedder'].generate_embedding.return_value = FaceEmbedding(np.random.rand(128))
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        face_detector=detector,
+        face_embedder=mock_cv_components['embedder'],
+        face_recognizer=mock_cv_components['recognizer'],
+        liveness_detector=mock_cv_components['liveness']
+    )
+    manager.set_gallery([("2021001", FaceEmbedding(np.random.rand(128)))])
+
+    result = manager.process_frame(sample_frame)
+
+    assert result.multiple_faces is False
+    assert result.message == ""
+    assert result.marked_count == 1
+    assert result.processed_faces[0].attendance_marked is True
+
+
+# ============================================================================
+# Test Liveness Belongs To One Person
+# ============================================================================
+
+BOB = RecognitionResult(identity="2021002", distance=0.3, is_match=True)
+FACE = DetectedFace(bbox=(10, 10, 50, 50), confidence=0.9)
+
+
+@pytest.fixture
+def stateful_liveness(mock_cv_components):
+    """Liveness mock with blink + head-turn challenge state that really resets."""
+    liveness = mock_cv_components['liveness']
+    liveness.enable_challenges = True
+    liveness.require_challenge = True
+
+    def reset():
+        liveness.blink_count = 0
+        liveness.current_challenge = ChallengeType.NONE
+        liveness.challenge_state = ChallengeState.INACTIVE
+
+    def start_challenge():
+        liveness.current_challenge = ChallengeType.TURN_LEFT
+        liveness.challenge_state = ChallengeState.ACTIVE
+        return ChallengeType.TURN_LEFT
+
+    liveness.reset_temporal_state.side_effect = reset
+    liveness.start_new_challenge.side_effect = start_challenge
+    reset()
+    return liveness
+
+
+def _pass_liveness(liveness):
+    """The person in front of the camera blinks and completes the head turn."""
+    liveness.blink_count = 1
+    liveness.challenge_state = ChallengeState.COMPLETED
+
+
+def _liveness_manager(temp_db, active_session, mock_cv_components, liveness):
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        face_detector=mock_cv_components['detector'],
+        face_embedder=mock_cv_components['embedder'],
+        face_recognizer=mock_cv_components['recognizer'],
+        liveness_detector=liveness,
+        require_liveness=True
+    )
+    manager.set_gallery([
+        ("2021001", FaceEmbedding(np.random.rand(128))),
+        ("2021002", FaceEmbedding(np.random.rand(128)))
+    ])
+    mock_cv_components['embedder'].generate_embedding.return_value = FaceEmbedding(np.random.rand(128))
+    return manager
+
+
+def test_liveness_resets_after_mark_and_next_student_must_verify(
+    temp_db, active_session, sample_student, second_student, sample_frame,
+    mock_cv_components, stateful_liveness
+):
+    """After Alice is marked, Bob gets no credit for her blink and head turn."""
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    liveness = stateful_liveness
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+    detector.detect_faces.return_value = [FACE]
+
+    # Alice verifies and is marked
+    recognizer.recognize.return_value = ALICE
+    manager.process_frame(sample_frame)          # challenge starts
+    _pass_liveness(liveness)
+    alice = manager.process_frame(sample_frame)
+    assert alice.processed_faces[0].attendance_marked is True
+    assert liveness.blink_count == 0             # evidence used up
+    assert liveness.challenge_state == ChallengeState.INACTIVE
+
+    # Alice leaves, Bob steps up: he must blink and turn himself
+    detector.detect_faces.return_value = []
+    manager.process_frame(sample_frame)
+    detector.detect_faces.return_value = [FACE]
+    recognizer.recognize.return_value = BOB
+    bob_pending = manager.process_frame(sample_frame)
+    face = bob_pending.processed_faces[0]
+    assert face.identity == "2021002"
+    assert face.attendance_marked is False
+    assert face.liveness_state == LivenessState.UNKNOWN
+    assert "liveness" in face.reason.lower()
+
+    _pass_liveness(liveness)
+    bob = manager.process_frame(sample_frame)
+    assert bob.processed_faces[0].attendance_marked is True
+    assert len(AttendanceService(temp_db).get_session_attendance(active_session)) == 2
+
+
+def test_marked_student_still_in_view_is_reported_already_marked(
+    temp_db, active_session, sample_student, sample_frame,
+    mock_cv_components, stateful_liveness
+):
+    """Liveness restarts after the mark, but the marked student is not asked again."""
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    liveness = stateful_liveness
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+    detector.detect_faces.return_value = [FACE]
+    recognizer.recognize.return_value = ALICE
+
+    manager.process_frame(sample_frame)
+    _pass_liveness(liveness)
+    manager.process_frame(sample_frame)          # marked
+    after = manager.process_frame(sample_frame)  # still standing there
+
+    assert after.processed_faces[0].already_marked is True
+    assert after.processed_faces[0].attendance_marked is False
+
+
+def test_liveness_resets_when_face_leaves_view(
+    temp_db, active_session, sample_student, sample_frame,
+    mock_cv_components, stateful_liveness
+):
+    """Progress collected for one face is dropped once nobody is in view."""
+    detector = mock_cv_components['detector']
+    mock_cv_components['recognizer'].recognize.return_value = ALICE
+    liveness = stateful_liveness
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+
+    detector.detect_faces.return_value = [FACE]
+    manager.process_frame(sample_frame)
+    liveness.blink_count = 1                     # blinked, head turn still pending
+    detector.detect_faces.return_value = []
+    manager.process_frame(sample_frame)
+
+    assert liveness.blink_count == 0
+    assert liveness.challenge_state == ChallengeState.INACTIVE
+
+
+@pytest.mark.parametrize("first_person", [ALICE, STRANGER])
+def test_liveness_resets_when_identity_changes(
+    temp_db, active_session, sample_student, second_student, sample_frame,
+    mock_cv_components, stateful_liveness, first_person
+):
+    """A different person taking over the face (no gap in detection) starts
+    liveness again: neither another student's nor an unenrolled live
+    person's blink + turn can be handed over to Bob.
+    """
+    detector = mock_cv_components['detector']
+    recognizer = mock_cv_components['recognizer']
+    liveness = stateful_liveness
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+    manager.track_reverify_seconds = 0.0         # recognise on every frame
+    detector.detect_faces.return_value = [FACE]
+
+    recognizer.recognize.return_value = first_person
+    manager.process_frame(sample_frame)
+    liveness.blink_count = 1                     # first person blinked...
+    if first_person is STRANGER:
+        _pass_liveness(liveness)                 # ...the stranger even passed fully
+
+    recognizer.recognize.return_value = BOB
+    result = manager.process_frame(sample_frame)
+
+    face = result.processed_faces[0]
+    assert face.identity == "2021002"
+    assert face.blink_count == 0
+    assert face.liveness_state == LivenessState.UNKNOWN
+    assert face.attendance_marked is False
+    assert result.marked_count == 0
+
+
+def test_liveness_kept_while_same_student_stays(
+    temp_db, active_session, sample_student, sample_frame,
+    mock_cv_components, stateful_liveness
+):
+    """Re-recognising the same student does not wipe their progress."""
+    detector = mock_cv_components['detector']
+    mock_cv_components['recognizer'].recognize.return_value = ALICE
+    liveness = stateful_liveness
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+    manager.track_reverify_seconds = 0.0
+    detector.detect_faces.return_value = [FACE]
+
+    manager.process_frame(sample_frame)
+    liveness.blink_count = 1
+    result = manager.process_frame(sample_frame)
+
+    assert liveness.blink_count == 1
+    assert result.processed_faces[0].blink_count == 1
+
+
+def test_second_face_appearing_discards_liveness_progress(
+    temp_db, active_session, sample_student, sample_frame,
+    mock_cv_components, stateful_liveness
+):
+    """A second face joining mid-verification resets the first person's progress."""
+    detector = mock_cv_components['detector']
+    mock_cv_components['recognizer'].recognize.return_value = ALICE
+    liveness = stateful_liveness
+    manager = _liveness_manager(temp_db, active_session, mock_cv_components, liveness)
+
+    detector.detect_faces.return_value = [FACE]
+    manager.process_frame(sample_frame)
+    _pass_liveness(liveness)
+    detector.detect_faces.return_value = [FACE, DetectedFace(bbox=(60, 10, 30, 30), confidence=0.9)]
+    result = manager.process_frame(sample_frame)
+
+    assert result.multiple_faces is True
+    assert result.marked_count == 0
+    assert liveness.blink_count == 0
+    assert liveness.challenge_state == ChallengeState.INACTIVE
 
 
 def test_inactive_student_rejected(
