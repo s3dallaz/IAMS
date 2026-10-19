@@ -381,5 +381,77 @@ class TestCameraManagerDestructor:
         mock_capture.release.assert_called()
 
 
+class TestCameraManagerBackgroundReader:
+    """The opt-in reader thread used by the Real-Time Attendance page."""
+
+    @staticmethod
+    def _camera_at(fps, frames_ok=True):
+        """Mock VideoCapture delivering numbered frames at `fps`."""
+        import itertools
+        import time as _time
+        capture = Mock()
+        capture.isOpened.return_value = True
+        counter = itertools.count(1)
+
+        def read():
+            _time.sleep(1.0 / fps)
+            if not frames_ok:
+                return False, None
+            return True, np.full((4, 4, 3), next(counter) % 256, dtype=np.uint8)
+
+        capture.read.side_effect = read
+        return capture
+
+    @patch('cv2.VideoCapture')
+    def test_read_returns_the_newest_frame(self, mock_video_capture):
+        import time as _time
+        mock_video_capture.return_value = self._camera_at(fps=200)
+        manager = CameraManager(background_reader=True)
+        manager.open()
+        try:
+            _, first = manager.read_frame()
+            _time.sleep(0.1)                     # slow consumer: frames pile up
+            _, newest = manager.read_frame()
+            assert int(newest[0, 0, 0]) > int(first[0, 0, 0]) + 1  # stale frames skipped
+        finally:
+            manager.release()
+
+    @patch('cv2.VideoCapture')
+    def test_each_read_waits_for_a_new_frame(self, mock_video_capture):
+        mock_video_capture.return_value = self._camera_at(fps=100)
+        manager = CameraManager(background_reader=True)
+        manager.open()
+        try:
+            values = [int(manager.read_frame()[1][0, 0, 0]) for _ in range(5)]
+            assert len(set(values)) == 5          # never the same frame twice
+        finally:
+            manager.release()
+
+    @patch('cv2.VideoCapture')
+    def test_read_times_out_when_the_camera_stalls(self, mock_video_capture):
+        mock_video_capture.return_value = self._camera_at(fps=100, frames_ok=False)
+        manager = CameraManager(background_reader=True, read_timeout=0.1)
+        manager.open()
+        try:
+            assert manager.read_frame() == (False, None)
+        finally:
+            manager.release()
+
+    @patch('cv2.VideoCapture')
+    def test_release_stops_the_reader_before_releasing_the_camera(self, mock_video_capture):
+        capture = self._camera_at(fps=100)
+        mock_video_capture.return_value = capture
+        manager = CameraManager(background_reader=True)
+        manager.open()
+        thread = manager._reader_thread
+        assert thread.is_alive()
+
+        manager.release()
+
+        assert not thread.is_alive()
+        capture.release.assert_called_once()
+        assert manager.read_frame() == (False, None)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

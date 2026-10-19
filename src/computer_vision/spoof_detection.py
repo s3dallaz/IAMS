@@ -44,19 +44,34 @@ SCREEN_LABELS = ["cell phone", "laptop", "tv"]  # COCO categories that show a fa
 
 
 def crop_around_face(frame: np.ndarray, bbox: Tuple[int, int, int, int], scale: float) -> Optional[np.ndarray]:
-    """Crop a square-ish region `scale` times the face box, centred on it and clipped to the frame."""
+    """
+    Crop a region `scale` times the face box, centred on it - the same crop
+    as Silent-Face-Anti-Spoofing's CropImage: the scale shrinks if the region
+    cannot fit in the frame, and a region crossing the frame edge is shifted
+    back inside (keeping its size and context) rather than cut off.
+    """
     frame_h, frame_w = frame.shape[:2]
     x, y, w, h = bbox
     if w <= 0 or h <= 0:
         return None
-    # Shrink the scale if the enlarged box would not fit in the frame (as in the reference code)
     scale = min((frame_h - 1) / h, (frame_w - 1) / w, scale)
     center_x, center_y = x + w / 2, y + h / 2
     new_w, new_h = w * scale, h * scale
-    x1 = max(0, int(center_x - new_w / 2))
-    y1 = max(0, int(center_y - new_h / 2))
-    x2 = min(frame_w - 1, int(center_x + new_w / 2))
-    y2 = min(frame_h - 1, int(center_y + new_h / 2))
+    x1, y1 = center_x - new_w / 2, center_y - new_h / 2
+    x2, y2 = center_x + new_w / 2, center_y + new_h / 2
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
+    if x2 > frame_w - 1:
+        x1 -= x2 - frame_w + 1
+        x2 = frame_w - 1
+    if y2 > frame_h - 1:
+        y1 -= y2 - frame_h + 1
+        y2 = frame_h - 1
+    x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), int(x2), int(y2)
     if x2 <= x1 or y2 <= y1:
         return None
     return frame[y1:y2 + 1, x1:x2 + 1]
@@ -111,6 +126,8 @@ class ScreenDetector:
     def __init__(self, model_path: Optional[Path] = None, score_threshold: Optional[float] = None):
         self.logger = get_logger(__name__)
         self._detector = None
+        # Screens found by the last screen_covering_face() call: (label, score, share of the face covered)
+        self.last_screens: List[Tuple[str, float, float]] = []
         path = Path(model_path) if model_path is not None else PROJECT_ROOT / SCREEN_MODEL_FILE
         threshold = score_threshold if score_threshold is not None else config.SCREEN_DETECTION_CONFIDENCE
         if not path.exists():
@@ -153,11 +170,15 @@ class ScreenDetector:
         """
         fx, fy, fw, fh = face_bbox
         face_area = fw * fh
+        self.last_screens = []
         if face_area <= 0:
             return None
-        for label, _score, (sx, sy, sw, sh) in self.detect_screens(frame):
+        covering = None
+        for label, score, (sx, sy, sw, sh) in self.detect_screens(frame):
             overlap_w = max(0, min(fx + fw, sx + sw) - max(fx, sx))
             overlap_h = max(0, min(fy + fh, sy + sh) - max(fy, sy))
-            if overlap_w * overlap_h / face_area >= config.SCREEN_FACE_OVERLAP:
-                return label
-        return None
+            overlap = overlap_w * overlap_h / face_area
+            self.last_screens.append((label, score, overlap))
+            if covering is None and overlap >= config.SCREEN_FACE_OVERLAP:
+                covering = label
+        return covering

@@ -69,19 +69,33 @@ class FaceRecognizer:
     otherwise they are treated as "Unknown".
     """
 
-    def __init__(self, threshold: Optional[float] = None, margin: Optional[float] = None):
+    def __init__(
+        self,
+        threshold: Optional[float] = None,
+        margin: Optional[float] = None,
+        backend: Optional[str] = None
+    ):
         """
         Initialize the FaceRecognizer.
 
         Args:
             threshold: Distance threshold for recognition. Distances below this
-                      are considered matches. If None, uses config.FACE_RECOGNITION_THRESHOLD
+                      are considered matches. If None, uses the backend's
+                      config value (FACE_RECOGNITION_THRESHOLD for dlib,
+                      SFACE_RECOGNITION_THRESHOLD for SFace)
             margin: Minimum required distance gap to a DIFFERENT enrolled
                     identity. Below this the match is ambiguous. If None, uses
-                    config.FACE_RECOGNITION_MARGIN
+                    the backend's config value
+            backend: Embedding model the distances come from ("sface" or
+                    "dlib"); None = config.FACE_RECOGNITION_BACKEND
         """
-        self.threshold = threshold if threshold is not None else config.FACE_RECOGNITION_THRESHOLD
-        self.margin = margin if margin is not None else config.FACE_RECOGNITION_MARGIN
+        self.backend = (backend or config.FACE_RECOGNITION_BACKEND).lower()
+        if self.backend == "sface":
+            default_threshold, default_margin = config.SFACE_RECOGNITION_THRESHOLD, config.SFACE_RECOGNITION_MARGIN
+        else:
+            default_threshold, default_margin = config.FACE_RECOGNITION_THRESHOLD, config.FACE_RECOGNITION_MARGIN
+        self.threshold = threshold if threshold is not None else default_threshold
+        self.margin = margin if margin is not None else default_margin
         self.logger = get_logger(__name__)
         self.logger.info(
             f"FaceRecognizer initialized with threshold: {self.threshold}, "

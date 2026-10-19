@@ -324,9 +324,31 @@ class RealTimeAttendanceManager:
         # may be seen covering it (sticky until the person leaves the view).
         self._spoof_scores: deque = deque(maxlen=max(1, config.ANTI_SPOOF_WINDOW))
         self._screen_label: str = ""
-        # When the current random challenge started; it must be finished
+        self._spoof_flagged: bool = False     # anti-spoof model saw a photo / screen (sticky)
+        self._last_screen_check: float = 0.0# screen detection every SCREEN_CHECK_INTERVAL
+        self._last_spoof_log: float = 0.0     # SPOOF CHECK diagnostics, once per second
+# When the current random challenge started; it must be finished
         # within config.LIVENESS_CHALLENGE_TIMEOUT. None = no challenge yet.
         self._challenge_started_at: Optional[float] = None
+
+        # Per-frame liveness. Blinks last 100-250 ms, so they are measured by
+        # update_liveness() on EVERY camera frame, while recognition, spoof
+        # checks and marking run less often (process_frame / the background
+        # worker). The page sets fast_liveness = True when it calls
+        # update_liveness(); process_frame() then only reads the evidence.
+        # The lock guards the liveness detector state shared by both paths.
+        self.fast_liveness: bool = False
+        self._liveness_lock = threading.RLock()
+        self._last_fast_ear: Optional[float] = None
+        # The single face seen by the last process_frame(); a jump of its box
+        # (IoU below person_change_iou) means a different person stepped in
+        self._last_face: Optional[DetectedFace] = None
+        self.person_change_iou: float = 0.1
+        # When the face was last lost (grace period before liveness resets)
+        self._face_missing_since: Optional[float] = None
+        # Head-turn part of the liveness test: None = detector/config default,
+        # True/False = set by the page ("Require head turn" switch)
+        self.require_head_turn: Optional[bool] = None
 
         # Session status cache to avoid DB query on every CV frame (~6/sec)
         self._session_status_cache: Optional[Dict[str, Any]] = None
@@ -341,6 +363,11 @@ class RealTimeAttendanceManager:
         self._bg_latest_result: Optional[RealTimeAttendanceResult] = None
         self._bg_lock = threading.Lock()
         self._bg_stop_flag = threading.Event()
+        self._bg_frame_ready = threading.Event()  # wakes the worker when a frame is submitted
+        # Shortest time between two background processing runs (seconds).
+        # Recognition does not need every frame; a pause leaves CPU time and
+        # the GIL to the camera and per-frame liveness threads.
+        self.min_processing_interval: float = 0.0
 
         if session_id is not None:
             self.set_session(session_id)
@@ -428,12 +455,15 @@ class RealTimeAttendanceManager:
 
     def _reset_liveness(self) -> None:
         """Start liveness from scratch: no blinks, no challenge, no spoof evidence, no owner."""
-        if self.liveness_detector is not None:
-            self.liveness_detector.reset_temporal_state()
-        self._liveness_identity = None
-        self._spoof_scores.clear()
-        self._screen_label = ""
-        self._challenge_started_at = None
+        with self._liveness_lock:
+            if self.liveness_detector is not None:
+                self.liveness_detector.reset_temporal_state()
+            self._liveness_identity = None
+            self._spoof_scores.clear()
+            self._screen_label = ""
+            self._spoof_flagged = False
+            self._last_screen_check = 0.0
+            self._challenge_started_at = None
 
     def _update_spoof_evidence(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
         """Add this frame's anti-spoof score and screen check for the person in view."""
@@ -443,14 +473,40 @@ class RealTimeAttendanceManager:
                 score = anti_spoof.real_score(frame, bbox)
             if score is not None:
                 self._spoof_scores.append(score)
+                bad = sum(s < config.ANTI_SPOOF_THRESHOLD for s in self._spoof_scores)
+                if not self._spoof_flagged and bad >= config.ANTI_SPOOF_BAD_FRAMES:
+                    self._spoof_flagged = True
+                    logger.warning(f"Spoof suspected: {bad} of the last {len(self._spoof_scores)} frames "
+                                   f"look like a photo or screen; marking blocked")
 
         screen_detector = self._get_screen_detector()
-        if screen_detector is not None and not self._screen_label:
+        now = time.time()
+        if (screen_detector is not None and not self._screen_label
+                and now - self._last_screen_check >= config.SCREEN_CHECK_INTERVAL):
+            self._last_screen_check = now
             with time_operation("screen_detection"):
                 label = screen_detector.screen_covering_face(frame, bbox)
             if label:
                 self._screen_label = label
                 logger.warning(f"Spoof suspected: face shown on a {label}; marking blocked")
+
+    def _log_spoof_diagnostics(self, face_result: "FaceProcessingResult", now: float) -> None:
+        """
+        Once per second while a face is in view (config.SPOOF_DIAGNOSTICS):
+        the anti-spoof scores and the screens seen, for calibrating the
+        thresholds from data/logs/app.log.
+        """
+        if not config.SPOOF_DIAGNOSTICS or not self.require_liveness or now - self._last_spoof_log < 1.0:
+            return
+        self._last_spoof_log = now
+        scores = list(self._spoof_scores)
+        score_text = (f"n={len(scores)} last={scores[-1]:.2f} mean={sum(scores) / len(scores):.2f} "
+                      f"min={min(scores):.2f}") if scores else "n=0"
+        screens = getattr(self.screen_detector, "last_screens", None) or []
+        screen_text = ", ".join(f"{label} {score:.2f} covers {overlap:.0%}" for label, score, overlap in screens) or "none"
+        logger.info(f"SPOOF CHECK: identity={face_result.identity} scores {score_text} | "
+                    f"screens: {screen_text} | blocked by screen: {self._screen_label or 'no'} | "
+                    f"reason: {face_result.reason}")
 
     def _spoof_score(self) -> Optional[float]:
         """Mean real-face probability over the recent frames, or None if not measured."""
@@ -460,18 +516,20 @@ class RealTimeAttendanceManager:
         """Reason the face looks like a spoof, or None if no spoof has been seen."""
         if self._screen_label:
             return f"Spoof suspected: face shown on a {self._screen_label} - step out of view and try again"
-        score = self._spoof_score()
-        if (score is not None
-                and self._get_anti_spoof_detector() is not None
-                and len(self._spoof_scores) >= config.ANTI_SPOOF_MIN_FRAMES
-                and score < config.ANTI_SPOOF_THRESHOLD):
+        if self._spoof_flagged:
             return "Spoof suspected: face looks like a photo or screen"
         return None
 
     def _spoof_check_pending(self) -> bool:
-        """True while too few anti-spoof frames have been scored to decide."""
-        return (self._get_anti_spoof_detector() is not None
-                and len(self._spoof_scores) < config.ANTI_SPOOF_MIN_FRAMES)
+        """
+        True until the last ANTI_SPOOF_MIN_FRAMES scored frames all look real
+        (too few frames yet, or a recent frame below the threshold).
+        """
+        if self._get_anti_spoof_detector() is None:
+            return False
+        recent = list(self._spoof_scores)[-config.ANTI_SPOOF_MIN_FRAMES:]
+        return (len(recent) < config.ANTI_SPOOF_MIN_FRAMES
+                or any(s < config.ANTI_SPOOF_THRESHOLD for s in recent))
 
     def _challenge_seconds_left(self, current_time: float) -> Optional[float]:
         if self._challenge_started_at is None or config.LIVENESS_CHALLENGE_TIMEOUT <= 0:
@@ -518,16 +576,68 @@ class RealTimeAttendanceManager:
 
         Called only for frames whose identity is backed by an embedding, so a
         frame where the embedding failed does not wipe a student's progress.
-        "Unknown" counts as an identity: an unenrolled live person cannot
-        collect the blink + turn and then hand over to a photo of a student.
+        - Student A -> "Unknown": progress is KEPT. Recognition briefly fails
+          while a student turns their head for the challenge; resetting then
+          would wipe the very progress the challenge asks for.
+        - "Unknown" -> student, or student A -> student B: liveness restarts,
+          so an unenrolled live person's blink + turn can never be handed
+          over to a student (e.g. a photo swapped in at the same place).
+        Losing the face, a second face and a jump of the face box also
+        restart it (see _process_frame_sync).
         """
-        if self._liveness_identity is not None and identity != self._liveness_identity:
-            logger.info(
-                f"Person changed ('{self._liveness_identity}' -> '{identity}'); "
-                f"liveness restarted"
-            )
-            self._reset_liveness()
-        self._liveness_identity = identity
+        with self._liveness_lock:
+            owner = self._liveness_identity
+            if identity == "Unknown":
+                if owner is None:
+                    self._liveness_identity = identity
+                return
+            if owner is not None and identity != owner:
+                logger.info(f"Person changed ('{owner}' -> '{identity}'); liveness restarted")
+                self._reset_liveness()
+            self._liveness_identity = identity
+
+    def update_liveness(self, frame: np.ndarray) -> None:
+        """
+        Per-frame liveness: call for EVERY camera frame (~10 ms).
+
+        Measures the eyes and head pose of the single face in view and
+        advances the blink counter and head-turn challenge. Recognition, spoof
+        checks and marking stay in process_frame(), which reads this evidence
+        (set fast_liveness = True). With no face or several faces the
+        landmarker reports no eyes, which only pauses the counters;
+        process_frame() resets liveness for those cases.
+        """
+        if not self.require_liveness or frame is None or frame.size == 0:
+            return
+        face = self._last_face or DetectedFace(bbox=(0, 0, frame.shape[1], frame.shape[0]), confidence=1.0)
+        with self._liveness_lock:
+            liveness_detector = self._get_liveness_detector()
+            liveness_detector.enable_video_mode()  # consecutive camera frames: track the face
+            with time_operation("liveness_fast_update"):
+                ear = liveness_detector.extract_ear(frame, face)
+                liveness_detector.update_temporal_state(ear, frame, face)
+            self._last_fast_ear = ear
+
+    def refresh_liveness_display(self, result: "RealTimeAttendanceResult") -> None:
+        """
+        Copy the live blink / challenge progress into the face of `result`
+        (the latest recognition result), so the on-screen instructions react
+        to each blink immediately instead of when the next recognition ends.
+        """
+        if not self.fast_liveness or result.multiple_faces or len(result.processed_faces) != 1:
+            return
+        face = result.processed_faces[0]
+        if face.already_marked or face.attendance_marked or self.liveness_detector is None:
+            return
+        with self._liveness_lock:
+            detector = self.liveness_detector
+            progress = detector.get_challenge_progress()
+            face.blink_count = detector.blink_count
+            face.min_blinks_required = detector.min_blinks
+            face.challenge_type = progress['challenge_type']
+            face.challenge_state = progress['challenge_state']
+            face.challenge_progress = progress['progress_percent']
+            face.challenge_seconds_left = self._challenge_seconds_left(time.time())
 
     def _get_session_status_cached(self, session_id: int) -> bool:
         """
@@ -579,7 +689,9 @@ class RealTimeAttendanceManager:
 
     def _get_face_recognizer(self) -> FaceRecognizer:
         if self.face_recognizer is None:
-            self.face_recognizer = FaceRecognizer()
+            # Thresholds must match the model that produced the embeddings
+            backend = getattr(self._get_face_embedder(), "backend", None)
+            self.face_recognizer = FaceRecognizer(backend=backend)
         return self.face_recognizer
 
     def _get_liveness_detector(self) -> LivenessDetector:
@@ -592,6 +704,9 @@ class RealTimeAttendanceManager:
         elif self.head_turn_angle is not None and self.liveness_detector.head_turn_angle != self.head_turn_angle:
             # Update existing detector with new angle if changed
             self.liveness_detector.head_turn_angle = self.head_turn_angle
+        if self.require_head_turn is not None:
+            self.liveness_detector.enable_challenges = self.require_head_turn
+            self.liveness_detector.require_challenge = self.require_head_turn
         return self.liveness_detector
 
     def _get_anti_spoof_detector(self) -> Optional[AntiSpoofDetector]:
@@ -614,10 +729,15 @@ class RealTimeAttendanceManager:
         self,
         face_crop: np.ndarray,
         face_embedder: FaceEmbedder,
-        face_recognizer: FaceRecognizer
+        face_recognizer: FaceRecognizer,
+        frame: Optional[np.ndarray] = None,
+        detected_face: Optional[DetectedFace] = None
     ) -> Tuple[str, bool, float, bool]:
         """
         Compute the face embedding and match it against the gallery.
+
+        With SFace and a face that has YuNet landmarks, the face is aligned
+        straight from `frame`; otherwise `face_crop` is embedded.
 
         Returns:
             (identity, is_recognized, distance, embedding_ok); identity is
@@ -635,8 +755,13 @@ class RealTimeAttendanceManager:
             # PERFORMANCE: Use the MediaPipe face crop for dlib encoding.
             # Benchmark confirmed: crop (11ms) >> full_frame+bbox (248ms) >> full_frame (138ms)
             # The crop approach is 22x faster than the "optimized" bbox approach.
-            with time_operation("face_embedding"):
-                embedding = face_embedder.generate_embedding(face_crop)
+            if (frame is not None and detected_face is not None
+                    and getattr(face_embedder, "backend", None) == "sface"
+                    and getattr(detected_face, "landmarks", None) is not None):
+                embedding = face_embedder.generate_embedding_from_frame(frame, detected_face)
+            else:
+                with time_operation("face_embedding"):
+                    embedding = face_embedder.generate_embedding(face_crop)
 
             if embedding is not None:
                 embedding_ok = True
@@ -682,6 +807,7 @@ class RealTimeAttendanceManager:
             
         self._bg_worker_enabled = False
         self._bg_stop_flag.set()
+        self._bg_frame_ready.set()
         
         if self._bg_worker_thread is not None:
             self._bg_worker_thread.join(timeout=1.0)
@@ -692,6 +818,9 @@ class RealTimeAttendanceManager:
     def _background_worker(self) -> None:
         """Background thread that processes frames asynchronously."""
         while not self._bg_stop_flag.is_set():
+            if not self._bg_frame_ready.wait(timeout=0.1):
+                continue
+            self._bg_frame_ready.clear()
             # Check for pending frame
             with self._bg_lock:
                 pending = self._bg_pending_frame
@@ -699,10 +828,12 @@ class RealTimeAttendanceManager:
             
             if pending is not None:
                 frame, session_id, marked_at = pending
-                
+                run_started = time.perf_counter()
+
                 # Process frame synchronously in background thread
                 try:
-                    result = self._process_frame_sync(frame, session_id, marked_at)
+                    with time_operation("cv_frame_processing"):
+                        result = self._process_frame_sync(frame, session_id, marked_at)
                     
                     # Publish result
                     with self._bg_lock:
@@ -710,9 +841,10 @@ class RealTimeAttendanceManager:
                         
                 except Exception as e:
                     logger.error(f"Background worker error: {e}")
-            else:
-                # No pending frame, sleep briefly
-                time.sleep(0.001)
+
+                pause = self.min_processing_interval - (time.perf_counter() - run_started)
+                if pause > 0:
+                    self._bg_stop_flag.wait(pause)
 
     def process_frame_async(
         self,
@@ -744,6 +876,7 @@ class RealTimeAttendanceManager:
         with self._bg_lock:
             self._bg_pending_frame = (frame.copy(), target_session, marked_at)
             result = self._bg_latest_result
+        self._bg_frame_ready.set()
         
         # Return latest available result or empty result
         if result is None:
@@ -815,7 +948,15 @@ class RealTimeAttendanceManager:
 
         if not detected_faces:
             self._tracked_face = None  # face left the view: re-recognise next time
-            self._reset_liveness()     # the next person starts liveness afresh
+            self._last_face = None
+            # The detector briefly loses a face that turns for the head-turn
+            # challenge. Only a face gone for LIVENESS_FACE_LOST_GRACE seconds
+            # counts as the person leaving; the next person then starts afresh.
+            now = time.time()
+            if self._face_missing_since is None:
+                self._face_missing_since = now
+            if now - self._face_missing_since >= config.LIVENESS_FACE_LOST_GRACE:
+                self._reset_liveness()
             # Diagnostics: record the post-detection stages for a missed frame,
             # which separates "not detected" from "detected but unusable".
             get_diagnostics().record(frame.shape, [], stage="no_detection")
@@ -828,6 +969,7 @@ class RealTimeAttendanceManager:
             )
 
         current_time = time.time()
+        self._face_missing_since = None  # a face is back in view
 
         # Step 2: One person at a time. With several faces in view nobody is
         # recognised, liveness-checked or marked: the eye/head landmarks come
@@ -836,6 +978,7 @@ class RealTimeAttendanceManager:
         # also avoids a ~230 ms embedding per face on every CV frame.
         if len(detected_faces) > 1:
             self._tracked_face = None
+            self._last_face = None
             self._reset_liveness()
             return RealTimeAttendanceResult(
                 session_id=target_session,
@@ -855,10 +998,18 @@ class RealTimeAttendanceManager:
                 message=MULTIPLE_FACES_MESSAGE
             )
 
-        # Step 3: Process the single face in view
+        # Step 3: Process the single face in view. A face that appears far
+        # from the previous one is treated as a different person.
+        face = detected_faces[0]
+        if self._last_face is not None and _bbox_iou(self._last_face.bbox, face.bbox) < self.person_change_iou:
+            logger.info("Face box jumped; treating it as a new person (liveness restarted)")
+            self._tracked_face = None
+            self._reset_liveness()
+        self._last_face = face
+
         face_result = self._process_single_face(
             frame=frame,
-            detected_face=detected_faces[0],
+            detected_face=face,
             target_session=target_session,
             session_active=session_active,
             face_embedder=self._get_face_embedder(),
@@ -870,6 +1021,13 @@ class RealTimeAttendanceManager:
         )
         face_result.spoof_score = self._spoof_score()
         face_result.challenge_seconds_left = self._challenge_seconds_left(current_time)
+        # A suspected spoof is reported whatever else applies to the face
+        # (unknown, already marked, liveness pending), so the person sees why
+        if self.require_liveness and not face_result.attendance_marked:
+            spoof_reason = self._spoof_rejection_reason()
+            if spoof_reason:
+                face_result.reason = spoof_reason
+        self._log_spoof_diagnostics(face_result, current_time)
 
         return RealTimeAttendanceResult(
             session_id=target_session,
@@ -921,7 +1079,7 @@ class RealTimeAttendanceManager:
             track['bbox'] = bbox  # follow the face as it moves
         else:
             identity, is_recognized, distance, embedding_ok = self._recognize_crop(
-                face_crop, face_embedder, face_recognizer
+                face_crop, face_embedder, face_recognizer, frame, detected_face
             )
             # Only follow faces that produced an embedding; otherwise retry next frame
             self._tracked_face = {
@@ -940,85 +1098,91 @@ class RealTimeAttendanceManager:
         if self.require_liveness:
             self._update_spoof_evidence(frame, bbox)
 
-        # Step B: Liveness analysis
-        # CRITICAL FIX: Start challenge if enabled and not yet started
-        if (liveness_detector.enable_challenges and
-            liveness_detector.require_challenge and
-            liveness_detector.current_challenge == ChallengeType.NONE):
-            liveness_detector.start_new_challenge()  # random head-turn direction
-            # ...and a random number of blinks, so the required actions differ
-            # every time and cannot be pre-recorded
-            liveness_detector.min_blinks = random.randint(
-                config.LIVENESS_MIN_BLINKS, max(config.LIVENESS_MIN_BLINKS, config.LIVENESS_MAX_BLINKS)
-            )
-            self._challenge_started_at = current_time
+        # Step B: Liveness analysis (shared with the per-frame path: under its lock)
+        with self._liveness_lock:
+            # A new liveness test for this person: one test with a random number
+            # of blinks AND (if required) a random head-turn direction, done in
+            # any order within one time limit. Random, so it cannot be pre-recorded.
+            if self._challenge_started_at is None:
+                if (liveness_detector.enable_challenges and
+                    liveness_detector.require_challenge and
+                    liveness_detector.current_challenge == ChallengeType.NONE):
+                    liveness_detector.start_new_challenge()  # random head-turn direction
+                liveness_detector.min_blinks = random.randint(
+                    config.LIVENESS_MIN_BLINKS, max(config.LIVENESS_MIN_BLINKS, config.LIVENESS_MAX_BLINKS)
+                )
+                self._challenge_started_at = current_time
 
-        # Update temporal state for the face
-        # PERFORMANCE FIX: MediaPipe landmarks are now cached per-frame to avoid double inference
-        with time_operation("liveness_ear_extraction"):
-            ear = liveness_detector.extract_ear(frame, detected_face)
+            # Update temporal state for the face, unless update_liveness() already
+            # does it on every camera frame (fast_liveness)
+            # PERFORMANCE FIX: MediaPipe landmarks are now cached per-frame to avoid double inference
+            if self.fast_liveness:
+                ear = self._last_fast_ear
+            else:
+                with time_operation("liveness_ear_extraction"):
+                    ear = liveness_detector.extract_ear(frame, detected_face)
 
-        with time_operation("liveness_temporal_update"):
-            liveness_detector.update_temporal_state(ear, frame, detected_face)
+                with time_operation("liveness_temporal_update"):
+                    liveness_detector.update_temporal_state(ear, frame, detected_face)
 
-        # Diagnostics: which stage consumed the face. This distinguishes
-        # detection loss from recognition failure from liveness failure.
-        get_diagnostics().record_stage(
-            stage="recognition",
-            bbox=bbox,
-            detection_confidence=det_conf,
-            embedding_ok=embedding_ok,
-            recognized=is_recognized,
-            distance=distance if is_recognized else None,
-        )
-        if ear is None:
+            # Diagnostics: which stage consumed the face. This distinguishes
+            # detection loss from recognition failure from liveness failure.
             get_diagnostics().record_stage(
-                stage="liveness",
+                stage="recognition",
                 bbox=bbox,
                 detection_confidence=det_conf,
-                ear=None,
+                embedding_ok=embedding_ok,
+                recognized=is_recognized,
+                distance=distance if is_recognized else None,
             )
+            if ear is None:
+                get_diagnostics().record_stage(
+                    stage="liveness",
+                    bbox=bbox,
+                    detection_confidence=det_conf,
+                    ear=None,
+                )
 
-        # BUG FIX: Properly evaluate liveness state using both blinks AND challenges
-        # Previous implementation only checked blink_count manually, bypassing challenge verification
-        # Now we check both requirements according to the detector's configuration
-        blinks_detected = liveness_detector.blink_count
-        min_blinks = liveness_detector.min_blinks
-        blink_passed = blinks_detected >= min_blinks
+            # BUG FIX: Properly evaluate liveness state using both blinks AND challenges
+            # Previous implementation only checked blink_count manually, bypassing challenge verification
+            # Now we check both requirements according to the detector's configuration
+            blinks_detected = liveness_detector.blink_count
+            min_blinks = liveness_detector.min_blinks
+            blink_passed = blinks_detected >= min_blinks
 
-        # Get challenge progress for UI display
-        challenge_progress = liveness_detector.get_challenge_progress()
+            # Get challenge progress for UI display
+            challenge_progress = liveness_detector.get_challenge_progress()
 
-        # Check if challenges are enabled and required
-        if liveness_detector.enable_challenges and liveness_detector.require_challenge:
-            # CRITICAL FIX: Must verify BOTH blinks AND challenge completion for LIVE state
-            challenge_state = liveness_detector.challenge_state
-            challenge_completed = (challenge_state == ChallengeState.COMPLETED)
+            # Check if challenges are enabled and required
+            if liveness_detector.enable_challenges and liveness_detector.require_challenge:
+                # CRITICAL FIX: Must verify BOTH blinks AND challenge completion for LIVE state
+                challenge_state = liveness_detector.challenge_state
+                challenge_completed = (challenge_state == ChallengeState.COMPLETED)
 
-            # Only LIVE if BOTH conditions are met
-            if blink_passed and challenge_completed:
-                liveness_state = LivenessState.LIVE
-                liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
+                # Only LIVE if BOTH conditions are met
+                if blink_passed and challenge_completed:
+                    liveness_state = LivenessState.LIVE
+                    liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
+                else:
+                    # Insufficient evidence - need both blinks and challenge
+                    liveness_state = LivenessState.UNKNOWN
+                    liveness_confidence = 0.0
             else:
-                # Insufficient evidence - need both blinks and challenge
-                liveness_state = LivenessState.UNKNOWN
-                liveness_confidence = 0.0
-        else:
-            # Challenges disabled - only check blinks
-            if blink_passed:
-                liveness_state = LivenessState.LIVE
-                liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
-            else:
-                liveness_state = LivenessState.UNKNOWN
-                liveness_confidence = 0.0
+                # Challenges disabled - only check blinks
+                if blink_passed:
+                    liveness_state = LivenessState.LIVE
+                    liveness_confidence = max(0.85, liveness_detector.liveness_threshold)
+                else:
+                    liveness_state = LivenessState.UNKNOWN
+                    liveness_confidence = 0.0
 
-        # Time limit: an unfinished challenge is replaced by a new random one
-        # (the next frame starts it). Spoof evidence for the person is kept.
-        seconds_left = self._challenge_seconds_left(current_time)
-        if liveness_state != LivenessState.LIVE and seconds_left == 0.0:
-            logger.debug("Liveness challenge timed out; a new random challenge starts")
-            liveness_detector.reset_temporal_state()
-            self._challenge_started_at = None
+            # Time limit: an unfinished challenge is replaced by a new random one
+            # (the next frame starts it). Spoof evidence for the person is kept.
+            seconds_left = self._challenge_seconds_left(current_time)
+            if liveness_state != LivenessState.LIVE and seconds_left == 0.0:
+                logger.debug("Liveness challenge timed out; a new random challenge starts")
+                liveness_detector.reset_temporal_state()
+                self._challenge_started_at = None
 
         # Step C: Resolve student identity from database (cached to avoid per-frame SQLite hits).
         # The cache maps identity_string -> student dict (or None when not found).
@@ -1217,7 +1381,7 @@ class RealTimeAttendanceManager:
         # face again on this exact frame; it must still be the same student.
         if recognition_reused:
             fresh_identity, _, fresh_distance, fresh_embedding_ok = self._recognize_crop(
-                face_crop, face_embedder, face_recognizer
+                face_crop, face_embedder, face_recognizer, frame, detected_face
             )
             if fresh_identity != identity:
                 self._tracked_face = None

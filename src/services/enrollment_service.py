@@ -22,6 +22,22 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def encoding_file_for_backend(encoding_path: Path, backend: str) -> Path:
+    """
+    The encoding file of `backend` for an enrollment sample. dlib encodings
+    are enc_<id>.npy and SFace ones enc_sface_<id>.npy in the same folder;
+    the database keeps whichever path the sample was enrolled with.
+    """
+    name = encoding_path.name
+    if backend == "sface":
+        if name.startswith("enc_sface_"):
+            return encoding_path
+        return encoding_path.with_name("enc_sface_" + name[len("enc_"):] if name.startswith("enc_") else "sface_" + name)
+    if name.startswith("enc_sface_"):
+        return encoding_path.with_name("enc_" + name[len("enc_sface_"):])
+    return encoding_path
+
+
 class EnrollmentServiceError(Exception):
     """Base exception for enrollment service errors."""
     pass
@@ -92,12 +108,17 @@ class EnrollmentService:
         Raises:
             InvalidFaceImageError: If image is empty, has no face, or has multiple ambiguous faces
         """
+        face, face_crop = self._detect_single_face(image)
+        return face_crop, float(face.confidence)
+
+    def _detect_single_face(self, image: np.ndarray) -> Tuple[DetectedFace, np.ndarray]:
+        """The single face in `image` and its crop; raises InvalidFaceImageError otherwise."""
         if image is None or not isinstance(image, np.ndarray) or image.size == 0:
             raise InvalidFaceImageError("Input image cannot be empty or invalid")
-            
+
         detector = self._get_detector()
         detected_faces = detector.detect_faces(image)
-        
+
         if not detected_faces:
             raise InvalidFaceImageError("No face detected in the provided image. Please ensure good lighting and face visibility.")
             
@@ -114,7 +135,7 @@ class EnrollmentService:
         crop_h = max(1, min(h, h_img - crop_y))
         
         face_crop = image[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-        return face_crop, float(face.confidence)
+        return face, face_crop
         
     def add_face_sample(
         self,
@@ -143,12 +164,17 @@ class EnrollmentService:
         student_id_str = student['student_id']
         
         # Step 1: Validate face and extract crop
-        face_crop, confidence = self.validate_and_extract_face(face_image)
-        
-        # Step 2: Generate 128D embedding
+        face, face_crop = self._detect_single_face(face_image)
+        confidence = float(face.confidence)
+
+        # Step 2: Generate 128D embedding (SFace: aligned on the face's landmarks)
         embedder = self._get_embedder()
+        sface = getattr(embedder, "backend", None) == "sface"
         try:
-            embedding = embedder.generate_embedding(face_crop)
+            if sface:
+                embedding = embedder.generate_embedding_from_frame(face_image, face)
+            else:
+                embedding = embedder.generate_embedding(face_crop)
             if embedding is None:
                 raise InvalidFaceImageError("Failed to extract face embedding from the detected face")
         except FaceEmbeddingError as e:
@@ -161,7 +187,8 @@ class EnrollmentService:
         student_img_dir.mkdir(parents=True, exist_ok=True)
         
         timestamp_str = f"{int(np.round(cv2.getTickCount()))}"
-        encoding_filename = f"enc_{timestamp_str}.npy"
+        # SFace and dlib embeddings are not comparable: tag the file with the model
+        encoding_filename = f"enc_sface_{timestamp_str}.npy" if sface else f"enc_{timestamp_str}.npy"
         image_filename = f"face_{timestamp_str}.jpg"
         
         encoding_file_path = student_enc_dir / encoding_filename
@@ -262,7 +289,8 @@ class EnrollmentService:
             List of (student_id_string, FaceEmbedding) tuples ready for FaceRecognizer
         """
         gallery: List[Tuple[str, FaceEmbedding]] = []
-        
+        backend = self._gallery_backend()
+
         # Get all active students
         students = self.student_repo.get_all(active_only=True)
         student_map = {s['id']: s['student_id'] for s in students}
@@ -275,9 +303,10 @@ class EnrollmentService:
                 continue  # Student inactive or deleted
                 
             student_id_str = student_map[student_db_id]
-            encoding_path_str = record['encoding_path']
-            encoding_path = Path(encoding_path_str)
-            
+            encoding_path = encoding_file_for_backend(Path(record['encoding_path']), backend)
+            if not encoding_path.exists() and backend == "sface":
+                encoding_path = self._create_sface_encoding(encoding_path, student_id_str) or encoding_path
+
             if encoding_path.exists():
                 try:
                     encoding_arr = np.load(str(encoding_path))
@@ -288,8 +317,41 @@ class EnrollmentService:
             else:
                 logger.debug(f"Encoding file missing: {encoding_path}")
                 
-        logger.info(f"Loaded active recognition gallery with {len(gallery)} face samples")
+        logger.info(f"Loaded active recognition gallery with {len(gallery)} face samples ({backend})")
         return gallery
+
+    def _gallery_backend(self) -> str:
+        """Embedding model of the gallery: the embedder's, or SFace if configured and available."""
+        if self.face_embedder is not None:
+            return "sface" if getattr(self.face_embedder, "backend", None) == "sface" else "dlib"
+        if config.FACE_RECOGNITION_BACKEND == "sface" and Path(config.SFACE_MODEL_PATH).exists():
+            return "sface"
+        return "dlib"
+
+    def _create_sface_encoding(self, sface_path: Path, student_id_str: str) -> Optional[Path]:
+        """
+        Create a missing SFace encoding from the saved enrollment photo
+        (face_<id>.jpg) of a sample enrolled with dlib. Only adds a file; the
+        dlib encoding is kept. Returns the new path, or None if not possible.
+        """
+        sample_id = sface_path.stem[len("enc_sface_"):]
+        photo_path = self.images_dir / str(student_id_str) / f"face_{sample_id}.jpg"
+        photo = cv2.imread(str(photo_path)) if photo_path.exists() else None
+        if photo is None:
+            logger.warning(f"No enrollment photo {photo_path} to create the SFace encoding from; "
+                           f"re-enroll student {student_id_str} to include this sample")
+            return None
+        try:
+            embedding = self._get_embedder().generate_embedding(photo)
+            if embedding is None:
+                return None
+            np.save(str(sface_path), embedding.encoding)
+            logger.info(f"Created SFace encoding {sface_path.name} for student {student_id_str} "
+                        f"from the enrollment photo")
+            return sface_path
+        except Exception as e:
+            logger.warning(f"Could not create the SFace encoding for {photo_path}: {e}")
+            return None
         
     def clear_student_face_dataset(self, student_db_id: int) -> int:
         """

@@ -28,10 +28,10 @@ class TestCropAroundFace:
         crop = crop_around_face(FRAME, (270, 190, 100, 100), 2.0)
         assert crop.shape[:2] == (201, 201)
 
-    def test_crop_is_clipped_at_the_frame_edge(self):
+    def test_crop_at_the_frame_edge_is_shifted_inside_and_keeps_its_size(self):
+        """Like Silent-Face's CropImage: the model always sees the full context."""
         crop = crop_around_face(FRAME, (0, 0, 100, 100), 2.7)
-        assert crop.shape[0] <= 480 and crop.shape[1] <= 640
-        assert crop.shape[:2] == (186, 186)  # only the part inside the frame
+        assert crop.shape[:2] == (271, 271)
 
     def test_scale_shrinks_when_the_face_fills_the_frame(self):
         crop = crop_around_face(FRAME, (100, 40, 400, 400), 4.0)

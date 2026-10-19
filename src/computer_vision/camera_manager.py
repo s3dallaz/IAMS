@@ -6,6 +6,8 @@ Handles opening, reading, and releasing camera resources safely.
 """
 
 import logging
+import threading
+import time
 from typing import Optional, Tuple
 
 import config  # noqa: F401 - must precede cv2: sets the MSMF camera startup flag
@@ -13,7 +15,7 @@ import cv2
 import numpy as np
 
 from src.utils.logger import get_logger
-from src.utils.performance_timer import time_operation
+from src.utils.performance_timer import get_timer, time_operation
 
 
 class CameraManager:
@@ -29,7 +31,9 @@ class CameraManager:
         camera_index: int = 0,
         width: Optional[int] = None,
         height: Optional[int] = None,
-        buffer_size: int = 1
+        buffer_size: int = 1,
+        background_reader: bool = False,
+        read_timeout: float = 1.0
     ):
         """
         Initialize the CameraManager.
@@ -39,6 +43,13 @@ class CameraManager:
             width: Optional frame width (if None, uses camera default)
             height: Optional frame height (if None, uses camera default)
             buffer_size: Camera buffer size (1 = minimize latency, recommended for real-time)
+            background_reader: If True, a daemon thread reads the camera
+                continuously and read_frame() returns the newest frame, so
+                the caller's processing never makes it wait on the camera and
+                every camera frame is available for per-frame analysis
+                (blink detection). Used by the Real-Time Attendance page.
+            read_timeout: With background_reader, the longest read_frame()
+                waits for a new frame (seconds) before reporting a failure
         """
         self.camera_index = camera_index
         self.width = width
@@ -47,6 +58,16 @@ class CameraManager:
         self._capture: Optional[cv2.VideoCapture] = None
         self._is_open = False
         self.logger = get_logger(__name__)
+
+        # Background reader state (only used when background_reader=True)
+        self.background_reader = background_reader
+        self.read_timeout = read_timeout
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+        self._frame_cond = threading.Condition()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_seq = 0      # frames captured by the reader thread
+        self._returned_seq = 0   # last frame handed out by read_frame()
 
     def open(self) -> bool:
         """
@@ -93,6 +114,8 @@ class CameraManager:
                     pass  # Silently ignore if not supported
 
             self._is_open = True
+            if self.background_reader:
+                self._start_reader()
             backend_name = self._capture.getBackendName() if hasattr(self._capture, 'getBackendName') else "unknown"
             self.logger.info(f"Camera {self.camera_index} opened successfully (backend: {backend_name})")
             return True
@@ -116,6 +139,9 @@ class CameraManager:
             self.logger.error("Cannot read frame: camera is not open")
             return False, None
 
+        if self._reader_thread is not None:
+            return self._read_latest_frame()
+
         try:
             success, frame = self._capture.read()
 
@@ -135,6 +161,7 @@ class CameraManager:
 
         Safe to call multiple times. Does nothing if camera is already released.
         """
+        self._stop_reader()
         if self._capture is not None:
             try:
                 self.logger.info(f"Releasing camera {self.camera_index}")
@@ -144,6 +171,67 @@ class CameraManager:
             finally:
                 self._capture = None
                 self._is_open = False
+
+    # ------------------------------------------------------------------------
+    # Background reader
+    # ------------------------------------------------------------------------
+
+    def _start_reader(self) -> None:
+        self._reader_stop.clear()
+        self._frame_seq = 0
+        self._returned_seq = 0
+        self._latest_frame = None
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, name=f"camera-{self.camera_index}-reader", daemon=True
+        )
+        self._reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        """Read frames as fast as the camera delivers them; keep only the newest."""
+        capture = self._capture
+        last_frame_time = None
+        while not self._reader_stop.is_set() and capture is not None:
+            try:
+                success, frame = capture.read()
+            except Exception as e:
+                self.logger.error(f"Error reading frame from camera {self.camera_index}: {e}")
+                success, frame = False, None
+            if not success or frame is None:
+                time.sleep(0.01)
+                continue
+            now = time.perf_counter()
+            if last_frame_time is not None:
+                # Time between frames from the camera = its real frame rate
+                get_timer().record_time("camera_frame_interval", (now - last_frame_time) * 1000.0)
+            last_frame_time = now
+            with self._frame_cond:
+                self._latest_frame = frame
+                self._frame_seq += 1
+                self._frame_cond.notify_all()
+
+    def _read_latest_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Newest frame not yet returned; waits up to read_timeout for one."""
+        with self._frame_cond:
+            got_new = self._frame_cond.wait_for(
+                lambda: self._frame_seq > self._returned_seq, timeout=self.read_timeout
+            )
+            if not got_new or self._latest_frame is None:
+                self.logger.warning(f"No new frame from camera {self.camera_index} "
+                                    f"within {self.read_timeout:.1f} s")
+                return False, None
+            self._returned_seq = self._frame_seq
+            return True, self._latest_frame
+
+    def _stop_reader(self) -> None:
+        """Stop the reader thread before the capture is released."""
+        thread = self._reader_thread
+        if thread is None:
+            return
+        self._reader_stop.set()
+        thread.join(timeout=2.0)
+        if thread.is_alive():
+            self.logger.warning(f"Camera {self.camera_index} reader thread did not stop in time")
+        self._reader_thread = None
 
     def is_open(self) -> bool:
         """

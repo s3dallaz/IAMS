@@ -3,13 +3,16 @@ Real-Time Attendance UI Page for the Intelligent Attendance Monitoring System.
 
 Phase 4D: Attendance UI & Management
 Provides Streamlit interface for taking attendance in real-time via camera feed.
-Integrates CameraManager, RealTimeAttendanceManager, FaceDetector, FaceEmbedder,
-FaceRecognizer, LivenessDetector, SessionService, and AttendanceService.
-Runs continuous frame processing loop with st.empty() without full script rerun per frame.
+
+The camera and the whole attendance pipeline run in a separate vision engine
+process (src/realtime/engine.py). The page shows the engine's MJPEG video
+stream in an <img> tag and refreshes the status panel a few times per second,
+so Streamlit never handles individual video frames.
 """
 
 import math
 
+import pandas as pd
 import streamlit as st
 import cv2
 import numpy as np
@@ -17,7 +20,7 @@ import time
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 
-from src.computer_vision.camera_manager import CameraManager
+import config
 from src.computer_vision.face_detector import FaceDetector, DetectedFace
 from src.computer_vision.detection_diagnostics import get_diagnostics
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding
@@ -37,10 +40,21 @@ from src.services.session_service import SessionService, SessionStatus
 from src.services.attendance_service import AttendanceService, AttendanceStatus
 from src.services.student_service import StudentService
 from src.services.enrollment_service import EnrollmentService
+from src.realtime.engine_client import EngineController
+from src.realtime.protocol import result_from_dict
 from src.utils.logger import get_logger
-from src.utils.performance_timer import time_operation, log_performance_summary
 
 logger = get_logger(__name__)
+
+STATUS_REFRESH_SECONDS = 0.5   # side panel refresh while streaming
+RECORDS_REFRESH_SECONDS = 2.0  # marked-students table refresh while streaming
+PERSON_PANEL_HEIGHT = 300      # px; fixed so the changing text never moves the page
+
+
+@st.cache_resource
+def _get_engine() -> EngineController:
+    """One vision engine per app process (the camera can only be opened once)."""
+    return EngineController()
 
 
 def render_realtime_attendance():
@@ -63,6 +77,14 @@ def render_realtime_attendance():
             "Require Liveness Check",
             value=True,
             help="Enforce anti-spoofing; only live verified faces will be marked"
+        )
+
+        require_head_turn = st.checkbox(
+            "Require Head Turn",
+            value=config.LIVENESS_REQUIRE_CHALLENGE,
+            disabled=not require_liveness,
+            help="Liveness test = random blinks + a random head turn (left/right) within the time "
+                 "limit. Switch off to need blinks only; the anti-spoof checks stay on."
         )
 
         cooldown_seconds = st.slider(
@@ -144,11 +166,8 @@ def render_realtime_attendance():
             if st.button("⏹️ Close Session", width="stretch"):
                 try:
                     session_service.close_session(selected_session_id)
-                    if st.session_state.att_camera_manager is not None:
-                        st.session_state.att_camera_manager.release()
-                        st.session_state.att_camera_manager = None
+                    _get_engine().stop()
                     st.session_state.att_camera_active = False
-                    st.session_state.att_rt_manager = None
                     st.success(f"Session #{selected_session_id} closed!")
                     st.rerun()
                 except Exception as e:
@@ -166,13 +185,17 @@ def render_realtime_attendance():
 
     st.markdown("---")
 
-    # Initialize Streamlit Session State for Camera & Detectors
+    # Initialize Streamlit Session State for the camera stream
     if 'att_camera_active' not in st.session_state:
         st.session_state.att_camera_active = False
-    if 'att_camera_manager' not in st.session_state:
-        st.session_state.att_camera_manager = None
-    if 'att_rt_manager' not in st.session_state:
-        st.session_state.att_rt_manager = None
+
+    engine = _get_engine()
+    engine_settings = {
+        "require_liveness": require_liveness,
+        "require_head_turn": require_head_turn,
+        "cooldown_seconds": cooldown_seconds,
+        "head_turn_angle": float(head_turn_angle),
+    }
 
     # Camera Control Buttons
     col_cam1, col_cam2 = st.columns(2)
@@ -188,24 +211,21 @@ def render_realtime_attendance():
                 disabled=start_disabled,
                 help=start_help
             ):
-                if st.session_state.att_camera_manager is None:
-                    st.session_state.att_camera_manager = CameraManager(camera_index=0)
-
-                if st.session_state.att_camera_manager.open():
+                with st.spinner("Starting the camera and loading the face models..."):
+                    started, error = engine.start(selected_session_id, engine_settings)
+                if started:
                     st.session_state.att_camera_active = True
+                    st.session_state.att_engine_settings = engine_settings
                     logger.info(f"Attendance stream started for session #{selected_session_id}")
                     st.rerun()
                 else:
-                    st.error("❌ Failed to open camera device. Please check hardware connection.")
-                    st.session_state.att_camera_manager = None
+                    st.error(f"❌ Failed to start the camera stream: {error}")
 
     with col_cam2:
         if st.session_state.att_camera_active:
             if st.button("⏹️ Stop Attendance Stream", width="stretch"):
                 st.session_state.att_camera_active = False
-                if st.session_state.att_camera_manager is not None:
-                    st.session_state.att_camera_manager.release()
-                    st.session_state.att_camera_manager = None
+                engine.stop()
                 logger.info("Attendance stream stopped")
                 st.rerun()
 
@@ -213,216 +233,109 @@ def render_realtime_attendance():
 
     # Render Live Stream & Records
     if st.session_state.att_camera_active and is_active:
-        _run_realtime_attendance_stream(
+        _render_live_stream(
+            engine=engine,
             session_id=selected_session_id,
-            require_liveness=require_liveness,
-            cooldown_seconds=cooldown_seconds,
-            session_service=session_service,
+            settings=engine_settings,
             attendance_service=attendance_service,
-            student_service=student_service,
-            head_turn_angle=head_turn_angle
+            student_service=student_service
         )
     else:
         # Show Current Session Attendance Records Table when stream is idle
         render_session_records_panel(selected_session_id, attendance_service, student_service)
 
 
-def _run_realtime_attendance_stream(
+def _render_live_stream(
+    engine: EngineController,
     session_id: int,
-    require_liveness: bool,
-    cooldown_seconds: float,
-    session_service: SessionService,
+    settings: Dict[str, Any],
     attendance_service: AttendanceService,
-    student_service: StudentService,
-    head_turn_angle: float
+    student_service: StudentService
 ):
     """
-    Run the live camera feed and real-time attendance processing loop.
-    Uses st.empty() updates for smooth, responsive real-time streaming.
+    Show the engine's live video and the status panel.
 
-    Optimizations to reduce per-frame overhead:
-    - Database queries throttled (every 30 frames, not every frame)
-    - Widgets pre-created and content updated via markdown/image only
-    - Minimal Streamlit API calls inside the frame loop
+    The video is the engine's MJPEG stream in an <img> tag: the browser plays
+    it at the camera's frame rate without Streamlit handling any frames. Only
+    the status panel is refreshed, a few times per second, by a fragment.
     """
-    camera = st.session_state.att_camera_manager
-    if camera is None or not camera.is_open():
-        st.error("Camera is not open.")
+    if not engine.is_running() or engine.session_id != session_id:
+        st.session_state.att_camera_active = False
+        st.error("❌ The camera stream stopped. Click **Start Attendance Stream** to start it again.")
         return
 
-    # Initialize RealTimeAttendanceManager in session state if needed
-    if st.session_state.att_rt_manager is None or st.session_state.att_rt_manager.current_session_id != session_id:
-        rt_manager = RealTimeAttendanceManager(
-            session_id=session_id,
-            attendance_service=attendance_service,
-            session_service=session_service,
-            student_service=student_service,
-            require_liveness=require_liveness,
-            cooldown_seconds=cooldown_seconds,
-            marked_by="cv_realtime",
-            head_turn_angle=head_turn_angle
-        )
-        enrollment_service = EnrollmentService()
-        gallery = enrollment_service.load_active_gallery()
-        rt_manager.set_gallery(gallery)
-        st.session_state.att_rt_manager = rt_manager
-    else:
-        rt_manager = st.session_state.att_rt_manager
-        rt_manager.require_liveness = require_liveness
-        rt_manager.cooldown_seconds = cooldown_seconds
-        rt_manager.head_turn_angle = head_turn_angle
-        # Reload the gallery on every page run (about every 30 s while
-        # streaming) so students enrolled or deactivated during an active
-        # session are picked up without restarting it. Loading takes only
-        # a few milliseconds.
-        rt_manager.set_gallery(EnrollmentService().load_active_gallery())
+    # Settings changed in the sidebar reach the running engine immediately
+    if st.session_state.get('att_engine_settings') != settings:
+        engine.update_settings(settings)
+        st.session_state.att_engine_settings = settings
 
-    # Layout placeholders
     col_video, col_live_status = st.columns([3, 2])
-
     with col_video:
-        video_placeholder = st.empty()
-
+        st.markdown(
+            f'<img src="{engine.stream_url}" alt="Live camera" '
+            f'style="width:100%; border-radius:0.5rem; background:#111;">',
+            unsafe_allow_html=True
+        )
     with col_live_status:
-        st.markdown("### 📊 Live Session Stats")
-        metrics_placeholder = st.empty()
-        st.markdown("### 👤 Last Detected Person")
-        person_info_placeholder = st.empty()
+        _live_status_panel(engine, session_id, attendance_service)
 
     st.markdown("---")
     st.markdown("### 📋 Marked Students in this Session")
-    records_table_placeholder = st.empty()
+    _live_records_table(session_id, attendance_service, student_service)
 
-    frame_count = 0
-    max_frames_per_run = 900  # Stream batch frames per execution cycle (~30 seconds at 30 fps)
-    # BUG FIX: Increased from 300 to 900 frames to reduce page refresh frequency
-    # from every 10 seconds to every 30 seconds, making refreshes less disruptive
 
-    # Cache for database queries (refreshed periodically, not every frame)
-    cached_records = []
-    cached_present_cnt = 0
-    cached_late_cnt = 0
-    cached_total_cnt = 0
+@st.fragment(run_every=STATUS_REFRESH_SECONDS)
+def _live_status_panel(
+    engine: EngineController,
+    session_id: int,
+    attendance_service: AttendanceService
+):
+    """Live stats and the person in front of the camera (refreshed twice per second)."""
+    status = engine.status() or {}
+    records = attendance_service.get_session_attendance(session_id)
+    present_cnt = sum(1 for r in records if r['status'] == AttendanceStatus.PRESENT)
+    late_cnt = sum(1 for r in records if r['status'] == AttendanceStatus.LATE)
+    st.markdown("### 📊 Live Session Stats")
+    fps = status.get("preview_fps")
+    fps_text = f" | **Preview:** {fps:.0f} fps" if fps is not None else ""
+    st.markdown(f"**Total:** {len(records)} | **Present:** {present_cnt} | **Late:** {late_cnt}{fps_text}")
 
-    # Cache for CV processing results (to avoid processing every frame)
-    # The key bottleneck: face detection/recognition/liveness is expensive
-    # We process every 5th frame but display all frames for smooth preview
-    last_cv_result: Optional[RealTimeAttendanceResult] = None
-    cv_process_interval = 5  # Process CV every 5 frames = 6fps processing at 30fps preview
+    st.markdown("### 👤 Last Detected Person")
+    # Fixed height: the text changes every refresh (instructions, warnings),
+    # and a growing / shrinking panel would push the page up and down
+    with st.container(height=PERSON_PANEL_HEIGHT, border=True):
+        if status.get("state") == "error":
+            st.error(f"❌ {status.get('error')}")
+        elif status.get("error"):
+            st.warning(f"⚠️ {status.get('error')}")
+        if status.get("result"):
+            result = result_from_dict(status["result"])
+        else:
+            result = RealTimeAttendanceResult(session_id=session_id, faces_detected=0,
+                                              processed_faces=[], session_active=True)
+        st.markdown(_build_person_info_markdown(result))
+        last_mark = status.get("last_mark")
+        if last_mark:
+            marked_at = datetime.fromtimestamp(last_mark["time"]).strftime("%H:%M:%S")
+            st.caption(f"✅ Last marked: **{last_mark['name']}** ({last_mark['status'].lower()}) at {marked_at}")
 
-    # Performance measurement counters
-    frame_times = []
-    cv_process_times = []
-    performance_log_interval = 150  # Log performance every 150 frames (~5 seconds)
 
-    try:
-        while frame_count < max_frames_per_run:
-            if not st.session_state.att_camera_active:
-                break
-
-            frame_start_time = time.perf_counter()
-
-            with time_operation("camera_read_frame"):
-                success, frame = camera.read_frame()
-            if not success or frame is None:
-                video_placeholder.warning("⚠️ Frame read timeout — waiting for camera...")
-                time.sleep(0.05)
-                continue
-
-            # KEY FIX: Only run CV processing every Nth frame to reduce lag
-            # The expensive operations (face detection, embedding, recognition, liveness)
-            # run at ~6 fps while the camera preview stays smooth at 30 fps
-            if frame_count % cv_process_interval == 0:
-                # Process frame through RealTimeAttendanceManager
-                cv_start_time = time.perf_counter()
-                with time_operation("cv_frame_processing"):
-                    result: RealTimeAttendanceResult = rt_manager.process_frame(frame, session_id=session_id)
-                cv_process_time = (time.perf_counter() - cv_start_time) * 1000.0
-                cv_process_times.append(cv_process_time)
-                last_cv_result = result
-            else:
-                # Reuse previous CV result for smooth preview with stale detection boxes
-                # This maintains 30fps display while CV runs at lower rate
-                result = last_cv_result if last_cv_result is not None else RealTimeAttendanceResult(
-                    session_id=session_id,
-                    faces_detected=0,
-                    processed_faces=[],
-                    session_active=True,
-                    marked_count=0
-                )
-
-            # Draw overlays on display frame (uses cached result between CV updates)
-            with time_operation("frame_annotation"):
-                display_frame = _draw_attendance_overlays(frame, result)
-
-                # Diagnostics annotations on top of the mirrored preview.
-                # Returns the input unchanged unless FACE_DIAGNOSTICS_ENABLED=true.
-                display_frame = get_diagnostics().overlay(display_frame, _result_faces(result))
-
-            # Update video placeholder (only the image, no widget creation)
-            with time_operation("streamlit_image_update"):
-                video_placeholder.image(
-                    cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB),
-                    channels="RGB",
-                    width="stretch"
-                )
-
-            # Refresh database cache periodically (every 30 frames = once per second at 30fps)
-            # This reduces database queries from 300/run to 10/run
-            if frame_count % 30 == 0:
-                cached_records = attendance_service.get_session_attendance(session_id)
-                cached_present_cnt = sum(1 for r in cached_records if r['status'] == AttendanceStatus.PRESENT)
-                cached_late_cnt = sum(1 for r in cached_records if r['status'] == AttendanceStatus.LATE)
-                cached_total_cnt = len(cached_records)
-
-                # Update metrics using pre-formatted markdown (no st.columns creation per frame)
-                metrics_placeholder.markdown(
-                    f"**Total:** {cached_total_cnt} | **Present:** {cached_present_cnt} | **Late:** {cached_late_cnt}"
-                )
-
-            # Update Last Detected Person Info (build markdown string, single update)
-            person_info_markdown = _build_person_info_markdown(result)
-            person_info_placeholder.markdown(person_info_markdown, unsafe_allow_html=False)
-
-            # Update Records Table (every 30 frames to match database refresh rate)
-            if frame_count % 30 == 0:
-                _update_live_records_table(records_table_placeholder, cached_records, student_service)
-
-            # Record frame processing time
-            frame_end_time = time.perf_counter()
-            frame_time = (frame_end_time - frame_start_time) * 1000.0
-            frame_times.append(frame_time)
-
-            # Log performance statistics periodically
-            if frame_count > 0 and frame_count % performance_log_interval == 0:
-                if frame_times:
-                    avg_frame_time = sum(frame_times[-performance_log_interval:]) / min(len(frame_times), performance_log_interval)
-                    effective_fps = 1000.0 / avg_frame_time if avg_frame_time > 0 else 0
-
-                if cv_process_times:
-                    avg_cv_time = sum(cv_process_times[-30:]) / min(len(cv_process_times), 30)  # Last 30 CV frames
-
-                logger.info(f"PERFORMANCE: Frame {frame_count}, "
-                           f"Avg frame time: {avg_frame_time:.1f}ms, "
-                           f"Effective FPS: {effective_fps:.1f}, "
-                           f"Avg CV time: {avg_cv_time:.1f}ms")
-
-                # Log detailed performance summary every 5 seconds
-                log_performance_summary()
-
-            time.sleep(0.033)
-            frame_count += 1
-
-        # Re-trigger run to continue streaming smoothly
-        if st.session_state.att_camera_active:
-            st.rerun()
-
-    except Exception as e:
-        logger.error(f"Error in real-time attendance loop: {e}", exc_info=True)
-        video_placeholder.error(f"❌ Real-time error: {e}")
-        if st.session_state.att_camera_active:
-            time.sleep(0.2)
-            st.rerun()
+@st.fragment(run_every=RECORDS_REFRESH_SECONDS)
+def _live_records_table(
+    session_id: int,
+    attendance_service: AttendanceService,
+    student_service: StudentService
+):
+    """
+    Students marked in this session, newest first. A static table (st.table):
+    unlike the interactive st.dataframe grid it does not flicker or reset
+    its scroll position when it is refreshed with the same rows.
+    """
+    rows = _live_records_rows(attendance_service.get_session_attendance(session_id), student_service)
+    if not rows:
+        st.info("No attendance recorded yet.")
+        return
+    st.table(pd.DataFrame(rows).style.hide(axis="index"))
 
 
 def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
@@ -444,6 +357,15 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
         return "_No face currently detected in frame._"
 
     face_info = result.processed_faces[0]
+
+    # A suspected photo / screen replay is shown first, whoever the face is
+    if face_info.reason.startswith("Spoof suspected"):
+        who = face_info.student_name or ("Unknown person" if not face_info.is_recognized else face_info.identity)
+        return (
+            f"🔴 **{face_info.reason}**\n\n"
+            f"**Face:** {who}\n\n"
+            f"_Nobody is marked from a photo or screen._"
+        )
 
     if face_info.is_recognized:
         name = face_info.student_name or '—'
@@ -566,16 +488,11 @@ def _result_faces(result) -> List[DetectedFace]:
     return faces
 
 
-def _update_live_records_table(
-    placeholder,
+def _live_records_rows(
     records: List[Dict[str, Any]],
     student_service: StudentService
-):
-    """Update live attendance records table."""
-    if not records:
-        placeholder.info("No attendance recorded yet.")
-        return
-
+) -> List[Dict[str, Any]]:
+    """Rows of the live marked-students table, newest first."""
     table_data = []
     for r in reversed(records):  # Show newest first
         student = student_service.get_student_by_id(r['student_id'])
@@ -591,12 +508,7 @@ def _update_live_records_table(
             'Liveness': f"{r['liveness_score']:.2f}" if r.get('liveness_score') is not None else "—",
             'Marked By': r.get('marked_by') or 'system'
         })
-
-    placeholder.dataframe(
-        table_data,
-        width="stretch",
-        hide_index=True
-    )
+    return table_data
 
 
 def render_session_records_panel(

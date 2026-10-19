@@ -202,6 +202,26 @@ FACE_DIAGNOSTICS_WARN_FACE_PX: int = int(_env_float("FACE_DIAGNOSTICS_WARN_FACE_
 # file is written. Useful for measuring across real distances.
 FACE_DIAGNOSTICS_CSV_PATH: str = os.getenv("FACE_DIAGNOSTICS_CSV_PATH", "")
 
+# Face pipeline models (OpenCV Zoo, run with OpenCV's DNN module).
+# - YuNet detector: finds faces (also turned ones) and 5 landmarks (eyes, nose,
+#   mouth corners) in ~7 ms; "mediapipe" = the previous BlazeFace detector.
+# - SFace recogniser: 128-d face embedding of the aligned face in ~5 ms
+#   (dlib took ~240 ms and blocked other threads); "dlib" = the previous model.
+# Each falls back to the previous model if its file is missing. Embeddings of
+# the two recognisers are not compatible: SFace ones are stored next to the
+# dlib ones as enc_sface_<id>.npy and created automatically from the saved
+# enrollment photos (EnrollmentService.load_active_gallery).
+FACE_DETECTOR_BACKEND: str = os.getenv("FACE_DETECTOR_BACKEND", "yunet").lower()
+FACE_RECOGNITION_BACKEND: str = os.getenv("FACE_RECOGNITION_BACKEND", "sface").lower()
+YUNET_MODEL_PATH: Final[Path] = PROJECT_ROOT / "face_detection_yunet_2023mar.onnx"
+SFACE_MODEL_PATH: Final[Path] = PROJECT_ROOT / "face_recognition_sface_2021dec.onnx"
+
+# SFace match threshold: Euclidean distance between unit-length embeddings.
+# 1.128 is OpenCV's published threshold (= cosine similarity 0.363); lower is
+# stricter. The ambiguity margin works like FACE_RECOGNITION_MARGIN below.
+SFACE_RECOGNITION_THRESHOLD: float = _env_float("SFACE_RECOGNITION_THRESHOLD", 1.128)
+SFACE_RECOGNITION_MARGIN: float = _env_float("SFACE_RECOGNITION_MARGIN", 0.1)
+
 # Face detection confidence threshold (MediaPipe).
 # Now overridable via .env so the threshold can be tuned without editing code.
 FACE_DETECTION_CONFIDENCE: Final[float] = _env_float("FACE_DETECTION_CONFIDENCE", 0.7)
@@ -299,7 +319,12 @@ LIVENESS_HEAD_HOLD_FRAMES: Final[int] = 3
 
 # Require challenge completion along with blink detection for LIVE state
 # If False, blink detection alone is sufficient (Phase 3B behavior)
-LIVENESS_REQUIRE_CHALLENGE: Final[bool] = True
+LIVENESS_REQUIRE_CHALLENGE: Final[bool] = os.getenv("LIVENESS_REQUIRE_CHALLENGE", "true").lower() == "true"
+
+# Seconds a face may be lost before liveness restarts. The face detector
+# briefly loses a face that turns for the head-turn challenge; resetting at
+# once would wipe the progress the challenge asks for.
+LIVENESS_FACE_LOST_GRACE: float = _env_float("LIVENESS_FACE_LOST_GRACE", 2.0)
 
 # ----------------------------------------------------------------------------
 # Spoof (presentation attack) detection - part of the liveness requirement
@@ -308,11 +333,18 @@ LIVENESS_REQUIRE_CHALLENGE: Final[bool] = True
 # a face must also pass these checks (src/computer_vision/spoof_detection.py).
 # Each check is skipped, with a warning, if its model file is missing.
 
-# Anti-spoof model (MiniFASNet): real-face probability averaged over the last
-# ANTI_SPOOF_WINDOW CV frames must be at least ANTI_SPOOF_THRESHOLD, after at
-# least ANTI_SPOOF_MIN_FRAMES frames. Tune with manual_tests/spoof_check_live.py.
+# Anti-spoof model (MiniFASNet), judged per processed frame. Calibrated with
+# manual_tests/spoof_check_live.py on the development webcam: a real face
+# scored >= 0.89 on every frame (mean 1.00), while a face on a phone flips
+# between ~0 and ~1 (43-66 % of frames below 0.6), so an average let phones
+# pass. Now:
+# - a frame scoring below ANTI_SPOOF_THRESHOLD is a "spoof frame";
+# - ANTI_SPOOF_BAD_FRAMES spoof frames among the last ANTI_SPOOF_WINDOW block
+#   the person until they leave the view;
+# - marking needs the last ANTI_SPOOF_MIN_FRAMES frames all above the threshold.
 ANTI_SPOOF_ENABLED: bool = os.getenv("ANTI_SPOOF_ENABLED", "true").lower() == "true"
-ANTI_SPOOF_THRESHOLD: float = _env_float("ANTI_SPOOF_THRESHOLD", 0.6)
+ANTI_SPOOF_THRESHOLD: float = _env_float("ANTI_SPOOF_THRESHOLD", 0.8)
+ANTI_SPOOF_BAD_FRAMES: int = int(_env_float("ANTI_SPOOF_BAD_FRAMES", 2))
 ANTI_SPOOF_MIN_FRAMES: int = int(_env_float("ANTI_SPOOF_MIN_FRAMES", 5))
 ANTI_SPOOF_WINDOW: int = int(_env_float("ANTI_SPOOF_WINDOW", 10))
 
@@ -322,6 +354,17 @@ ANTI_SPOOF_WINDOW: int = int(_env_float("ANTI_SPOOF_WINDOW", 10))
 SCREEN_DETECTION_ENABLED: bool = os.getenv("SCREEN_DETECTION_ENABLED", "true").lower() == "true"
 SCREEN_DETECTION_CONFIDENCE: float = _env_float("SCREEN_DETECTION_CONFIDENCE", 0.4)
 SCREEN_FACE_OVERLAP: float = _env_float("SCREEN_FACE_OVERLAP", 0.5)
+# Seconds between screen checks for the person in view (~37 ms each);
+# 0 = on every recognition run (at most RECOGNITION_INTERVAL apart)
+SCREEN_CHECK_INTERVAL: float = _env_float("SCREEN_CHECK_INTERVAL", 0.0)
+
+# Log a "SPOOF CHECK" line (anti-spoof scores, screens seen) once per second
+# while a face is in view - for calibrating ANTI_SPOOF_THRESHOLD
+SPOOF_DIAGNOSTICS: bool = os.getenv("SPOOF_DIAGNOSTICS", "true").lower() == "true"
+
+# Real-time recognition runs at most every RECOGNITION_INTERVAL seconds in the
+# vision engine (blinks and head turns are still checked on every frame)
+RECOGNITION_INTERVAL: float = _env_float("RECOGNITION_INTERVAL", 0.2)
 
 # Audit snapshot: a small photo of the face is saved with every real-time
 # attendance mark (data/attendance_snapshots/session_<id>/) so a teacher can

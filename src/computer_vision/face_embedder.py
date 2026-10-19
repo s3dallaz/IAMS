@@ -1,13 +1,19 @@
 """
 Face Embedder for the Intelligent Attendance Monitoring System.
 
-Provides face embedding generation using face_recognition library.
-Generates 128-dimensional face encodings from face images for recognition purposes.
+Generates 128-dimensional face encodings for recognition with OpenCV's SFace
+model (default, ~5 ms, face aligned on its landmarks first) or dlib via the
+face_recognition library (~240 ms) - config.FACE_RECOGNITION_BACKEND.
+The two models' encodings are not comparable with each other.
 """
 
+from pathlib import Path
 from typing import Optional, Tuple
+import cv2
 import numpy as np
 import face_recognition
+
+import config
 
 from src.utils.logger import get_logger
 from src.utils.performance_timer import time_operation
@@ -55,11 +61,83 @@ class FaceEmbedder:
     Uses dlib's face recognition model under the hood.
     """
     
-    def __init__(self):
-        """Initialize the FaceEmbedder."""
+    def __init__(self, backend: Optional[str] = None):
+        """
+        Initialize the FaceEmbedder.
+
+        Args:
+            backend: "sface" or "dlib"; None = config.FACE_RECOGNITION_BACKEND.
+                SFace falls back to dlib if its model file is missing.
+        """
         self.logger = get_logger(__name__)
-        self.logger.info("FaceEmbedder initialized")
-    
+        self.backend = (backend or config.FACE_RECOGNITION_BACKEND).lower()
+        self._sface = None
+        self._crop_detector = None  # YuNet, to find landmarks inside a face crop (lazy)
+        if self.backend == "sface":
+            model_path = Path(config.SFACE_MODEL_PATH)
+            try:
+                if not model_path.exists():
+                    raise FileNotFoundError(model_path)
+                self._sface = cv2.FaceRecognizerSF.create(str(model_path), "")
+            except Exception as e:
+                self.logger.warning(f"SFace model unavailable ({e}); using dlib face encodings")
+                self.backend = "dlib"
+        self.logger.info(f"FaceEmbedder initialized ({self.backend})")
+
+    def generate_embedding_from_frame(self, frame: np.ndarray, face) -> Optional[FaceEmbedding]:
+        """
+        Embedding of a detected face in a full frame. With SFace and YuNet
+        landmarks the face is aligned straight from the frame (best quality);
+        otherwise the face box is cropped and passed to generate_embedding().
+        """
+        if self._sface is not None and getattr(face, "landmarks", None) is not None:
+            with time_operation("face_embedding"):
+                aligned = self._sface.alignCrop(frame, face.yunet_row())
+                return self._sface_embedding(aligned)
+        x, y, w, h = face.bbox
+        return self.generate_embedding(frame[max(0, y):y + h, max(0, x):x + w])
+
+    def _sface_embedding(self, aligned_face: np.ndarray) -> FaceEmbedding:
+        """SFace feature of a 112x112 aligned BGR face, scaled to unit length."""
+        feature = self._sface.feature(aligned_face).reshape(-1).astype(np.float64)
+        norm = np.linalg.norm(feature)
+        if norm == 0:
+            raise FaceEmbeddingError("SFace returned an empty feature")
+        return FaceEmbedding(feature / norm)
+
+    def _sface_from_crop(self, face_crop: np.ndarray) -> Optional[FaceEmbedding]:
+        """
+        SFace embedding of a face crop (e.g. a saved enrollment photo): find the
+        landmarks with YuNet on the padded crop and align; if YuNet finds no
+        face, use the crop resized to 112x112.
+        """
+        bgr = face_crop
+        if bgr.ndim == 2:
+            bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+        elif bgr.shape[2] == 4:
+            bgr = cv2.cvtColor(bgr, cv2.COLOR_BGRA2BGR)
+        bgr = np.ascontiguousarray(bgr)
+        h, w = bgr.shape[:2]
+        pad = max(8, int(0.3 * max(h, w)))
+        padded = cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        if self._crop_detector is None and Path(config.YUNET_MODEL_PATH).exists():
+            self._crop_detector = cv2.FaceDetectorYN.create(
+                str(config.YUNET_MODEL_PATH), "", (padded.shape[1], padded.shape[0]),
+                score_threshold=0.5, nms_threshold=0.3, top_k=5
+            )
+        faces = None
+        if self._crop_detector is not None:
+            self._crop_detector.setInputSize((padded.shape[1], padded.shape[0]))
+            _, faces = self._crop_detector.detect(padded)
+        with time_operation("face_embedding"):
+            if faces is not None and len(faces):
+                largest = max(faces, key=lambda row: row[2] * row[3])
+                aligned = self._sface.alignCrop(padded, largest)
+            else:
+                self.logger.debug("No landmarks found in face crop; using it unaligned")
+                aligned = cv2.resize(bgr, (112, 112))
+            return self._sface_embedding(aligned)
+
     def generate_embedding(self, face_image: np.ndarray) -> Optional[FaceEmbedding]:
         """
         Generate a face embedding from a face image.
@@ -94,6 +172,15 @@ class FaceEmbedder:
                 "Expected 2D (grayscale) or 3D (color) array"
             )
         
+        if self._sface is not None:
+            try:
+                return self._sface_from_crop(face_image)
+            except FaceEmbeddingError:
+                raise
+            except Exception as e:
+                self.logger.error(f"Error during face encoding: {e}")
+                raise FaceEmbeddingError(f"Failed to generate face encoding: {e}")
+
         # Convert to RGB if needed
         try:
             rgb_image = self._ensure_rgb(face_image)

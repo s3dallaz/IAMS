@@ -380,6 +380,13 @@ class LivenessDetector:
         # Keyed by the id() of the numpy array; cleared after each frame.
         self._cached_frame_id: Optional[int] = None
         self._cached_landmarks = None  # raw face_landmarks list or None
+        # Faces the landmarker saw in the last analysed frame (landmarks are
+        # only used when this is exactly 1)
+        self.last_face_count: int = 0
+        # VIDEO running mode: the landmarker tracks the face between frames
+        # instead of searching the whole image every time (enable_video_mode)
+        self.video_mode: bool = False
+        self._last_video_ts: int = -1
 
         # Temporal state for blink detection
         self._reset_temporal_state()
@@ -486,6 +493,23 @@ class LivenessDetector:
             'progress_percent': min(1.0, self._challenge_frames_held / self.head_hold_frames) if self.head_hold_frames > 0 else 0.0
         }
 
+    def enable_video_mode(self) -> None:
+        """
+        Analyse frames as a video stream (MediaPipe VIDEO mode): faster and
+        steadier when every camera frame is analysed. Frames must then come
+        from one stream in time order.
+        """
+        if self.video_mode:
+            return
+        self.video_mode = True
+        if self._landmarker is not None:
+            try:
+                self._landmarker.close()
+            except Exception:
+                pass
+            self._landmarker = None  # recreated in VIDEO mode on next use
+        self._cached_frame_id = None
+
     def _initialize_landmarker(self) -> None:
         """
         Initialize MediaPipe Face Landmarker (lazy initialization).
@@ -502,10 +526,13 @@ class LivenessDetector:
             )
             options = vision.FaceLandmarkerOptions(
                 base_options=base_options,
-                num_faces=1,  # We only analyze one face at a time
+                # Two, so a second face is noticed: eyes and head pose are
+                # only read while exactly one face is in view
+                num_faces=2,
                 min_face_detection_confidence=0.5,
                 min_face_presence_confidence=0.5,
-                min_tracking_confidence=0.5
+                min_tracking_confidence=0.5,
+                running_mode=vision.RunningMode.VIDEO if self.video_mode else vision.RunningMode.IMAGE
             )
             self._landmarker = vision.FaceLandmarker.create_from_options(options)
             self.logger.info("MediaPipe Face Landmarker initialized")
@@ -565,11 +592,19 @@ class LivenessDetector:
         try:
             frame_rgb = self._convert_to_rgb(frame)
             mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
-            detection_result = self._landmarker.detect(mp_image)
+            if self.video_mode:
+                # VIDEO mode needs strictly increasing timestamps (ms)
+                self._last_video_ts = max(self._last_video_ts + 1, int(time.monotonic() * 1000))
+                detection_result = self._landmarker.detect_for_video(mp_image, self._last_video_ts)
+            else:
+                detection_result = self._landmarker.detect(mp_image)
 
-            if (not detection_result.face_landmarks
-                    or len(detection_result.face_landmarks) == 0):
+            self.last_face_count = len(detection_result.face_landmarks or [])
+            if self.last_face_count == 0:
                 self.logger.debug("No face landmarks detected")
+                landmarks = None
+            elif self.last_face_count > 1:
+                # One person at a time: whose blink would it be?
                 landmarks = None
             else:
                 landmarks = detection_result.face_landmarks[0]

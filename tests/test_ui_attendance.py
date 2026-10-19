@@ -332,37 +332,45 @@ def test_person_panel_shows_a_suspected_spoof_instead_of_instructions():
     assert "Blink 3 times" not in text
 
 
-def test_stream_reloads_gallery_for_existing_manager():
-    """Students enrolled during an active session reach the running manager."""
+def test_live_stream_reports_a_stopped_engine():
+    """If the vision engine died, the page says so and offers to start again."""
     from types import SimpleNamespace
-    from src.ui.pages.realtime_attendance import _run_realtime_attendance_stream
+    from src.ui.pages.realtime_attendance import _render_live_stream
 
-    camera = MagicMock()
-    camera.is_open.return_value = True
-    rt_manager = MagicMock()
-    rt_manager.current_session_id = 7
-    state = SimpleNamespace(
-        att_camera_manager=camera,
-        att_rt_manager=rt_manager,
-        att_camera_active=False,  # stop before the frame loop starts
-    )
-    new_gallery = [("2021001", MagicMock()), ("2021002", MagicMock())]
+    engine = MagicMock()
+    engine.is_running.return_value = False
+    state = SimpleNamespace(att_camera_active=True)
+
+    with patch("streamlit.session_state", state), patch("streamlit.error") as mock_error:
+        _render_live_stream(engine=engine, session_id=7, settings={},
+                            attendance_service=MagicMock(), student_service=MagicMock())
+
+    assert state.att_camera_active is False
+    mock_error.assert_called_once()
+
+
+def test_live_stream_sends_changed_settings_to_the_engine():
+    from types import SimpleNamespace
+    from src.ui.pages.realtime_attendance import _render_live_stream
+
+    engine = MagicMock()
+    engine.is_running.return_value = True
+    engine.session_id = 7
+    engine.stream_url = "http://127.0.0.1:9999/stream.mjpg"
+    state = SimpleNamespace(att_camera_active=True, att_engine_settings={"require_head_turn": True})
+    state.get = lambda key, default=None: getattr(state, key, default)
+    new_settings = {"require_head_turn": False}
 
     with patch("streamlit.session_state", state), \
-         patch("src.ui.pages.realtime_attendance.EnrollmentService") as mock_enrollment:
-        mock_enrollment.return_value.load_active_gallery.return_value = new_gallery
-        _run_realtime_attendance_stream(
-            session_id=7,
-            require_liveness=True,
-            cooldown_seconds=5.0,
-            session_service=MagicMock(),
-            attendance_service=MagicMock(),
-            student_service=MagicMock(),
-            head_turn_angle=15.0,
-        )
+         patch("streamlit.columns", return_value=(MagicMock(), MagicMock())), \
+         patch("streamlit.markdown") as mock_markdown, \
+         patch("src.ui.pages.realtime_attendance._live_status_panel"):
+        _render_live_stream(engine=engine, session_id=7, settings=new_settings,
+                            attendance_service=MagicMock(), student_service=MagicMock())
 
-    assert state.att_rt_manager is rt_manager  # same manager, not recreated
-    rt_manager.set_gallery.assert_called_once_with(new_gallery)
+    engine.update_settings.assert_called_once_with(new_settings)
+    assert state.att_engine_settings == new_settings
+    assert any(engine.stream_url in str(call) for call in mock_markdown.call_args_list)
 
 
 # ============================================================================
@@ -545,3 +553,10 @@ def test_manage_face_reset_confirmation_warning():
         mock_warn.assert_called_once()
         # Not deleted without explicit confirmation click
         mock_enroll_svc.clear_student_face_dataset.assert_not_called()
+
+
+def test_person_panel_shows_a_spoof_for_an_unknown_face_too():
+    face = _pending_student(is_recognized=False, identity="Unknown", student_name=None,
+                            reason="Spoof suspected: face looks like a photo or screen")
+    text = _panel(face)
+    assert "🔴" in text and "Unknown person" in text and "photo or screen" in text
