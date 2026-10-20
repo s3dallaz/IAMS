@@ -167,8 +167,8 @@ def test_delete_confirmation_warning_box():
     mock_service.get_all_students.return_value = [{'id': 1, 'student_id': 'DEL101', 'name': 'John Delete', 'department': 'CS', 'is_active': 1, 'enrolled_at': None}]
     mock_service.get_student_by_id.return_value = {'id': 1, 'student_id': 'DEL101', 'name': 'John Delete'}
     mock_enroll_svc = MagicMock()
-    mock_enroll_svc.get_student_samples_count.return_value = 2
-    
+    mock_enroll_svc.get_all_samples_counts.return_value = {1: 2}
+
     fake_state = {
         'confirm_delete_id': 1,
         'current_view': 'directory'
@@ -229,3 +229,25 @@ def test_release_registration_camera_complete_reset():
         assert fake_state['reg_cam_manager'] is None
         assert fake_state['reg_cam_active'] is False
         assert fake_state['captured_photo_preview'] is None
+
+
+def test_directory_shows_action_buttons_one_page_at_a_time():
+    """With 1,000 students the action list must not draw thousands of buttons."""
+    mock_service = MagicMock()
+    mock_service.get_all_students.return_value = [
+        {'id': i, 'student_id': f'S{i:04d}', 'name': f'Student {i}', 'department': 'CS',
+         'is_active': 1, 'enrolled_at': None} for i in range(1, 61)]
+    mock_enroll_svc = MagicMock()
+    mock_enroll_svc.get_all_samples_counts.return_value = {1: 1}
+
+    with patch("streamlit.session_state", {'current_view': 'directory'}), \
+         patch("streamlit.button", return_value=False) as mock_btn, \
+         patch("streamlit.text_input", return_value=""), \
+         patch("streamlit.selectbox", return_value="All Students"), \
+         patch("streamlit.number_input", return_value=3) as mock_page:
+        render_directory_view(mock_service, mock_enroll_svc)
+
+    assert mock_page.call_args.kwargs["max_value"] == 3            # 60 students, 25 per page
+    face_buttons = [c.kwargs["key"] for c in mock_btn.call_args_list if c.kwargs.get("key", "").startswith("btn_face_")]
+    assert face_buttons == [f"btn_face_{i}" for i in range(51, 61)]   # page 3: students 51-60
+    mock_enroll_svc.get_student_samples_count.assert_not_called()   # one query for all counts

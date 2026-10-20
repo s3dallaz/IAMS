@@ -339,6 +339,32 @@ class StudentRepository:
             logger.error(f"Database error deleting student {student_db_id}: {e}")
             raise
 
+    def bulk_save(self, creates: List[Dict[str, Any]], updates: List[Dict[str, Any]]) -> None:
+        """
+        Insert and update many students in ONE transaction (all or nothing).
+
+        Args:
+            creates: dicts with student_id, name, email, department, notes
+            updates: the same keys; the row with that student_id is updated
+        """
+        insert = """
+            INSERT INTO students (student_id, name, email, department, notes)
+            VALUES (:student_id, :name, :email, :department, :notes)
+        """
+        update = """
+            UPDATE students SET name = :name, email = :email, department = :department, notes = :notes
+            WHERE student_id = :student_id
+        """
+        columns = ("student_id", "name", "email", "department", "notes")
+        try:
+            with get_db_connection(self.database_path) as conn:
+                conn.executemany(insert, [{k: row.get(k) for k in columns} for row in creates])
+                conn.executemany(update, [{k: row.get(k) for k in columns} for row in updates])
+            logger.info(f"Bulk saved students: {len(creates)} created, {len(updates)} updated")
+        except sqlite3.Error as e:
+            logger.error(f"Database error in bulk student save (nothing was saved): {e}")
+            raise
+
 
 if __name__ == "__main__":
     # Simple manual test

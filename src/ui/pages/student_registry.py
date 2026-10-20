@@ -29,9 +29,12 @@ from src.services.enrollment_service import (
     InvalidFaceImageError
 )
 from src.computer_vision.camera_manager import CameraManager
+from src.ui.pages.bulk_import import render_bulk_import_view
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+DIRECTORY_PAGE_SIZE = 25   # students per page in the "Manage Students" action list
 
 
 def release_registration_camera():
@@ -57,7 +60,7 @@ def render_student_registry():
     
     # Initialize state keys
     if 'current_view' not in st.session_state:
-        st.session_state['current_view'] = 'directory'  # 'directory', 'add', 'edit', 'manage_face'
+        st.session_state['current_view'] = 'directory'  # 'directory', 'add', 'edit', 'manage_face', 'bulk_import'
     if 'selected_student_id' not in st.session_state:
         st.session_state['selected_student_id'] = None
     if 'confirm_delete_id' not in st.session_state:
@@ -93,6 +96,8 @@ def render_student_registry():
         render_edit_student_view(student_service, st.session_state['selected_student_id'])
     elif view == 'add':
         render_add_student_view(student_service)
+    elif view == 'bulk_import':
+        render_bulk_import_view(student_service, enrollment_service)
     else:
         # Default view: Full Directory with Add expander and table actions
         render_directory_view(student_service, enrollment_service)
@@ -106,13 +111,19 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
     """Render the main directory list with quick actions (Edit, Manage Face, Delete, Activate/Deactivate)."""
     
     # Top Action Bar
-    col_hdr, col_btn = st.columns([3, 1])
+    col_hdr, col_btn, col_bulk = st.columns([2, 1, 1])
     with col_hdr:
         st.subheader("📋 Student Directory")
     with col_btn:
         if st.button("➕ Add New Student", type="primary", width="stretch", key="btn_open_add_student"):
             release_registration_camera()
             st.session_state['current_view'] = 'add'
+            st.rerun()
+    with col_bulk:
+        if st.button("📥 Bulk Import", width="stretch", key="btn_open_bulk_import",
+                     help="Add many students from Excel / CSV and their face photos from a ZIP"):
+            release_registration_camera()
+            st.session_state['current_view'] = 'bulk_import'
             st.rerun()
 
     # Search and Filter
@@ -150,10 +161,11 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
             st.info("No students found matching current criteria. Click **➕ Add New Student** above to register.")
             return
 
-        # Overview Table
+        # Overview Table (face sample counts of all students in one query)
+        samples_counts = enrollment_service.get_all_samples_counts()
         table_rows = []
         for s in students:
-            samples_cnt = enrollment_service.get_student_samples_count(s['id'])
+            samples_cnt = samples_counts.get(s['id'], 0)
             face_status = f"✅ {samples_cnt} sample(s)" if samples_cnt > 0 else "⚠️ No face data"
             table_rows.append({
                 'ID': s['student_id'],
@@ -192,9 +204,20 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
                             st.error(f"❌ Failed to delete student: {e}")
                 st.markdown("---")
 
-        # Action rows for each student
-        for s in students:
-            samples_cnt = enrollment_service.get_student_samples_count(s['id'])
+        # Action rows, a page at a time (hundreds of rows of buttons make the page slow)
+        page_count = max(1, -(-len(students) // DIRECTORY_PAGE_SIZE))
+        if page_count > 1:
+            # A narrower search can leave the remembered page past the last one
+            if st.session_state.get("input_directory_page", 1) > page_count:
+                st.session_state["input_directory_page"] = page_count
+            page = st.number_input(f"Page (of {page_count}, {DIRECTORY_PAGE_SIZE} students each)",
+                                   min_value=1, max_value=page_count, step=1,
+                                   key="input_directory_page")
+        else:
+            page = 1
+        page_students = students[(page - 1) * DIRECTORY_PAGE_SIZE:page * DIRECTORY_PAGE_SIZE]
+        for s in page_students:
+            samples_cnt = samples_counts.get(s['id'], 0)
             face_badge = f"📸 Manage Face ({samples_cnt})" if samples_cnt > 0 else "📸 Add Face Data"
             
             row_cols = st.columns([1.5, 2.5, 2, 1.5, 1.2, 0.8])

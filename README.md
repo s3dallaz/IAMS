@@ -115,6 +115,11 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 4. **Statistics & Reports** - View attendance analytics and export PDFs
 5. **AI Assistant** - Query attendance data via natural language (requires OmniRoute API key in `.env`)
 
+### Adding many students at once (Student Registry → 📥 Bulk Import)
+
+1. **Students** – upload an Excel (`.xlsx`) or CSV file with the columns `student_id`, `name` (required) and `email`, `department`, `notes` (optional); a template can be downloaded on the page. The file is checked first (new / updated / unchanged / rows with errors) and saved in one go. Re-uploading is safe: existing students are updated, never duplicated, and empty cells keep their current details.
+2. **Face photos** – upload a ZIP of photos named after the student IDs (`2021001.jpg`, extra photos `2021001_2.jpg`, or a folder per student `2021001/…`). Each photo is checked (one clear face, big enough, not the same face as another student); problems are listed and downloadable as a report. Students who already have face data are skipped by default, so re-running the same ZIP continues an interrupted import.
+
 ## 📁 Project Structure
 
 ```

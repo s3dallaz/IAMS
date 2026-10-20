@@ -1,0 +1,3 @@
+[server]
+# Bulk import: a ZIP of face photos for hundreds of students can exceed the 200 MB default
+maxUploadSize = 1024

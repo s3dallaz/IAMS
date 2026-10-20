@@ -160,18 +160,26 @@ class EnrollmentService:
         student = self.student_repo.get_by_id(student_db_id)
         if not student:
             raise EnrollmentServiceError(f"Student with DB ID {student_db_id} not found")
-            
-        student_id_str = student['student_id']
-        
-        # Step 1: Validate face and extract crop
-        face, face_crop = self._detect_single_face(face_image)
-        confidence = float(face.confidence)
 
-        # Step 2: Generate 128D embedding (SFace: aligned on the face's landmarks)
+        # Steps 1-2: validate the face, crop it and generate its embedding
+        face, face_crop, embedding = self.prepare_face_sample(face_image)
+
+        # Steps 3-4: save the files and the enrollment record
+        return self.save_face_sample(student, face_crop, embedding, float(face.confidence),
+                                     enrollment_method=enrollment_method, view_angle=view_angle)
+
+    def prepare_face_sample(self, face_image: np.ndarray) -> Tuple[DetectedFace, np.ndarray, FaceEmbedding]:
+        """
+        The single face in `face_image`, its crop and its 128D embedding
+        (SFace: aligned on the face's landmarks), without saving anything.
+
+        Raises:
+            InvalidFaceImageError: no face, several faces, or no embedding
+        """
+        face, face_crop = self._detect_single_face(face_image)
         embedder = self._get_embedder()
-        sface = getattr(embedder, "backend", None) == "sface"
         try:
-            if sface:
+            if self._uses_sface():
                 embedding = embedder.generate_embedding_from_frame(face_image, face)
             else:
                 embedding = embedder.generate_embedding(face_crop)
@@ -179,7 +187,25 @@ class EnrollmentService:
                 raise InvalidFaceImageError("Failed to extract face embedding from the detected face")
         except FaceEmbeddingError as e:
             raise InvalidFaceImageError(f"Embedding error: {e}")
-            
+        return face, face_crop, embedding
+
+    def _uses_sface(self) -> bool:
+        return getattr(self._get_embedder(), "backend", None) == "sface"
+
+    def save_face_sample(
+        self,
+        student: Dict[str, Any],
+        face_crop: np.ndarray,
+        embedding: FaceEmbedding,
+        confidence: float,
+        enrollment_method: str = 'camera',
+        view_angle: str = 'unknown'
+    ) -> int:
+        """Save a prepared face sample (embedding + crop) for `student` and record it. Returns the enrollment ID."""
+        student_db_id = student['id']
+        student_id_str = student['student_id']
+        sface = self._uses_sface()
+
         # Step 3: Save embedding and sample image to student's folder
         student_enc_dir = self.encodings_dir / str(student_id_str)
         student_img_dir = self.images_dir / str(student_id_str)
@@ -254,6 +280,13 @@ class EnrollmentService:
         """Get the number of active enrolled face samples for a student."""
         enrollments = self.enrollment_repo.get_by_student_id(student_db_id, active_only=True)
         return len(enrollments)
+
+    def get_all_samples_counts(self) -> Dict[int, int]:
+        """Active face sample count per student DB ID, in one query (students without samples are absent)."""
+        counts: Dict[int, int] = {}
+        for record in self.enrollment_repo.get_all(active_only=True):
+            counts[record['student_id']] = counts.get(record['student_id'], 0) + 1
+        return counts
         
     def get_student_enrollment_coverage(self, student_db_id: int) -> Dict[str, bool]:
         """
