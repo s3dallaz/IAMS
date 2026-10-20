@@ -85,6 +85,16 @@ Every package in `requirements.txt` installs from a prebuilt wheel, so **no C++ 
    ```
    This starts the Streamlit server with the `.venv` interpreter (nothing is reinstalled) and opens `http://localhost:8501` in your browser.
 
+4. **Uninstall** (optional):
+   ```cmd
+   uninstall.bat
+   ```
+   Asks about each part separately, shows a summary, and changes nothing until you confirm:
+   * **In the project folder:** `.venv` with every Python library, or only the optional dlib recogniser; the temporary files; your data (you have to type `DELETE`); or the whole IAMS folder.
+   * **Shared with the rest of the PC:** the Microsoft C++ build tools (the Build Tools product, or only the C++ workload of a full Visual Studio), CMake, Python 3.10, and the pip / Streamlit / Matplotlib caches. `setup.bat` records the prerequisites it installs in `.iams_installed`, so the uninstaller tells you which ones were already on the PC and may be used by other programs.
+
+   A running IAMS is closed first. Exit codes: `0` = finished, `1` = a part could not be removed, `2` = restart Windows to finish removing the C++ build tools.
+
 ### Manual Alternative
 If you prefer manual control:
 ```cmd
@@ -114,6 +124,7 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 ├── requirements-dev.txt        # Test-only tooling (pytest)
 ├── setup.bat                   # Windows automated setup
 ├── run.bat                     # Windows automated launch
+├── uninstall.bat               # Windows uninstaller - asks per part
 ├── scripts/
 │   └── setup_helper.py         # Python/dependency checks used by setup.bat
 ├── .env.example                # Environment variable template

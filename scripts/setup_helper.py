@@ -42,6 +42,13 @@ detect-msvc         Check the components dlib actually needs - the MSVC
                     With --env-file it also writes IAMS_MSVC_OK,
                     IAMS_VS_HAS_CPP, IAMS_VS_INSTANCE and IAMS_VS_INSTALLER.
 
+list-vs             For uninstall.bat: list the Visual Studio installations
+                    that contain the MSVC C++ tools. With --env-file it
+                    writes IAMS_VS_COUNT, IAMS_VS_INSTALLER and, per
+                    installation N, IAMS_VS_N_PATH, IAMS_VS_N_NAME and
+                    IAMS_VS_N_KIND ("product" for a Build Tools product,
+                    which exists only for C++, otherwise "workload").
+
 verify-install      Import every runtime-critical package and exit 0 only
                     if all of them import successfully. Prints one line per
                     package so failures are immediately diagnosable.
@@ -576,6 +583,45 @@ def detect_msvc(argv):
     return 0 if ok else 1
 
 
+def list_vs(argv):
+    quiet = "--quiet" in argv
+    env_file = _arg_value(argv, "--env-file")
+
+    instances = []
+    installer = ""
+    vswhere = _vswhere_path()
+    if vswhere:
+        candidate = os.path.join(os.path.dirname(vswhere), "setup.exe")
+        if os.path.isfile(candidate):
+            installer = candidate
+        code, output = _run([vswhere, "-products", "*", "-requires",
+                             VC_TOOLS_COMPONENT, "-format", "json"], timeout=90)
+        try:
+            import json
+            instances = [i for i in json.loads(output or "[]")
+                         if os.path.isdir(i.get("installationPath", ""))]
+        except ValueError:
+            instances = []
+
+    values = [("IAMS_VS_COUNT", str(len(instances))),
+              ("IAMS_VS_INSTALLER", installer)]
+    for number, instance in enumerate(instances, 1):
+        name = "%s %s" % (instance.get("displayName") or "Visual Studio",
+                          instance.get("installationVersion") or "")
+        kind = ("product" if instance.get("productId")
+                == "Microsoft.VisualStudio.Product.BuildTools" else "workload")
+        values += [("IAMS_VS_%d_PATH" % number, instance["installationPath"]),
+                   ("IAMS_VS_%d_NAME" % number, name.strip()),
+                   ("IAMS_VS_%d_KIND" % number, kind)]
+        if not quiet:
+            print("  %s  %s  [%s]" % (name.strip(), instance["installationPath"], kind))
+    if not quiet and not instances:
+        print("No Visual Studio installation with the C++ tools was found.")
+    if env_file:
+        _write_env_file(env_file, values)
+    return 0
+
+
 def _arg_value(argv, name):
     """Return the value of ``--name value`` or ``--name=value``."""
     for index, item in enumerate(argv):
@@ -658,6 +704,7 @@ COMMANDS = {
     "check-dlib": check_dlib,
     "detect-cmake": detect_cmake,
     "detect-msvc": detect_msvc,
+    "list-vs": list_vs,
     "verify-install": verify_install,
 }
 
@@ -667,7 +714,7 @@ def main(argv):
         print(__doc__)
         print("usage: setup_helper.py "
               "{check-python|check-venv|check-windows|check-dlib|detect-cmake|"
-              "detect-msvc|verify-install} [--quiet] [--env-file PATH]")
+              "detect-msvc|list-vs|verify-install} [--quiet] [--env-file PATH]")
         return 2
     return COMMANDS[argv[0]](argv[1:])
 

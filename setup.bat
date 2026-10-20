@@ -31,6 +31,13 @@ set "ENVDIR=%TEMP%\iams_setup"
 set "CMAKE_ENV=%ENVDIR%\cmake_env.bat"
 set "MSVC_ENV=%ENVDIR%\msvc_env.bat"
 
+REM Every prerequisite this script installs is recorded here, one line
+REM each - python, cmake, msvc-buildtools or msvc-workload - so that
+REM uninstall.bat can tell it apart from software that was already on
+REM this PC.
+set "INSTALL_RECORD=%ROOT%.iams_installed"
+set "IAMS_MSVC_METHOD="
+
 REM An RC environment variable (set by this script in older versions, or
 REM inherited from Windows) makes CMake use it as the resource compiler and
 REM the dlib build fails with: Could not find the compiler specified in the
@@ -171,6 +178,7 @@ if defined PY_CMD goto :python_installed
 goto :python_install_unverified
 
 :python_installed
+>>"%INSTALL_RECORD%" echo python
 echo Python is now available.
 %PY_CMD% "%HELPER%" check-windows
 if errorlevel 2 goto :unsupported_windows
@@ -313,6 +321,7 @@ if "%IAMS_CMAKE_OK%"=="1" goto :cmake_installed
 goto :cmake_install_failed
 
 :cmake_installed
+>>"%INSTALL_RECORD%" echo cmake
 echo CMake is now available.
 if not defined IAMS_CMAKE_BIN goto :step_msvc
 set "PATH=%IAMS_CMAKE_BIN%;%PATH%"
@@ -432,6 +441,7 @@ echo Adding the C++ workload with the Visual Studio Installer.
 echo This can take 10 to 30 minutes, and Windows will ask for
 echo administrator approval. Please wait ...
 echo.
+set "IAMS_MSVC_METHOD=msvc-workload"
 "%IAMS_VS_INSTALLER%" modify --installPath "%IAMS_VS_INSTANCE%" --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended --passive --norestart
 set "IAMS_RC=%ERRORLEVEL%"
 goto :msvc_recheck
@@ -442,6 +452,7 @@ echo Installing the Microsoft Visual Studio 2022 Build Tools with
 echo winget, including the workload "Desktop development with C++"
 echo and a Windows SDK. This is a large download - please wait ...
 echo.
+set "IAMS_MSVC_METHOD=msvc-buildtools"
 winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --accept-package-agreements --accept-source-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended"
 set "IAMS_RC=%ERRORLEVEL%"
 goto :msvc_recheck
@@ -459,6 +470,7 @@ if "%IAMS_MSVC_OK%"=="1" goto :msvc_installed
 goto :msvc_install_unverified
 
 :msvc_installed
+>>"%INSTALL_RECORD%" echo %IAMS_MSVC_METHOD%
 echo The Microsoft C++ build tools are now available.
 goto :step_venv
 
@@ -486,6 +498,7 @@ echo Nothing was changed in this project - it is safe to run again.
 goto :action_required
 
 :msvc_reboot
+>>"%INSTALL_RECORD%" echo %IAMS_MSVC_METHOD%
 echo.
 echo Windows reported that a restart is required before the new
 echo build tools can be used.
@@ -700,6 +713,9 @@ echo.
 echo run.bat starts the Streamlit server and opens
 echo http://localhost:8501 in your browser. A webcam is required
 echo for the real-time attendance page.
+echo.
+echo To remove IAMS later, run uninstall.bat - it asks before removing
+echo each part.
 echo.
 pause
 exit /b 0

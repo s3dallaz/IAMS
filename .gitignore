@@ -57,6 +57,9 @@ data/logs/*
 !data/logs/.gitkeep
 *.log
 
+# Prerequisites setup.bat installed on this PC (read by uninstall.bat)
+.iams_installed
+
 # Testing
 .pytest_cache/
 .coverage
