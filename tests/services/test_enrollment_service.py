@@ -282,3 +282,25 @@ def test_validate_and_extract_face_success(enrollment_service):
     face_crop, confidence = enrollment_service.validate_and_extract_face(_make_face_image())
     assert face_crop is not None
     assert confidence == pytest.approx(0.95)
+
+
+def test_gallery_signature_tracks_gallery_changes(enrollment_service, student_service, sample_student):
+    empty = enrollment_service.gallery_signature()
+    assert enrollment_service.gallery_signature() == empty          # stable while nothing changes
+
+    enrollment_service.add_face_sample(student_db_id=sample_student, face_image=_make_face_image())
+    one_sample = enrollment_service.gallery_signature()
+    assert one_sample != empty                                        # new sample
+
+    other = student_service.create_student(student_id="2021002", name="Jane Roe")
+    assert enrollment_service.gallery_signature() == one_sample      # a student without samples adds nothing
+
+    enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image())
+    two_students = enrollment_service.gallery_signature()
+    assert two_students != one_sample
+
+    student_service.deactivate_student(other)
+    assert enrollment_service.gallery_signature() == one_sample      # deactivated student leaves the gallery
+
+    enrollment_service.clear_student_face_dataset(sample_student)
+    assert enrollment_service.gallery_signature() == empty

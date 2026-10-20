@@ -5,7 +5,8 @@ Provides face recognition by comparing face embeddings using Euclidean distance.
 Matches query faces against a gallery of known identities.
 """
 
-from typing import Optional, List, Tuple
+from collections.abc import Sequence
+from typing import Iterable, Optional, List, Tuple, Union
 import numpy as np
 
 import config
@@ -59,6 +60,64 @@ class RecognitionResult:
         return f"RecognitionResult(identity='{self.identity}', distance={self.distance:.4f}, {match_str})"
 
 
+class FaceGallery(Sequence):
+    """
+    Gallery of known faces prepared for fast matching.
+
+    Behaves like the list of (identity, FaceEmbedding) tuples it is built
+    from, and also keeps every embedding in one (N, 128) matrix with an
+    identity code per row, so recognize() computes all distances in one
+    NumPy call instead of a Python loop (~27 ms -> <1 ms per face at 11k
+    samples). Build it once per gallery change, not per frame -
+    RealTimeAttendanceManager.set_gallery() does.
+    """
+
+    def __init__(self, entries: Iterable[Tuple[str, FaceEmbedding]]):
+        """
+        Raises:
+            ValueError: If an embedding is None or not 128-dimensional
+        """
+        self._entries = tuple(entries)
+        for idx, (identity, embedding) in enumerate(self._entries):
+            if embedding is None:
+                raise ValueError(f"Gallery embedding at index {idx} (identity '{identity}') is None")
+            if embedding.encoding.shape != (128,):
+                raise ValueError(
+                    f"Gallery embedding at index {idx} (identity '{identity}') must be "
+                    f"128-dimensional, got {embedding.encoding.shape}"
+                )
+
+        code_of = {}
+        self.codes = np.array([code_of.setdefault(identity, len(code_of)) for identity, _ in self._entries],
+                              dtype=np.int64)
+        self.identities: List[str] = list(code_of)
+        if self._entries:
+            self.matrix = np.stack([embedding.encoding for _, embedding in self._entries]).astype(np.float64)
+        else:
+            self.matrix = np.zeros((0, 128), dtype=np.float64)
+        self.sq_norms = np.einsum("ij,ij->i", self.matrix, self.matrix)
+        self.max_sq_norm = float(self.sq_norms.max()) if len(self.sq_norms) else 0.0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __getitem__(self, index):
+        return self._entries[index]
+
+    def same_content(self, other: "FaceGallery") -> bool:
+        """True if `other` holds the same identities and embeddings in the same order."""
+        return (isinstance(other, FaceGallery) and len(self) == len(other)
+                and self.identities == other.identities
+                and np.array_equal(self.codes, other.codes)
+                and np.array_equal(self.matrix, other.matrix))
+
+    def approx_sq_distances(self, query: np.ndarray) -> np.ndarray:
+        """Squared distances to every entry, |m|^2 - 2 m.q + |q|^2 (rounding error ~1e-15 * scale)."""
+        query = np.asarray(query, dtype=np.float64)
+        sq = self.sq_norms - 2.0 * (self.matrix @ query) + float(query @ query)
+        return np.maximum(sq, 0.0, out=sq)
+
+
 class FaceRecognizer:
     """
     Recognizes faces by comparing embeddings against a gallery of known identities.
@@ -105,14 +164,16 @@ class FaceRecognizer:
     def recognize(
         self,
         query_embedding: FaceEmbedding,
-        gallery: List[Tuple[str, FaceEmbedding]]
+        gallery: Union[FaceGallery, List[Tuple[str, FaceEmbedding]]]
     ) -> RecognitionResult:
         """
         Recognize a face by comparing against a gallery of known embeddings.
         
         Args:
             query_embedding: The face embedding to identify
-            gallery: List of (identity, embedding) tuples representing known faces
+            gallery: FaceGallery, or a list of (identity, embedding) tuples
+                representing known faces (prepared on every call - pass a
+                FaceGallery when recognising many faces against one gallery)
         
         Returns:
             RecognitionResult with the matched identity, distance, and match status
@@ -140,34 +201,26 @@ class FaceRecognizer:
                 reason="empty_gallery"
             )
         
-        # Validate gallery embeddings
-        for idx, (identity, embedding) in enumerate(gallery):
-            if embedding is None:
-                raise ValueError(f"Gallery embedding at index {idx} (identity '{identity}') is None")
-            if embedding.encoding.shape != (128,):
-                raise ValueError(
-                    f"Gallery embedding at index {idx} (identity '{identity}') must be "
-                    f"128-dimensional, got {embedding.encoding.shape}"
-                )
-        
-        # Compute distances to all gallery embeddings
-        distances = []
-        for identity, embedding in gallery:
-            distance = self._compute_distance(query_embedding.encoding, embedding.encoding)
-            distances.append((identity, distance))
-        
-        # Find the closest match (deterministic: first occurrence if tied)
-        best_identity, best_distance = min(distances, key=lambda x: x[1])
+        if not isinstance(gallery, FaceGallery):
+            gallery = FaceGallery(gallery)  # validates the embeddings
+
+        # All distances at once. The fast formula is only used to find the
+        # near-ties; the exact distance of those few entries (the same
+        # formula as _compute_distance) decides, so results, thresholds and
+        # tie-breaking are identical to comparing every entry one by one.
+        query = query_embedding.encoding
+        approx = gallery.approx_sq_distances(query)
+        tolerance = 1e-5 * (float(np.dot(query, query)) + gallery.max_sq_norm)
+
+        # Closest match (deterministic: first occurrence if tied)
+        best_index, best_distance = self._closest(query, gallery, approx, tolerance)
+        best_identity = gallery[best_index][0]
 
         # Best distance belonging to a DIFFERENT identity. Embeddings of the
         # same student are one identity, so the runner-up must come from
         # someone else - do not fabricate a conflict from the same person.
-        second_best_distance = float('inf')
-        for identity, distance in distances:
-            if identity == best_identity:
-                continue
-            if distance < second_best_distance:
-                second_best_distance = distance
+        others = np.where(gallery.codes != gallery.codes[best_index], approx, np.inf)
+        _, second_best_distance = self._closest(query, gallery, others, tolerance)
 
         if best_distance > self.threshold:
             self.logger.debug(
@@ -211,6 +264,30 @@ class FaceRecognizer:
             reason="matched"
         )
     
+    def _closest(
+        self,
+        query: np.ndarray,
+        gallery: FaceGallery,
+        approx_sq: np.ndarray,
+        tolerance: float
+    ) -> Tuple[Optional[int], float]:
+        """
+        Index and exact distance of the closest entry; the first one wins a tie.
+
+        Entries whose approximate squared distance is within `tolerance` of
+        the lowest are compared by exact distance; entries marked np.inf are
+        skipped. (None, inf) when every entry is skipped.
+        """
+        lowest = approx_sq.min()
+        if not np.isfinite(lowest):
+            return None, float('inf')
+        best_index, best_distance = None, float('inf')
+        for index in np.flatnonzero(approx_sq <= lowest + tolerance):
+            distance = self._compute_distance(query, gallery[index][1].encoding)
+            if distance < best_distance:
+                best_index, best_distance = int(index), distance
+        return best_index, best_distance
+
     def _compute_distance(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
         """
         Compute Euclidean distance between two face embeddings.

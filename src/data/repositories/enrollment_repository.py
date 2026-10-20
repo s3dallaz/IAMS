@@ -125,6 +125,25 @@ class EnrollmentRepository:
             logger.error(f"Database error getting all enrollments: {e}")
             raise
     
+    def get_active_gallery_keys(self) -> List[tuple]:
+        """
+        (enrollment id, encoding path, student_id) of every active sample of
+        an active student, ordered by id. Cheap compared to loading the
+        encodings: used to notice when the recognition gallery changed.
+        """
+        query = """
+            SELECT e.id, e.encoding_path, s.student_id
+            FROM enrollments e JOIN students s ON s.id = e.student_id
+            WHERE e.is_active = 1 AND s.is_active = 1
+            ORDER BY e.id
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [tuple(r) for r in conn.execute(query).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting active gallery keys: {e}")
+            raise
+
     def delete_by_student_id(self, student_id: int) -> int:
         """Delete all enrollments for a student."""
         query = "DELETE FROM enrollments WHERE student_id = ?"

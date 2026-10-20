@@ -194,6 +194,7 @@ def test_stop_releases_the_camera(running_engine):
 
 def test_gallery_is_reloaded_while_running(running_engine):
     _, _, manager, _, enrollment, _ = running_engine
+    enrollment.return_value.gallery_signature.side_effect = lambda: time.time()  # always changed
     time.sleep(0.3)
     assert manager.set_gallery.call_count >= 2       # students enrolled meanwhile are picked up
 
@@ -220,3 +221,53 @@ def test_spoof_warning_comes_before_identity_on_the_video():
     for face in (_face(is_recognized=False, identity="Unknown"), _face(already_marked=True)):
         face.reason = "Spoof suspected: face looks like a photo or screen"
         assert instruction_bar(_result(face), None, time.time())[0].startswith("SPOOF SUSPECTED")
+
+
+def test_gallery_reload_runs_off_the_frame_loop_and_only_on_changes(monkeypatch):
+    """A slow gallery load must not stop the video, and an unchanged gallery is not reloaded."""
+    camera = MagicMock()
+    camera.open.return_value = True
+    frame_times = []
+
+    def read_frame():
+        time.sleep(0.005)
+        frame_times.append(time.perf_counter())
+        return True, np.zeros((48, 64, 3), dtype=np.uint8)
+
+    camera.read_frame.side_effect = read_frame
+    manager = MagicMock()
+    manager.process_frame_async.return_value = _result()
+    signature = {"value": "v1"}
+    loads = []
+
+    def slow_load():
+        loads.append(signature["value"])
+        if len(loads) > 1:
+            time.sleep(0.5)                       # a large gallery takes seconds to load
+        return []
+
+    enrollment = MagicMock()
+    enrollment.return_value.gallery_signature.side_effect = lambda: signature["value"]
+    enrollment.return_value.load_active_gallery.side_effect = slow_load
+    monkeypatch.setattr(engine_module, "CameraManager", MagicMock(return_value=camera))
+    monkeypatch.setattr(engine_module, "RealTimeAttendanceManager", MagicMock(return_value=manager))
+    monkeypatch.setattr(engine_module, "EnrollmentService", enrollment)
+    monkeypatch.setattr(engine_module, "GALLERY_RELOAD_SECONDS", 0.05)
+
+    engine = VisionEngine(session_id=3, settings={})
+    assert engine.start()
+    loop = threading.Thread(target=engine.run, daemon=True)
+    loop.start()
+    try:
+        time.sleep(0.3)
+        assert manager.set_gallery.call_count == 1          # unchanged: only the start-up load
+        signature["value"] = "v2"                           # a student was enrolled
+        time.sleep(1.0)
+    finally:
+        engine.stop()
+        loop.join(timeout=5)
+
+    assert loads == ["v1", "v2"]
+    assert manager.set_gallery.call_count == 2
+    gaps = np.diff(frame_times)
+    assert gaps.max() < 0.25                                # the 0.5 s load did not freeze the frames

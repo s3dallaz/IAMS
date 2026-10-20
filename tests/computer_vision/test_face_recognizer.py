@@ -15,7 +15,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.computer_vision.face_embedder import FaceEmbedding
-from src.computer_vision.face_recognizer import FaceRecognizer, RecognitionResult
+from src.computer_vision.face_recognizer import FaceGallery, FaceRecognizer, RecognitionResult
 
 
 class TestRecognitionResult:
@@ -621,3 +621,120 @@ class TestRecognitionResultDiagnostics:
         assert result.identity == "Unknown"
         assert result.distance == float('inf')
         assert result.reason == "empty_gallery"
+
+
+def _reference_recognize(recognizer, query, gallery):
+    """The original one-entry-at-a-time implementation: (identity, distance, is_match, second, reason)."""
+    distances = [(identity, float(np.linalg.norm(query.encoding - emb.encoding))) for identity, emb in gallery]
+    best_identity, best_distance = min(distances, key=lambda x: x[1])
+    second = float('inf')
+    for identity, distance in distances:
+        if identity != best_identity and distance < second:
+            second = distance
+    if best_distance > recognizer.threshold:
+        return "Unknown", best_distance, False, second, "above_threshold"
+    if second - best_distance < recognizer.margin:
+        return "Unknown", best_distance, False, second, "ambiguous_match"
+    return best_identity, best_distance, True, second, "matched"
+
+
+def _unit(v):
+    return v / np.linalg.norm(v)
+
+
+class TestVectorizedRecognition:
+    """recognize() computes all distances at once but must decide exactly like the per-entry loop."""
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_matches_the_per_entry_implementation(self, seed):
+        rng = np.random.default_rng(seed)
+        centers = [_unit(rng.normal(size=128)) for _ in range(40)]
+        gallery = []
+        for i in range(400):
+            person = int(rng.integers(len(centers)))
+            enc = _unit(centers[person] + rng.normal(scale=0.35, size=128))
+            if i % 3 == 0:
+                enc = enc.astype(np.float32)              # mixed dtypes, like old dlib/SFace files
+            gallery.append((f"S{person:03d}", FaceEmbedding(enc)))
+        prepared = FaceGallery(gallery)
+        recognizer = FaceRecognizer(threshold=1.128, margin=0.1, backend="sface")
+
+        for _ in range(60):
+            person = int(rng.integers(len(centers)))
+            query = FaceEmbedding(_unit(centers[person] + rng.normal(scale=0.35, size=128)))
+            expected = _reference_recognize(recognizer, query, gallery)
+            for g in (gallery, prepared):
+                r = recognizer.recognize(query, g)
+                assert (r.identity, r.distance, r.is_match, r.second_best_distance, r.reason) == expected
+
+    def test_exact_ties_go_to_the_first_occurrence(self):
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.0)
+        enc = np.zeros(128)
+        enc[0] = 0.3
+        gallery = [("Bob", FaceEmbedding(enc.copy())), ("Alice", FaceEmbedding(enc.copy())),
+                   ("Carol", FaceEmbedding(enc.copy()))]
+
+        result = recognizer.recognize(FaceEmbedding(np.zeros(128)), FaceGallery(gallery))
+
+        assert result.identity == "Bob"
+        assert result.distance == result.second_best_distance == pytest.approx(0.3)
+        assert result.is_match is True                     # margin 0: an exact tie still passes
+
+    def test_query_equal_to_a_sample_gives_distance_zero(self):
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.1)
+        rng = np.random.default_rng(7)
+        gallery = [(f"S{i}", FaceEmbedding(rng.random(128))) for i in range(50)]
+        query = FaceEmbedding(gallery[17][1].encoding.copy())
+
+        result = recognizer.recognize(query, FaceGallery(gallery))
+
+        assert result.identity == "S17"
+        assert result.distance == 0.0
+
+    def test_runner_up_ignores_other_samples_of_the_winner(self):
+        recognizer = FaceRecognizer(threshold=0.6, margin=0.1)
+        a1, a2, b = np.zeros(128), np.zeros(128), np.zeros(128)
+        a1[0], a2[0], b[0] = 0.1, 0.12, 0.5
+        gallery = FaceGallery([("A", FaceEmbedding(a1)), ("A", FaceEmbedding(a2)), ("B", FaceEmbedding(b))])
+
+        result = recognizer.recognize(FaceEmbedding(np.zeros(128)), gallery)
+
+        assert result.identity == "A"
+        assert result.second_best_distance == pytest.approx(0.5)
+
+
+class TestFaceGallery:
+    """FaceGallery is a drop-in for the list of (identity, embedding) tuples."""
+
+    def test_behaves_like_the_list_it_was_built_from(self):
+        entries = [("A", FaceEmbedding(np.random.rand(128))), ("B", FaceEmbedding(np.random.rand(128)))]
+        gallery = FaceGallery(entries)
+
+        assert len(gallery) == 2
+        assert gallery[1] is entries[1]
+        assert list(gallery) == entries
+        assert [identity for identity, _ in gallery] == ["A", "B"]
+        assert not FaceGallery([])
+
+    def test_keeps_one_matrix_and_identity_codes(self):
+        enc = np.random.rand(128)
+        gallery = FaceGallery([("A", FaceEmbedding(enc)), ("B", FaceEmbedding(enc)), ("A", FaceEmbedding(enc))])
+
+        assert gallery.matrix.shape == (3, 128)
+        assert gallery.identities == ["A", "B"]
+        assert gallery.codes.tolist() == [0, 1, 0]
+
+    def test_invalid_embeddings_are_rejected(self):
+        with pytest.raises(ValueError, match="index 1"):
+            FaceGallery([("A", FaceEmbedding(np.random.rand(128))), ("B", None)])
+
+    def test_same_content(self):
+        rng = np.random.default_rng(3)
+        entries = [(f"S{i}", FaceEmbedding(rng.random(128))) for i in range(5)]
+        gallery = FaceGallery(entries)
+
+        assert gallery.same_content(FaceGallery([(i, FaceEmbedding(e.encoding.copy())) for i, e in entries]))
+        assert not gallery.same_content(FaceGallery(entries[:4]))
+        assert not gallery.same_content(FaceGallery([("X", entries[0][1])] + entries[1:]))
+        changed = entries[:4] + [("S4", FaceEmbedding(rng.random(128)))]
+        assert not gallery.same_content(FaceGallery(changed))

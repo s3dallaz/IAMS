@@ -6,6 +6,7 @@ persisting embeddings to disk/database, updating face datasets for changed appea
 and constructing the active recognition gallery.
 """
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
@@ -352,6 +353,18 @@ class EnrollmentService:
                 
         logger.info(f"Loaded active recognition gallery with {len(gallery)} face samples ({backend})")
         return gallery
+
+    def gallery_signature(self) -> str:
+        """
+        Fingerprint of what load_active_gallery() would load: changes when a
+        sample is added, removed or (de)activated, or a student is
+        (de)activated or renamed. One SQL query (~tens of ms), while loading
+        the gallery reads every encoding file (~2.6 s for 11,000 samples).
+        """
+        digest = hashlib.blake2b(self._gallery_backend().encode(), digest_size=16)
+        for key in self.enrollment_repo.get_active_gallery_keys():
+            digest.update(repr(key).encode())
+        return digest.hexdigest()
 
     def _gallery_backend(self) -> str:
         """Embedding model of the gallery: the embedder's, or SFace if configured and available."""

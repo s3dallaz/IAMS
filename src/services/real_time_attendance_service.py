@@ -24,7 +24,7 @@ import numpy as np
 
 from src.computer_vision.face_detector import FaceDetector, DetectedFace
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding, FaceEmbeddingError
-from src.computer_vision.face_recognizer import FaceRecognizer, RecognitionResult
+from src.computer_vision.face_recognizer import FaceGallery, FaceRecognizer, RecognitionResult
 from src.computer_vision.detection_diagnostics import get_diagnostics
 from src.computer_vision.spoof_detection import AntiSpoofDetector, ScreenDetector, crop_around_face
 from src.computer_vision.liveness_detector import (
@@ -289,8 +289,9 @@ class RealTimeAttendanceManager:
         self.marked_by = marked_by
         self.head_turn_angle = head_turn_angle
 
-        # In-memory student gallery for face recognition: List[Tuple[str, FaceEmbedding]]
-        self._gallery: List[Tuple[str, FaceEmbedding]] = []
+        # In-memory student gallery for face recognition: (identity, FaceEmbedding)
+        # entries, prepared for fast matching
+        self._gallery: FaceGallery = FaceGallery([])
 
         # Active session state & in-memory caches for fast frame processing
         self._session_id: Optional[int] = None
@@ -396,19 +397,26 @@ class RealTimeAttendanceManager:
         """
         Set the known student gallery for face recognition.
 
+        Safe to call from another thread: the prepared gallery is swapped in
+        with one assignment, so the recognition worker sees either the old or
+        the new gallery, never a half-built one.
+
         Args:
-            gallery: List of (identity_string, FaceEmbedding) tuples
+            gallery: List of (identity_string, FaceEmbedding) tuples, or a FaceGallery
         """
         if gallery is None:
-            self._gallery = []
-        else:
-            self._gallery = list(gallery)
-        # Identities may have changed (enrolment / deactivation): re-recognise
-        self._tracked_face = None
-        logger.info(f"Gallery updated with {len(self._gallery)} identities")
+            gallery = []
+        new_gallery = gallery if isinstance(gallery, FaceGallery) else FaceGallery(gallery)
+        unchanged = new_gallery.same_content(self._gallery)
+        self._gallery = new_gallery
+        if not unchanged:
+            # Identities may have changed (enrolment / deactivation): re-recognise
+            self._tracked_face = None
+        logger.info(f"Gallery updated with {len(self._gallery)} face samples"
+                    + (" (unchanged)" if unchanged else ""))
 
-    def get_gallery(self) -> List[Tuple[str, FaceEmbedding]]:
-        """Get the current student gallery."""
+    def get_gallery(self) -> FaceGallery:
+        """Get the current student gallery (a sequence of (identity, FaceEmbedding))."""
         return self._gallery
 
     # ------------------------------------------------------------------------
@@ -820,7 +828,8 @@ class RealTimeAttendanceManager:
         distance = float('inf')
         embedding_ok = False
 
-        if face_crop.size == 0 or len(self._gallery) == 0:
+        gallery = self._gallery  # one snapshot, even if the gallery is swapped meanwhile
+        if face_crop.size == 0 or len(gallery) == 0:
             return identity, is_recognized, distance, embedding_ok
 
         try:
@@ -838,7 +847,7 @@ class RealTimeAttendanceManager:
             if embedding is not None:
                 embedding_ok = True
                 with time_operation("face_recognition"):
-                    rec_result = face_recognizer.recognize(embedding, self._gallery)
+                    rec_result = face_recognizer.recognize(embedding, gallery)
                 if rec_result.is_match and rec_result.identity != "Unknown":
                     identity = rec_result.identity
                     is_recognized = True

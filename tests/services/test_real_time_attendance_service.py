@@ -203,6 +203,20 @@ def test_gallery_management():
     assert manager.get_gallery()[0][0] == "2021001"
 
 
+def test_reloading_an_unchanged_gallery_keeps_the_tracked_face():
+    """A periodic reload with the same samples must not force re-recognition; a changed one must."""
+    manager = RealTimeAttendanceManager()
+    enc = np.random.rand(128)
+    manager.set_gallery([("2021001", FaceEmbedding(enc))])
+
+    manager._tracked_face = {"identity": "2021001"}
+    manager.set_gallery([("2021001", FaceEmbedding(enc.copy()))])
+    assert manager._tracked_face is not None
+
+    manager.set_gallery([("2021001", FaceEmbedding(enc)), ("2021002", FaceEmbedding(np.random.rand(128)))])
+    assert manager._tracked_face is None
+
+
 # ============================================================================
 # Test Frame Processing - Valid Active Session & Live Recognized Face
 # ============================================================================
