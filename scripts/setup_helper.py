@@ -45,7 +45,8 @@ detect-msvc         Check the components dlib actually needs - the MSVC
 verify-install      Import every runtime-critical package and exit 0 only
                     if all of them import successfully. Prints one line per
                     package so failures are immediately diagnosable.
-                    Pass --quiet for a silent exit-code-only check.
+                    Pass --quiet for a silent exit-code-only check, and
+                    --with-dlib to also check the optional dlib recogniser.
 
 Exit codes: 0 = OK, 1 = failed / warning, 2 = unsupported or usage error.
 """
@@ -73,7 +74,6 @@ MIN_FREE_DISK_GB = 15.0
 CRITICAL_PACKAGES = [
     ("streamlit", "streamlit", "streamlit"),
     ("cv2", "opencv-python", "opencv-python"),
-    ("face_recognition", "face-recognition", "face-recognition"),
     ("mediapipe", "mediapipe", "mediapipe"),
     ("numpy", "numpy", "numpy"),
     ("pandas", "pandas", "pandas"),
@@ -81,11 +81,21 @@ CRITICAL_PACKAGES = [
     ("fpdf", "fpdf2", "fpdf2"),
     ("dotenv", "python-dotenv", "python-dotenv"),
     ("requests", "requests", "requests"),
+]
+
+# Optional dlib recogniser (requirements-dlib.txt, setup.bat --with-dlib);
+# checked only by `verify-install --with-dlib`.
+DLIB_PACKAGES = [
+    ("face_recognition", "face-recognition", "face-recognition (dlib)"),
     # face_recognition_models does `from pkg_resources import resource_filename`
     # at import time, so the venv must contain a setuptools that still ships
     # pkg_resources (setuptools < 81).
     (None, "setuptools", "setuptools (provides pkg_resources)"),
 ]
+
+# A project folder path longer than this can push files deep inside .venv
+# past Windows' 260-character path limit (unless long paths are enabled).
+LONG_PATH_WARNING = 100
 
 
 def _installed_version(distribution_name):
@@ -258,9 +268,31 @@ def check_windows(argv):
         print("WARNING: only %.1f GB free on %s." % (free_gb, drive or "this drive"))
         print("         The Microsoft C++ build tools need roughly 3 to 7 GB")
         print("         when they have to be installed.")
+    if len(root) > LONG_PATH_WARNING and not _long_paths_enabled():
+        warning = True
+        print()
+        print("WARNING: the project folder path is %d characters long:" % len(root))
+        print("           %s" % root)
+        print("         Files deep inside .venv can then exceed Windows' 260-")
+        print("         character path limit, and package installs fail with")
+        print("         'No such file or directory' or 'legacy-install-failure'.")
+        print("         Move the project to a short folder such as C:\\IAMS - when")
+        print("         unzipping, do not extract into a folder of the same name.")
     if not warning and not quiet:
         print("Result        : this PC meets the basic requirements.")
     return 1 if warning else 0
+
+
+def _long_paths_enabled():
+    """True when Windows long paths (LongPathsEnabled) are switched on."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SYSTEM\CurrentControlSet\Control\FileSystem")
+        value, _ = winreg.QueryValueEx(key, "LongPathsEnabled")
+        return value == 1
+    except Exception:
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -579,8 +611,9 @@ def verify_install(argv):
     # warning is expected and should not pollute the setup output.
     warnings.filterwarnings("ignore")
 
+    packages = CRITICAL_PACKAGES + (DLIB_PACKAGES if "--with-dlib" in argv else [])
     failures = []
-    for module_name, distribution_name, label in CRITICAL_PACKAGES:
+    for module_name, distribution_name, label in packages:
         try:
             if module_name is None:
                 module = __import__("pkg_resources")
@@ -607,14 +640,14 @@ def verify_install(argv):
             print("  - 'No module named pkg_resources': the venv contains")
             print("    setuptools >= 81 which removed pkg_resources; setup.bat")
             print("    installs 'setuptools<81' from requirements.txt to fix this.")
-            print("  - dlib / face-recognition build errors: the Microsoft C++")
-            print("    build tools and CMake are needed (see README.md).")
+            print("  - dlib / face-recognition (only with --with-dlib): compiling")
+            print("    dlib needs the Microsoft C++ build tools and CMake (see README.md).")
         return 1
 
     if not quiet:
         print()
         print("All %d critical packages imported successfully."
-              % len(CRITICAL_PACKAGES))
+              % len(packages))
     return 0
 
 

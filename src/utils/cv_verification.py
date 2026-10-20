@@ -49,7 +49,9 @@ def verify_cv_dependencies() -> Dict[str, Any]:
         }
         results['all_available'] = False
     
-    # Check face_recognition
+    # Check face_recognition - optional since recognition uses OpenCV SFace
+    # (only FACE_RECOGNITION_BACKEND=dlib needs it), so it does not affect
+    # all_available
     try:
         import face_recognition
         results['dependencies']['face_recognition'] = {
@@ -63,10 +65,10 @@ def verify_cv_dependencies() -> Dict[str, Any]:
         results['dependencies']['face_recognition'] = {
             'installed': False,
             'version': None,
-            'error': error_msg
+            'error': error_msg,
+            'optional': True
         }
-        results['all_available'] = False
-    
+
     # Check MediaPipe
     try:
         import mediapipe

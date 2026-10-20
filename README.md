@@ -19,9 +19,9 @@ This project is an AI-powered attendance system that automates student attendanc
 ## 🧠 Technologies Used
 
 * Python 3.10 (see Python version note below)
-* OpenCV
-* face_recognition (dlib-based)
-* MediaPipe
+* OpenCV (YuNet face detection, SFace face recognition, MiniFASNet anti-spoofing)
+* MediaPipe (face landmarks for blink / head-turn liveness, phone/screen detection)
+* face_recognition (dlib) - optional legacy recogniser, see `requirements-dlib.txt`
 * NumPy & Pandas
 * SQLite
 * Streamlit (for UI)
@@ -32,14 +32,11 @@ This project is an AI-powered attendance system that automates student attendanc
 |---------|--------|-------|
 | **3.10** | ✅ **Recommended, verified** | Tested end-to-end on this project's development machine |
 | 3.11, 3.12 | 🟡 Constraint-checked, untested | Every pinned dependency publishes compatible Windows wheels, but this combination has not been run on a real machine |
-| 3.13+ | ❌ Not supported | `face_recognition` installation/imports fail; see `PHASE_2A_INSTALLATION_NOTES.txt` for the 3.14 failure details |
+| 3.13+ | ❌ Not supported | untested; the optional `face_recognition` (dlib) failed on 3.14, see `PHASE_2A_INSTALLATION_NOTES.txt` |
 
 Use the 64-bit installer from [python.org](https://www.python.org/downloads/windows/) and tick **Add Python to PATH**. `setup.bat` probes for 3.10 first, then 3.11 and 3.12.
 
-Two facts worth knowing:
-
-* `face_recognition_models` imports `pkg_resources` at runtime, which **setuptools 81+ removed**. `requirements.txt` therefore pins `setuptools>=65.5.0,<81`; Python 3.12+ virtual environments ship without setuptools at all, so this pin is what makes the import work there.
-* dlib publishes **no prebuilt Windows wheels** — it compiles from source during setup (see prerequisites below).
+Every package in `requirements.txt` installs from a prebuilt wheel, so **no C++ compiler or CMake is needed**. Face recognition uses OpenCV's SFace model. The previous dlib recogniser is optional (`requirements-dlib.txt`, `setup.bat --with-dlib`); dlib publishes no prebuilt Windows wheels and must be compiled, and `face_recognition_models` needs `setuptools<81` for `pkg_resources`.
 
 ## 📦 Quick Start (Windows)
 
@@ -48,13 +45,13 @@ Two facts worth knowing:
 - Windows 10/11, 64-bit
 - Python 3.10 (recommended) added to PATH — or let `setup.bat` install it for you after asking
 - A webcam, and Windows camera permission enabled for desktop apps
-- **Microsoft C++ Build Tools + CMake** — required because dlib has **no prebuilt Windows wheels** and is compiled from source. They are only needed while the environment is being built, and `setup.bat` asks before installing them:
+- **Only for the optional dlib recogniser** (`setup.bat --with-dlib`): Microsoft C++ Build Tools + CMake, because dlib has **no prebuilt Windows wheels** and is compiled from source. Not needed for a normal installation. `setup.bat --with-dlib` checks for them and asks before installing:
   ```cmd
   winget install --id Kitware.CMake
   winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended"
   ```
-  The Build Tools download is **large (roughly 3–7 GB, 10–30 minutes), requires administrator approval (UAC) and may require a restart**. If you install them by hand with the graphical installer, select the **"Desktop development with C++"** workload: installing the Build Tools *product* without that workload is not enough, because dlib needs the MSVC compiler (`cl.exe`), the linker (`link.exe`) and a Windows SDK. `setup.bat` verifies those components specifically, not just the presence of the product.
-- Extract the project to a **local folder** (e.g. `C:\Projects\attendance-system`). Avoid OneDrive-synced folders — background syncing can corrupt a virtual environment mid-install.
+  The Build Tools download is **large (roughly 3–7 GB), requires administrator approval (UAC) and may require a restart**; with the graphical installer select the **"Desktop development with C++"** workload.
+- Extract the project to a **short local folder** (e.g. `C:\IAMS`). Avoid OneDrive-synced folders — background syncing can corrupt a virtual environment mid-install — and do not extract a ZIP into a folder of the same name: a long path can push files inside `.venv` past Windows' 260-character limit. `setup.bat` warns when the path is too long.
 
 ### Automated Setup & Launch
 
@@ -68,11 +65,11 @@ Two facts worth knowing:
 
    1. Windows / free-disk-space check (64-bit required)
    2. Python — probes for 3.10, then 3.11/3.12; offers `winget install Python.Python.3.10` if none is found
-   3. CMake — checked on PATH, in the standard folders and in the copy shipped with Visual Studio
-   4. Microsoft C++ build tools — checks the real components (`cl.exe`, `link.exe`, a Windows SDK), not just whether a Build Tools product exists
-   5. `.venv` — created, or validated and reused; a broken `.venv` (e.g. built with Python 3.14) is only removed after you confirm
-   6. Runtime packages from `requirements.txt` — skipped entirely when the environment is already healthy
-   7. Final import check of every critical package, including `face_recognition` and `pkg_resources`
+   3. CMake — skipped unless `setup.bat --with-dlib` (optional dlib recogniser)
+   4. Microsoft C++ build tools — skipped unless `--with-dlib`; then it checks the real components (`cl.exe`, `link.exe`, a Windows SDK)
+   5. `.venv` — created, or validated and reused; a broken `.venv` (wrong Python, or damaged package files after an interrupted install) is only removed after you confirm
+   6. Runtime packages from `requirements.txt` (plus `requirements-dlib.txt` with `--with-dlib`) — skipped entirely when the environment is already healthy
+   7. Final import check of every critical package
 
    For every missing prerequisite the script prints the software name, why IAMS needs it, whether it is required or optional, whether administrator approval / a large download / a restart may be needed, and then asks **`Would you like the setup script to install this prerequisite now? (Y/N)`**. It never bypasses UAC or installer consent, and it never installs silently.
 
@@ -80,7 +77,7 @@ Two facts worth knowing:
    * Installation is verified by **re-detecting the actual components**, not by trusting the installer. If a prerequisite cannot be confirmed afterwards, setup says so and tells you what to do instead of reporting success.
    * If a **restart** or a **new terminal** is needed, setup stops cleanly — restart, open a new Command Prompt in the project folder, and run `setup.bat` again; it continues from that step.
 
-   The first run compiles dlib from source and can take **10–30 minutes** depending on the machine; later runs take about a minute. Exit codes: `0` = success, `1` = stopped or failed, `2` = a restart or a new terminal is needed. The script is safe to re-run at any time and never touches databases, face encodings, or student data — those live in `data/` and are created on first launch.
+   The first run downloads the packages and takes a few minutes (nothing is compiled; with `--with-dlib` compiling dlib adds 10–30 minutes); later runs take about a minute. Exit codes: `0` = success, `1` = stopped or failed, `2` = a restart or a new terminal is needed. The script is safe to re-run at any time and never touches databases, face encodings, or student data — those live in `data/` and are created on first launch.
 
 3. **Launch Application**:
    ```cmd
@@ -175,7 +172,12 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 
 ## 🐛 Troubleshooting
 
-### `dlib` build fails during `setup.bat`
+### Package installation fails with `No such file or directory` or `legacy-install-failure`
+- **Cause:** the project folder path is too long (for example a ZIP extracted into a folder of the same name), so files inside `.venv` exceed Windows' 260-character path limit
+- **Fix:** move the project to a short folder such as `C:\IAMS`, delete `.venv` there, and run `setup.bat` again
+
+### `dlib` build fails during `setup.bat --with-dlib`
+- **Note:** only the optional dlib recogniser needs this; a normal `setup.bat` does not compile anything
 - **Cause:** dlib has no prebuilt Windows wheels, so pip compiles it from source — this requires the Microsoft C++ Build Tools and CMake
 - **Fix:** re-run `setup.bat`; it detects the missing CMake / C++ components and offers to install them for you. `setup.bat` uses only official methods:
   ```cmd
@@ -185,9 +187,9 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
   In the Build Tools graphical installer, add the **"Desktop development with C++"** workload (with an MSVC v143 toolset and a Windows 11 SDK), then re-run `setup.bat`. Make sure CMake is on PATH or available to pip.
 - **Note:** installing CMake or the Build Tools may require a **restart**. If so, `setup.bat` stops and tells you; restart, open a **new** terminal and run `setup.bat` again — it resumes from there.
 
-### `No module named pkg_resources`
+### `No module named pkg_resources` (only with the optional dlib recogniser)
 - **Cause:** the virtual environment contains setuptools 81+ (which removed `pkg_resources`) or no setuptools at all
-- **Fix:** re-run `setup.bat` — it installs `setuptools>=65.5.0,<81` from `requirements.txt`. Manually: `.venv\Scripts\python.exe -m pip install "setuptools>=65.5.0,<81"`
+- **Fix:** re-run `setup.bat --with-dlib` — it installs `setuptools>=65.5.0,<81` from `requirements-dlib.txt`. Manually: `.venv\Scripts\python.exe -m pip install "setuptools>=65.5.0,<81"`
 
 ### `setup.bat` reports an unsupported Python version
 - **Cause:** only Python 3.13+ was found on the machine

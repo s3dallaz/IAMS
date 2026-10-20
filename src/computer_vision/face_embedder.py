@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 import cv2
 import numpy as np
-import face_recognition
+
+try:
+    import face_recognition  # optional: only the dlib backend uses it
+except ImportError:  # requirements-dlib.txt not installed
+    face_recognition = None
 
 import config
 
@@ -82,6 +86,13 @@ class FaceEmbedder:
             except Exception as e:
                 self.logger.warning(f"SFace model unavailable ({e}); using dlib face encodings")
                 self.backend = "dlib"
+        if self.backend == "dlib" and face_recognition is None:
+            raise RuntimeError(
+                "Face recognition is unavailable: the SFace model "
+                f"({config.SFACE_MODEL_PATH.name}) is missing and the optional dlib "
+                "recogniser is not installed. Restore the model file, or install "
+                "dlib with: setup.bat --with-dlib"
+            )
         self.logger.info(f"FaceEmbedder initialized ({self.backend})")
 
     def generate_embedding_from_frame(self, frame: np.ndarray, face) -> Optional[FaceEmbedding]:

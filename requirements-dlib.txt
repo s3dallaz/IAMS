@@ -1,0 +1,13 @@
+# OPTIONAL: the previous dlib face recogniser (FACE_RECOGNITION_BACKEND=dlib).
+#
+# IAMS recognises faces with OpenCV SFace by default and does not need
+# these packages. dlib has no prebuilt Windows wheels: pip compiles it from
+# source, which needs CMake and the Microsoft C++ Build Tools ("Desktop
+# development with C++"). Install with:  setup.bat --with-dlib
+# (or: .venv\Scripts\python.exe -m pip install -r requirements-dlib.txt)
+-r requirements.txt
+face-recognition>=1.3.0,<1.4.0
+# face_recognition_models imports pkg_resources at runtime, which was
+# removed from setuptools 81+. Python 3.12+ virtual environments ship
+# without setuptools at all, so this requirement guarantees pkg_resources.
+setuptools>=65.5.0,<81.0

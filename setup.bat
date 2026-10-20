@@ -37,6 +37,14 @@ REM the dlib build fails with: Could not find the compiler specified in the
 REM environment variable RC. Clear it for this setup session only.
 set "RC="
 
+REM The dlib face recogniser is optional - IAMS uses OpenCV SFace, which
+REM needs no C++ compiler. "setup.bat --with-dlib" also installs dlib from
+REM requirements-dlib.txt, which needs CMake and the C++ build tools.
+set "IAMS_WITH_DLIB=0"
+if /i "%~1"=="--with-dlib" set "IAMS_WITH_DLIB=1"
+set "DLIB_FLAG="
+if "%IAMS_WITH_DLIB%"=="1" set "DLIB_FLAG=--with-dlib"
+
 set "PY_CMD="
 set "BUILD_NEEDED=1"
 set "ANS="
@@ -60,9 +68,9 @@ echo Welcome. This setup checks this PC step by step:
 echo.
 echo   1. Windows 64-bit and free disk space
 echo   2. Python - version 3.10 is recommended
-echo   3. CMake - only needed when dlib has to be compiled
-echo   4. Microsoft C++ build tools - only needed when dlib has
-echo      to be compiled
+echo   3. CMake - only for the optional dlib recogniser
+echo   4. Microsoft C++ build tools - only for the optional dlib
+echo      recogniser: setup.bat --with-dlib
 echo   5. The project virtual environment .venv
 echo   6. The Python packages from requirements.txt
 echo   7. A final import check of every critical package
@@ -218,6 +226,20 @@ echo ------------------------------------------------------------
 echo [2/7] Checking CMake
 echo ------------------------------------------------------------
 echo.
+if "%IAMS_WITH_DLIB%"=="1" goto :dlib_requested
+echo   Skipped - not needed. Face recognition uses OpenCV SFace, and
+echo   every package installs prebuilt: nothing is compiled.
+echo   CMake and the C++ build tools are only needed for the optional
+echo   dlib recogniser: setup.bat --with-dlib
+echo.
+echo ------------------------------------------------------------
+echo [3/7] Checking the Microsoft C++ build tools
+echo ------------------------------------------------------------
+echo.
+echo   Skipped - not needed, for the same reason.
+goto :step_venv
+
+:dlib_requested
 set "BUILD_NEEDED=1"
 if not exist ".venv\Scripts\python.exe" goto :build_needed
 ".venv\Scripts\python.exe" "%HELPER%" check-python --quiet >nul 2>&1
@@ -589,22 +611,22 @@ echo [5/7] Installing the Python packages
 echo ------------------------------------------------------------
 echo.
 echo Checking whether the environment is already complete ...
-".venv\Scripts\python.exe" "%HELPER%" verify-install --quiet >nul 2>&1
+".venv\Scripts\python.exe" "%HELPER%" verify-install --quiet %DLIB_FLAG% >nul 2>&1
 if not errorlevel 1 goto :packages_ready
 echo Some of the required packages are still missing in .venv.
 echo.
 echo Packages      : the runtime dependencies from requirements.txt,
 echo                 for example streamlit, opencv, mediapipe, numpy,
-echo                 pandas, Pillow, fpdf2 and face-recognition.
-echo                 dlib is compiled from source here - that is the
-echo                 slow part and it needs the C++ build tools.
+echo                 pandas, Pillow and fpdf2 - all prebuilt, nothing
+echo                 is compiled. With --with-dlib also the optional
+echo                 dlib recogniser, which is compiled from source.
 echo Why IAMS needs them:
 echo                 they are the libraries the application imports
 echo                 when it starts.
 echo Status        : REQUIRED to run IAMS.
 echo Permissions   : none - they are installed into the project
 echo                 folder only, never system-wide.
-echo Time          : a few minutes, longer when dlib is compiled.
+echo Time          : a few minutes - longer with --with-dlib.
 echo.
 set "ANS="
 set /p ANS="Would you like the setup script to install the project packages now? (Y/N) "
@@ -615,6 +637,12 @@ echo Installing the packages into .venv. Please wait ...
 if errorlevel 1 echo WARNING: pip could not be upgraded - continuing with the bundled pip.
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto :install_failed
+if not "%IAMS_WITH_DLIB%"=="1" goto :install_done
+echo.
+echo Installing the optional dlib recogniser - compiling dlib now ...
+".venv\Scripts\python.exe" -m pip install -r requirements-dlib.txt
+if errorlevel 1 goto :install_failed
+:install_done
 echo Packages installed.
 goto :verify
 
@@ -637,11 +665,13 @@ goto :fail
 echo.
 echo SETUP FAILED - installing the packages failed. The reason is in
 echo the output above. The most common causes:
-echo   - dlib has no prebuilt Windows wheels and is compiled from
-echo     source. This needs the Microsoft C++ build tools and CMake:
+echo   - A very long project folder path. Move the project to a short
+echo     folder such as C:\IAMS and run setup.bat there.
+echo   - No internet connection, or PyPI is blocked by a firewall.
+echo   - Only with --with-dlib: dlib is compiled from source, which
+echo     needs the Microsoft C++ build tools and CMake:
 echo         winget install --id Microsoft.VisualStudio.2022.BuildTools
 echo     and select the workload "Desktop development with C++".
-echo   - No internet connection, or PyPI is blocked by a firewall.
 echo   - An unsupported Python version - see README.md.
 echo.
 echo After fixing the cause, run setup.bat again.
@@ -656,7 +686,7 @@ echo ------------------------------------------------------------
 echo [6/7] Verifying the installation
 echo ------------------------------------------------------------
 echo.
-".venv\Scripts\python.exe" "%HELPER%" verify-install
+".venv\Scripts\python.exe" "%HELPER%" verify-install %DLIB_FLAG%
 if errorlevel 1 goto :verify_failed
 
 echo.

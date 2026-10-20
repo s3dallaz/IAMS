@@ -7,8 +7,13 @@
 #
 # Supported Python: 3.10 (verified on this project), 3.11 and 3.12
 # (dependency constraints checked against PyPI wheel metadata, not
-# machine-tested). Python 3.13+ is NOT supported - face_recognition failed
-# to install on 3.14; see PHASE_2A_INSTALLATION_NOTES.txt.
+# machine-tested).
+#
+# Every package here installs from a prebuilt wheel: no C++ compiler or
+# CMake is needed. Face recognition uses OpenCV's YuNet + SFace models.
+# The previous dlib recogniser (face_recognition) is optional and lives in
+# requirements-dlib.txt (setup.bat --with-dlib); it must be compiled from
+# source and is only needed for FACE_RECOGNITION_BACKEND=dlib.
 #
 # Test-only tools live in requirements-dev.txt and are not needed to run
 # the application.
@@ -27,12 +32,6 @@ opencv-python>=5.0.0.93,<6.0.0
 # lockstep: the identical range guarantees matching builds.
 opencv-contrib-python>=5.0.0.93,<6.0.0
 mediapipe>=1.0.1,<1.1.0
-face-recognition>=1.3.0,<1.4.0
-# face_recognition_models imports pkg_resources at runtime, which was
-# removed from setuptools 81+. Python 3.12+ virtual environments ship
-# without setuptools at all, so this requirement guarantees pkg_resources
-# exists everywhere. Already-satisfied bundled setuptools is left alone.
-setuptools>=65.5.0,<81.0
 
 # --- Data / numerics ---------------------------------------------------
 numpy>=2.2.6,<3.0.0
