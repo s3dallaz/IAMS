@@ -31,10 +31,16 @@ set "ENVDIR=%TEMP%\iams_setup"
 set "CMAKE_ENV=%ENVDIR%\cmake_env.bat"
 set "MSVC_ENV=%ENVDIR%\msvc_env.bat"
 
+REM An RC environment variable (set by this script in older versions, or
+REM inherited from Windows) makes CMake use it as the resource compiler and
+REM the dlib build fails with: Could not find the compiler specified in the
+REM environment variable RC. Clear it for this setup session only.
+set "RC="
+
 set "PY_CMD="
 set "BUILD_NEEDED=1"
 set "ANS="
-set "RC=0"
+set "IAMS_RC=0"
 set "HAVE_WINGET="
 set "IAMS_CMAKE_OK="
 set "IAMS_CMAKE_BIN="
@@ -142,7 +148,7 @@ goto :python_declined
 echo.
 echo Installing Python 3.10 with winget. Please wait ...
 winget install --id Python.Python.3.10 --exact --accept-package-agreements --accept-source-agreements
-set "RC=%ERRORLEVEL%"
+set "IAMS_RC=%ERRORLEVEL%"
 echo.
 echo Re-checking whether Python is now available ...
 py -3.10 "%HELPER%" check-python --quiet >nul 2>&1
@@ -168,7 +174,7 @@ goto :step_cmake
 :python_install_unverified
 echo.
 echo SETUP STOPPED - Python could not be confirmed as installed.
-echo The winget command returned exit code %RC%.
+echo The winget command returned exit code %IAMS_RC%.
 echo.
 echo What to do next:
 echo   1. If an installation window asked you to restart, restart
@@ -274,7 +280,7 @@ goto :cmake_declined
 echo.
 echo Installing CMake with winget. Please wait ...
 winget install --id Kitware.CMake --exact --accept-package-agreements --accept-source-agreements
-set "RC=%ERRORLEVEL%"
+set "IAMS_RC=%ERRORLEVEL%"
 echo.
 echo Re-checking CMake ...
 %PY_CMD% "%HELPER%" detect-cmake --quiet --env-file "%CMAKE_ENV%" >nul 2>&1
@@ -293,7 +299,7 @@ goto :step_msvc
 :cmake_install_failed
 echo.
 echo SETUP STOPPED - CMake could not be confirmed as installed.
-echo The winget command returned exit code %RC%.
+echo The winget command returned exit code %IAMS_RC%.
 echo.
 echo What to do next:
 echo   1. Read the winget output above. A cancelled administrator
@@ -405,7 +411,7 @@ echo This can take 10 to 30 minutes, and Windows will ask for
 echo administrator approval. Please wait ...
 echo.
 "%IAMS_VS_INSTALLER%" modify --installPath "%IAMS_VS_INSTANCE%" --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended --passive --norestart
-set "RC=%ERRORLEVEL%"
+set "IAMS_RC=%ERRORLEVEL%"
 goto :msvc_recheck
 
 :msvc_winget
@@ -415,7 +421,7 @@ echo winget, including the workload "Desktop development with C++"
 echo and a Windows SDK. This is a large download - please wait ...
 echo.
 winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --accept-package-agreements --accept-source-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended"
-set "RC=%ERRORLEVEL%"
+set "IAMS_RC=%ERRORLEVEL%"
 goto :msvc_recheck
 
 :msvc_recheck
@@ -437,9 +443,9 @@ goto :step_venv
 :msvc_install_unverified
 echo.
 echo SETUP STOPPED - the C++ build tools could not be confirmed.
-echo The installer returned exit code %RC%.
-if "%RC%"=="3010" goto :msvc_reboot
-if "%RC%"=="1641" goto :msvc_reboot
+echo The installer returned exit code %IAMS_RC%.
+if "%IAMS_RC%"=="3010" goto :msvc_reboot
+if "%IAMS_RC%"=="1641" goto :msvc_reboot
 echo.
 echo What to do next:
 echo   1. If the Visual Studio Installer window is still open, let it
@@ -521,7 +527,7 @@ goto :venv_ready
 
 :venv_exists
 echo Found an existing virtual environment - validating it ...
-".venv\Scripts\python.exe" "%HELPER%" check-python --quiet >nul 2>&1
+".venv\Scripts\python.exe" "%HELPER%" check-venv
 if errorlevel 1 goto :venv_broken
 echo The existing virtual environment is usable and will be reused.
 goto :venv_ready
@@ -535,8 +541,9 @@ goto :fail
 
 :venv_broken
 echo.
-echo The existing .venv is broken or was created with an unsupported
-echo Python version, for example 3.14.
+echo The existing .venv is broken (see the reason above), for example
+echo damaged package files after an interrupted install, or it was
+echo created with an unsupported Python version such as 3.14.
 echo.
 echo Safe recovery - remove ONLY the virtual environment and let
 echo setup.bat recreate it:

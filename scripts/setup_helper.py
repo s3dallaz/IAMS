@@ -13,6 +13,13 @@ check-python        Exit 0 when THIS interpreter is supported by the
                     Pass --quiet to suppress the success line (used while
                     probing several interpreters).
 
+check-venv          Run by the project .venv interpreter: exit 0 when it
+                    is a supported Python AND no installed package is
+                    damaged (a *.dist-info folder without its METADATA
+                    file, left by an interrupted install - pip then fails
+                    with "No such file or directory: ...METADATA").
+                    Exit 1 otherwise, printing the reason.
+
 check-windows       Report the Windows version, the CPU architecture and the
                     free disk space of the project drive.
                     Exit 0 = fine, 1 = warning (low disk space / ARM64),
@@ -173,6 +180,36 @@ def check_python(argv):
     print("       https://www.python.org/downloads/windows/")
     print("       (tick 'Add Python to PATH' in the installer).")
     return 1
+
+
+def check_venv(argv):
+    """Supported Python and no damaged package metadata in this environment."""
+    if check_python(["--quiet"]) != 0:
+        print("The .venv was created with Python %d.%d, which is not supported."
+              % sys.version_info[:2])
+        return 1
+
+    import sysconfig
+    damaged = []
+    for key in ("purelib", "platlib"):
+        folder = sysconfig.get_paths().get(key)
+        if not folder or not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            if (name.endswith(".dist-info") and os.path.isdir(path)
+                    and not os.path.isfile(os.path.join(path, "METADATA"))
+                    and name not in damaged):
+                damaged.append(name)
+    if damaged:
+        print("The .venv has damaged package installs (METADATA file missing),")
+        print("usually left by an interrupted install or removed by antivirus:")
+        for name in damaged[:10]:
+            print("    " + name)
+        if len(damaged) > 10:
+            print("    ... and %d more" % (len(damaged) - 10))
+        return 1
+    return 0
 
 
 # ----------------------------------------------------------------------
@@ -582,6 +619,7 @@ def verify_install(argv):
 
 
 COMMANDS = {
+    "check-venv": check_venv,
     "check-python": check_python,
     "check-windows": check_windows,
     "check-dlib": check_dlib,
@@ -595,7 +633,7 @@ def main(argv):
     if not argv or argv[0] not in COMMANDS:
         print(__doc__)
         print("usage: setup_helper.py "
-              "{check-python|check-windows|check-dlib|detect-cmake|"
+              "{check-python|check-venv|check-windows|check-dlib|detect-cmake|"
               "detect-msvc|verify-install} [--quiet] [--env-file PATH]")
         return 2
     return COMMANDS[argv[0]](argv[1:])
