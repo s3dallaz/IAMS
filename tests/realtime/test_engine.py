@@ -77,6 +77,13 @@ def test_instruction_bar_states(face_kwargs, multiple, expected):
     assert text.startswith(expected)
 
 
+def test_instruction_bar_shows_a_running_spoof_recheck_with_its_time_left():
+    face = _face(reason="Spoof suspected - rechecking: look straight at the camera and hold still (8s)")
+    text, colour = instruction_bar(_result(face), None, time.time())
+    assert text == "Rechecking: face camera, hold still (8s)"
+    assert colour != instruction_bar(_result(_face(reason="Spoof suspected: x")), None, time.time())[1]
+
+
 def test_marked_banner_stays_for_a_few_seconds():
     mark = {"name": "Alice", "status": "PRESENT", "time": 100.0}
     assert instruction_bar(_result(), mark, 101.0)[0] == "MARKED: Alice (PRESENT)"

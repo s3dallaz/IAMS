@@ -103,8 +103,14 @@ One liveness test per person, all of which must pass before attendance is marked
 3. **Time limit**: blinks and turn in any order within 10 s; otherwise a new
    random test starts. A pre-recorded video cannot know the test in advance.
 4. **Anti-spoof model, judged per frame**: a processed frame scoring below 0.8
-   is a spoof frame; 2 spoof frames among the last 10 block the person until
-   they leave the view; marking needs the last 5 frames all above 0.8.
+   is a spoof frame; 2 spoof frames among the last 10 block the person;
+   marking needs the last 5 frames all above 0.8.
+   **Recheck**: a low-quality webcam (blur, noise, low light) gives a real
+   face a few low frames, so a block is checked again for up to 10 s: it is
+   lifted when at most 1 of the next 15 frames is low and the last 5 are all
+   real. A photo scores low on nearly every frame and a phone on about half,
+   so they keep failing. Up to 2 rechecks per person in view; after that, or
+   a timed-out recheck, the block lasts until the person leaves the view.
 5. **No screen**: a phone, laptop or TV covering the face blocks marking until
    the person leaves the view.
 6. **One person at a time**: with two faces in view nobody is marked.
@@ -168,6 +174,7 @@ deleted. New enrollments are stored as SFace directly.
 | `LIVENESS_CHALLENGE_TIMEOUT` | 10 | seconds per liveness test |
 | `LIVENESS_FACE_LOST_GRACE` | 2 | seconds a face may be lost before the test restarts |
 | `ANTI_SPOOF_THRESHOLD`, `_BAD_FRAMES`, `_MIN_FRAMES`, `_WINDOW` | 0.8, 2, 5, 10 | per-frame anti-spoof decision |
+| `ANTI_SPOOF_RECHECK_FRAMES`, `_RECHECK_MAX_BAD`, `_RECHECK_TIMEOUT`, `ANTI_SPOOF_MAX_RECHECKS` | 15, 1, 10 s, 2 | recheck of a model block (0 rechecks = none) |
 | `SPOOF_DIAGNOSTICS` | `true` | log a SPOOF CHECK line per second (scores, screens) |
 | `SCREEN_DETECTION_CONFIDENCE`, `SCREEN_FACE_OVERLAP` | 0.4, 0.5 | phone/screen check |
 | `ATTENDANCE_SNAPSHOTS_ENABLED` | `true` | audit photos |

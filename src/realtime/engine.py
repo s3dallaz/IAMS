@@ -44,6 +44,7 @@ from src.computer_vision.liveness_detector import LivenessState
 from src.realtime.protocol import result_to_dict
 from src.services.enrollment_service import EnrollmentService
 from src.services.real_time_attendance_service import (
+    SPOOF_RECHECK_PREFIX,
     RealTimeAttendanceManager,
     RealTimeAttendanceResult,
 )
@@ -70,6 +71,9 @@ def instruction_bar(result: RealTimeAttendanceResult, last_mark: Optional[Dict[s
     if not result.processed_faces:
         return None, None
     face = result.processed_faces[0]
+    if face.reason.startswith(SPOOF_RECHECK_PREFIX):
+        # "...: look straight at the camera and hold still (8s)" -> "(8s)"
+        return f"Rechecking: face camera, hold still {face.reason.rsplit(' ', 1)[-1]}", ORANGE
     if face.reason.startswith("Spoof suspected"):
         return "SPOOF SUSPECTED - photo / screen detected", RED
     if not face.is_recognized:

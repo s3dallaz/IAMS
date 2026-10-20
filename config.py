@@ -348,6 +348,21 @@ ANTI_SPOOF_BAD_FRAMES: int = int(_env_float("ANTI_SPOOF_BAD_FRAMES", 2))
 ANTI_SPOOF_MIN_FRAMES: int = int(_env_float("ANTI_SPOOF_MIN_FRAMES", 5))
 ANTI_SPOOF_WINDOW: int = int(_env_float("ANTI_SPOOF_WINDOW", 10))
 
+# Spoof recheck. Low-quality webcams (blur, noise, low light) give a real face
+# a few low-scoring frames, which flagged real people as spoofs. After the
+# anti-spoof model flags a face, it is checked again: the flag is lifted when
+# at most ANTI_SPOOF_RECHECK_MAX_BAD of the next ANTI_SPOOF_RECHECK_FRAMES
+# frames score below the threshold (and the last ANTI_SPOOF_MIN_FRAMES are all
+# real) within ANTI_SPOOF_RECHECK_TIMEOUT seconds. A photo scores low on
+# nearly every frame and a phone on roughly half, so they keep failing.
+# Up to ANTI_SPOOF_MAX_RECHECKS rechecks per person in view; after that (or a
+# timed-out recheck) the block stays until they leave. 0 rechecks = no recheck.
+# A phone / laptop / TV seen covering the face is never rechecked.
+ANTI_SPOOF_RECHECK_FRAMES: int = int(_env_float("ANTI_SPOOF_RECHECK_FRAMES", 15))
+ANTI_SPOOF_RECHECK_MAX_BAD: int = int(_env_float("ANTI_SPOOF_RECHECK_MAX_BAD", 1))
+ANTI_SPOOF_RECHECK_TIMEOUT: float = _env_float("ANTI_SPOOF_RECHECK_TIMEOUT", 10.0)
+ANTI_SPOOF_MAX_RECHECKS: int = int(_env_float("ANTI_SPOOF_MAX_RECHECKS", 2))
+
 # Screen detector (MediaPipe EfficientDet-Lite0): a phone, laptop or TV whose
 # box covers at least SCREEN_FACE_OVERLAP of the face box blocks marking until
 # the person leaves the view.

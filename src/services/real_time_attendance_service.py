@@ -7,6 +7,7 @@ Provides real-time frame processing, caching/debouncing, lifecycle verification,
 and anti-spoofing enforcement for live video attendance monitoring.
 """
 
+import math
 import random
 import re
 import time
@@ -48,6 +49,10 @@ from src.utils.logger import get_logger
 from src.utils.performance_timer import time_operation
 
 logger = get_logger(__name__)
+
+# Start of the reason shown while a suspected spoof is being checked again
+# (the UI shows it as a recheck, not a final rejection)
+SPOOF_RECHECK_PREFIX = "Spoof suspected - rechecking"
 
 
 # ============================================================================
@@ -324,7 +329,13 @@ class RealTimeAttendanceManager:
         # may be seen covering it (sticky until the person leaves the view).
         self._spoof_scores: deque = deque(maxlen=max(1, config.ANTI_SPOOF_WINDOW))
         self._screen_label: str = ""
-        self._spoof_flagged: bool = False     # anti-spoof model saw a photo / screen (sticky)
+        self._spoof_flagged: bool = False     # anti-spoof model saw a photo / screen
+        # Recheck of a model flag (config.ANTI_SPOOF_RECHECK_*): a low-quality
+        # webcam can make a real face score low for a few frames
+        self._spoof_flagged_at: Optional[float] = None
+        self._spoof_recheck_scores: deque = deque(maxlen=max(1, config.ANTI_SPOOF_RECHECK_FRAMES))
+        self._spoof_rechecks_passed: int = 0
+        self._spoof_final: bool = False       # no (more) recheck: blocked until the person leaves
         self._last_screen_check: float = 0.0# screen detection every SCREEN_CHECK_INTERVAL
         self._last_spoof_log: float = 0.0     # SPOOF CHECK diagnostics, once per second
 # When the current random challenge started; it must be finished
@@ -462,25 +473,30 @@ class RealTimeAttendanceManager:
             self._spoof_scores.clear()
             self._screen_label = ""
             self._spoof_flagged = False
+            self._spoof_flagged_at = None
+            self._spoof_recheck_scores.clear()
+            self._spoof_rechecks_passed = 0
+            self._spoof_final = False
             self._last_screen_check = 0.0
             self._challenge_started_at = None
 
     def _update_spoof_evidence(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
         """Add this frame's anti-spoof score and screen check for the person in view."""
+        now = time.time()
         anti_spoof = self._get_anti_spoof_detector()
         if anti_spoof is not None:
             with time_operation("anti_spoof_score"):
                 score = anti_spoof.real_score(frame, bbox)
             if score is not None:
                 self._spoof_scores.append(score)
-                bad = sum(s < config.ANTI_SPOOF_THRESHOLD for s in self._spoof_scores)
-                if not self._spoof_flagged and bad >= config.ANTI_SPOOF_BAD_FRAMES:
-                    self._spoof_flagged = True
-                    logger.warning(f"Spoof suspected: {bad} of the last {len(self._spoof_scores)} frames "
-                                   f"look like a photo or screen; marking blocked")
+                if self._spoof_flagged:
+                    self._recheck_spoof(score, now)
+                else:
+                    bad = sum(s < config.ANTI_SPOOF_THRESHOLD for s in self._spoof_scores)
+                    if bad >= config.ANTI_SPOOF_BAD_FRAMES:
+                        self._flag_spoof(bad, now)
 
         screen_detector = self._get_screen_detector()
-        now = time.time()
         if (screen_detector is not None and not self._screen_label
                 and now - self._last_screen_check >= config.SCREEN_CHECK_INTERVAL):
             self._last_screen_check = now
@@ -489,6 +505,52 @@ class RealTimeAttendanceManager:
             if label:
                 self._screen_label = label
                 logger.warning(f"Spoof suspected: face shown on a {label}; marking blocked")
+
+    def _flag_spoof(self, bad: int, now: float) -> None:
+        """The anti-spoof model saw a photo / screen: block marking and start a recheck if one is left."""
+        self._spoof_flagged = True
+        self._spoof_flagged_at = now
+        self._spoof_recheck_scores.clear()
+        self._spoof_final = (config.ANTI_SPOOF_RECHECK_FRAMES <= 0
+                             or self._spoof_rechecks_passed >= config.ANTI_SPOOF_MAX_RECHECKS)
+        follow_up = "until the person leaves the view" if self._spoof_final else "while rechecking"
+        logger.warning(f"Spoof suspected: {bad} of the last {len(self._spoof_scores)} frames "
+                       f"look like a photo or screen; marking blocked {follow_up}")
+
+    def _recheck_spoof(self, score: float, now: float) -> None:
+        """
+        Lift a model flag when the frames after it look real: at most
+        ANTI_SPOOF_RECHECK_MAX_BAD low scores among the last ANTI_SPOOF_RECHECK_FRAMES
+        and the last ANTI_SPOOF_MIN_FRAMES all real, within ANTI_SPOOF_RECHECK_TIMEOUT.
+        """
+        if self._spoof_final:
+            return
+        if now - self._spoof_flagged_at > config.ANTI_SPOOF_RECHECK_TIMEOUT:
+            self._spoof_final = True
+            logger.warning("Spoof recheck failed (time limit); marking blocked until the person leaves the view")
+            return
+        self._spoof_recheck_scores.append(score)
+        scores = list(self._spoof_recheck_scores)
+        if len(scores) < config.ANTI_SPOOF_RECHECK_FRAMES:
+            return
+        bad = sum(s < config.ANTI_SPOOF_THRESHOLD for s in scores)
+        latest = scores[-config.ANTI_SPOOF_MIN_FRAMES:]
+        if bad <= config.ANTI_SPOOF_RECHECK_MAX_BAD and all(s >= config.ANTI_SPOOF_THRESHOLD for s in latest):
+            self._spoof_flagged = False
+            self._spoof_flagged_at = None
+            self._spoof_rechecks_passed += 1
+            # Start the normal rule again from the real-looking frames only
+            self._spoof_scores.clear()
+            self._spoof_scores.extend(latest)
+            self._spoof_recheck_scores.clear()
+            logger.info(f"Spoof recheck passed ({bad} of {len(scores)} frames low); marking allowed again "
+                        f"(recheck {self._spoof_rechecks_passed} of {config.ANTI_SPOOF_MAX_RECHECKS})")
+
+    def _spoof_recheck_seconds_left(self, now: float) -> Optional[float]:
+        """Seconds left to pass the running spoof recheck, or None if none is running."""
+        if not self._spoof_flagged or self._spoof_final or self._spoof_flagged_at is None:
+            return None
+        return max(0.0, config.ANTI_SPOOF_RECHECK_TIMEOUT - (now - self._spoof_flagged_at))
 
     def _log_spoof_diagnostics(self, face_result: "FaceProcessingResult", now: float) -> None:
         """
@@ -504,9 +566,15 @@ class RealTimeAttendanceManager:
                       f"min={min(scores):.2f}") if scores else "n=0"
         screens = getattr(self.screen_detector, "last_screens", None) or []
         screen_text = ", ".join(f"{label} {score:.2f} covers {overlap:.0%}" for label, score, overlap in screens) or "none"
+        if not self._spoof_flagged:
+            recheck_text = "no"
+        elif self._spoof_final:
+            recheck_text = "final"
+        else:
+            recheck_text = f"running ({len(self._spoof_recheck_scores)}/{config.ANTI_SPOOF_RECHECK_FRAMES} frames)"
         logger.info(f"SPOOF CHECK: identity={face_result.identity} scores {score_text} | "
                     f"screens: {screen_text} | blocked by screen: {self._screen_label or 'no'} | "
-                    f"reason: {face_result.reason}")
+                    f"recheck: {recheck_text} | reason: {face_result.reason}")
 
     def _spoof_score(self) -> Optional[float]:
         """Mean real-face probability over the recent frames, or None if not measured."""
@@ -517,7 +585,11 @@ class RealTimeAttendanceManager:
         if self._screen_label:
             return f"Spoof suspected: face shown on a {self._screen_label} - step out of view and try again"
         if self._spoof_flagged:
-            return "Spoof suspected: face looks like a photo or screen"
+            seconds_left = self._spoof_recheck_seconds_left(time.time())
+            if seconds_left is not None:
+                return (f"{SPOOF_RECHECK_PREFIX}: look straight at the camera and hold still "
+                        f"({math.ceil(seconds_left)}s)")
+            return "Spoof suspected: face looks like a photo or screen - step out of view and try again"
         return None
 
     def _spoof_check_pending(self) -> bool:

@@ -32,6 +32,7 @@ from src.computer_vision.liveness_detector import (
     ChallengeType
 )
 from src.services.real_time_attendance_service import (
+    SPOOF_RECHECK_PREFIX,
     RealTimeAttendanceManager,
     RealTimeAttendanceResult,
     FaceProcessingResult
@@ -361,6 +362,13 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
     # A suspected photo / screen replay is shown first, whoever the face is
     if face_info.reason.startswith("Spoof suspected"):
         who = face_info.student_name or ("Unknown person" if not face_info.is_recognized else face_info.identity)
+        if face_info.reason.startswith(SPOOF_RECHECK_PREFIX):
+            return (
+                f"🟠 **{face_info.reason}**\n\n"
+                f"**Face:** {who}\n\n"
+                f"_Some frames looked like a photo or screen (often a low-quality "
+                f"camera or poor light). If the face looks real again, checking continues._"
+            )
         return (
             f"🔴 **{face_info.reason}**\n\n"
             f"**Face:** {who}\n\n"
@@ -422,7 +430,9 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
             liveness_display = instruction
 
         # A suspected photo / screen replay overrides the instructions
-        if face_info.reason.startswith("Spoof suspected"):
+        if face_info.reason.startswith(SPOOF_RECHECK_PREFIX):
+            liveness_display = f"🟠 **{face_info.reason}**"
+        elif face_info.reason.startswith("Spoof suspected"):
             liveness_display = f"🔴 **{face_info.reason}**"
 
         lines = [

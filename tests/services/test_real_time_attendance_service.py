@@ -1176,6 +1176,9 @@ def test_head_turn_angle_validated(temp_db, active_session):
 import config  # noqa: E402
 import cv2  # noqa: E402
 from src.computer_vision.spoof_detection import AntiSpoofDetector, ScreenDetector  # noqa: E402
+from src.services.real_time_attendance_service import SPOOF_RECHECK_PREFIX  # noqa: E402
+
+FINAL_SPOOF_REASON = "Spoof suspected: face looks like a photo or screen - step out of view and try again"
 
 
 def _fake_anti_spoof(score):
@@ -1223,7 +1226,7 @@ def test_replayed_face_is_not_marked_even_after_blink_and_turn(
         face = manager.process_frame(sample_frame).processed_faces[0]
 
     assert face.attendance_marked is False
-    assert face.reason == "Spoof suspected: face looks like a photo or screen"
+    assert face.reason.startswith(SPOOF_RECHECK_PREFIX)     # 0.2 keeps failing the recheck
     assert face.spoof_score == pytest.approx(0.2)
 
 
@@ -1574,7 +1577,7 @@ def test_spoof_is_reported_for_an_unknown_face(
     mock_cv_components['recognizer'].recognize.return_value = STRANGER
     for _ in range(3):
         face = manager.process_frame(sample_frame).processed_faces[0]
-    assert face.reason == "Spoof suspected: face looks like a photo or screen"
+    assert face.reason.startswith(SPOOF_RECHECK_PREFIX)
     assert face.attendance_marked is False
 
 
@@ -1616,14 +1619,16 @@ def test_phone_scores_that_average_high_are_still_blocked(
     faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(12)]
 
     assert not any(face.attendance_marked for face in faces)
-    assert faces[-1].reason == "Spoof suspected: face looks like a photo or screen"
+    assert faces[-1].reason.startswith(SPOOF_RECHECK_PREFIX)   # the recheck keeps failing too
 
 
 def test_spoof_block_lasts_until_the_person_leaves(
     temp_db, active_session, sample_student, sample_frame, mock_cv_components,
     stateful_liveness, monkeypatch, spoof_checks_on
 ):
+    """Without a recheck left, a model flag is final until the person leaves."""
     monkeypatch.setattr(config, "ANTI_SPOOF_THRESHOLD", 0.8)
+    monkeypatch.setattr(config, "ANTI_SPOOF_MAX_RECHECKS", 0)
     anti_spoof = _fake_anti_spoof(0.0)
     manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
                              anti_spoof, _fake_screen())
@@ -1635,7 +1640,7 @@ def test_spoof_block_lasts_until_the_person_leaves(
     for _ in range(12):
         face = manager.process_frame(sample_frame).processed_faces[0]
     assert face.attendance_marked is False
-    assert face.reason.startswith("Spoof suspected")
+    assert face.reason == FINAL_SPOOF_REASON
 
     detector = mock_cv_components['detector']
     detector.detect_faces.return_value = []          # leaves the view
@@ -1678,3 +1683,120 @@ def test_a_recent_low_frame_delays_marking(
     # one low frame is not a block, but marking waits for 3 real frames after it
     assert reasons[1].reason.startswith("Checking for photo / screen spoofing")
     assert reasons[-1].attendance_marked is True
+
+
+# ============================================================================
+# Spoof recheck: a low-quality webcam gives a real face a few low-scoring
+# frames; the face is checked again instead of being blocked until it leaves
+# ============================================================================
+
+@pytest.fixture
+def quick_recheck(monkeypatch, spoof_checks_on):
+    """Recheck over 5 frames (at most 1 low), the last 3 real; threshold 0.8."""
+    monkeypatch.setattr(config, "ANTI_SPOOF_THRESHOLD", 0.8)
+    monkeypatch.setattr(config, "ANTI_SPOOF_RECHECK_FRAMES", 5)
+    monkeypatch.setattr(config, "ANTI_SPOOF_RECHECK_MAX_BAD", 1)
+    monkeypatch.setattr(config, "ANTI_SPOOF_RECHECK_TIMEOUT", 10.0)
+    monkeypatch.setattr(config, "ANTI_SPOOF_MAX_RECHECKS", 2)
+
+
+def _recheck_manager(temp_db, active_session, mock_cv_components, liveness, scores):
+    """A manager whose anti-spoof model returns the given scores, one per processed frame."""
+    anti_spoof = _fake_anti_spoof(1.0)
+    anti_spoof.real_score.side_effect = scores
+    return _spoof_manager(temp_db, active_session, mock_cv_components, liveness,
+                          anti_spoof, _fake_screen())
+
+
+def test_real_face_flagged_by_a_poor_camera_passes_the_recheck(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, quick_recheck
+):
+    scores = [0.3, 0.5] + [0.95, 0.6, 0.95, 0.95, 0.95] + [0.95] * 5
+    manager = _recheck_manager(temp_db, active_session, mock_cv_components, stateful_liveness, scores)
+    manager.process_frame(sample_frame)
+    _pass_liveness(stateful_liveness)
+    flagged = manager.process_frame(sample_frame).processed_faces[0]    # 2 low frames
+    assert flagged.reason.startswith(SPOOF_RECHECK_PREFIX)
+    assert flagged.attendance_marked is False
+
+    faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(5)]
+    assert not any(face.attendance_marked for face in faces[:4])        # recheck still running
+    assert faces[-1].attendance_marked is True                          # 1 low of 5, last 3 real
+
+
+def test_photo_keeps_failing_the_recheck_and_is_blocked_after_the_time_limit(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, quick_recheck
+):
+    manager = _recheck_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                               [0.1] * 12 + [1.0] * 10)
+    manager.process_frame(sample_frame)
+    _pass_liveness(stateful_liveness)
+    for _ in range(9):
+        face = manager.process_frame(sample_frame).processed_faces[0]
+    assert face.reason.startswith(SPOOF_RECHECK_PREFIX) and face.attendance_marked is False
+
+    manager._spoof_flagged_at -= config.ANTI_SPOOF_RECHECK_TIMEOUT + 1   # the time limit passes
+    faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(10)]
+    assert not any(face.attendance_marked for face in faces)            # real-looking frames come too late
+    assert faces[-1].reason == FINAL_SPOOF_REASON
+
+
+def test_phone_flipping_between_real_and_fake_never_passes_the_recheck(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, quick_recheck
+):
+    manager = _recheck_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                               [1.0, 0.0] * 20)
+    manager.process_frame(sample_frame)
+    _pass_liveness(stateful_liveness)
+    faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(30)]
+    assert not any(face.attendance_marked for face in faces)
+    assert faces[-1].reason.startswith(SPOOF_RECHECK_PREFIX)
+
+
+def test_the_number_of_rechecks_is_limited(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, quick_recheck, monkeypatch
+):
+    monkeypatch.setattr(config, "ANTI_SPOOF_MAX_RECHECKS", 1)
+    scores = [0.1, 0.1] + [0.95] * 5 + [0.1, 0.1] + [0.95] * 10
+    manager = _recheck_manager(temp_db, active_session, mock_cv_components, stateful_liveness, scores)
+    for _ in range(7):                                    # flagged, then the recheck passes
+        manager.process_frame(sample_frame)
+    assert not manager._spoof_flagged
+    faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(12)]
+    assert not any(face.attendance_marked for face in faces)
+    assert faces[-1].reason == FINAL_SPOOF_REASON         # flagged again: no recheck left
+
+
+def test_rechecks_start_again_for_the_next_person(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, quick_recheck, monkeypatch
+):
+    monkeypatch.setattr(config, "ANTI_SPOOF_MAX_RECHECKS", 0)
+    manager = _recheck_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                               [0.1, 0.1, 0.1])
+    for _ in range(3):
+        manager.process_frame(sample_frame)
+    assert manager._spoof_final
+    mock_cv_components['detector'].detect_faces.return_value = []    # leaves the view
+    manager.process_frame(sample_frame)
+    assert not manager._spoof_flagged and not manager._spoof_final
+    assert manager._spoof_rechecks_passed == 0
+
+
+def test_a_face_on_a_phone_is_never_rechecked(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components,
+    stateful_liveness, quick_recheck
+):
+    screen = _fake_screen("cell phone")
+    manager = _spoof_manager(temp_db, active_session, mock_cv_components, stateful_liveness,
+                             _fake_anti_spoof(0.95), screen)
+    manager.process_frame(sample_frame)
+    screen.screen_covering_face.return_value = None
+    _pass_liveness(stateful_liveness)
+    faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(10)]
+    assert not any(face.attendance_marked for face in faces)
+    assert "cell phone" in faces[-1].reason
