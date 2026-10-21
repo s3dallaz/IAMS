@@ -12,6 +12,7 @@ Provides a clean, reliable, single-page Streamlit interface for:
 import csv
 import io
 
+import config
 import streamlit as st
 import cv2
 import numpy as np
@@ -726,7 +727,8 @@ def render_manage_face_view(
                 st.info("💡 Click **Take Photo** to start live preview, position face, and capture.")
             
             if st.button("📸 Take Photo", type="primary", width="stretch", key="btn_start_enroll_camera"):
-                cam = CameraManager(camera_index=0)
+                cam = CameraManager(camera_index=0, width=config.CAMERA_WIDTH or None,
+                                    height=config.CAMERA_HEIGHT or None)
                 if cam.open():
                     st.session_state['reg_cam_manager'] = cam
                     st.session_state['reg_cam_active'] = True

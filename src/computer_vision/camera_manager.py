@@ -41,7 +41,10 @@ class CameraManager:
         Args:
             camera_index: Camera device index (default: 0 for primary camera)
             width: Optional frame width (if None, uses camera default)
-            height: Optional frame height (if None, uses camera default)
+            height: Optional frame height (if None, uses camera default).
+                With both set, frames the camera delivers larger anyway are
+                shrunk to fit width x height (aspect ratio kept); some
+                cameras ignore the requested size
             buffer_size: Camera buffer size (1 = minimize latency, recommended for real-time)
             background_reader: If True, a daemon thread reads the camera
                 continuously and read_frame() returns the newest frame, so
@@ -54,6 +57,7 @@ class CameraManager:
         self.camera_index = camera_index
         self.width = width
         self.height = height
+        self._size_logged = False
         self.buffer_size = buffer_size
         self._capture: Optional[cv2.VideoCapture] = None
         self._is_open = False
@@ -149,7 +153,7 @@ class CameraManager:
                 self.logger.warning(f"Failed to read frame from camera {self.camera_index}")
                 return False, None
 
-            return True, frame
+            return True, self._fit(frame)
 
         except Exception as e:
             self.logger.error(f"Error reading frame from camera {self.camera_index}: {e}")
@@ -204,10 +208,28 @@ class CameraManager:
                 # Time between frames from the camera = its real frame rate
                 get_timer().record_time("camera_frame_interval", (now - last_frame_time) * 1000.0)
             last_frame_time = now
+            frame = self._fit(frame)   # here, so the caller's loop never pays for it
             with self._frame_cond:
                 self._latest_frame = frame
                 self._frame_seq += 1
                 self._frame_cond.notify_all()
+
+    def _fit(self, frame: np.ndarray) -> np.ndarray:
+        """`frame` shrunk to fit width x height if it is larger (some cameras ignore the requested size)."""
+        if not self.width or not self.height:
+            return frame
+        h, w = frame.shape[:2]
+        if not self._size_logged:
+            self._size_logged = True
+            if w > self.width or h > self.height:
+                self.logger.info(f"Camera {self.camera_index} delivers {w}x{h}; frames are shrunk to fit "
+                                 f"{self.width}x{self.height}")
+            else:
+                self.logger.info(f"Camera {self.camera_index} delivers {w}x{h}")
+        if w <= self.width and h <= self.height:
+            return frame
+        scale = min(self.width / w, self.height / h)
+        return cv2.resize(frame, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
 
     def _read_latest_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
         """Newest frame not yet returned; waits up to read_timeout for one."""

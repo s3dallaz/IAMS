@@ -453,5 +453,46 @@ class TestCameraManagerBackgroundReader:
         assert manager.read_frame() == (False, None)
 
 
+class TestCameraManagerFrameSize:
+    """Frames larger than width x height are shrunk (cameras such as the Brio 100 ignore the request)."""
+
+    @staticmethod
+    def _camera_delivering(shape):
+        capture = Mock()
+        capture.isOpened.return_value = True
+        capture.read.return_value = (True, np.zeros(shape, dtype=np.uint8))
+        return capture
+
+    @pytest.mark.parametrize("delivered, expected", [
+        ((1080, 1920, 3), (720, 1280, 3)),     # 1080p camera -> 720p
+        ((720, 1280, 3), (720, 1280, 3)),      # already 720p: untouched
+        ((480, 640, 3), (480, 640, 3)),        # smaller: never enlarged
+        ((1200, 1600, 3), (720, 960, 3)),      # 4:3 fits by height, aspect kept
+    ])
+    @patch('cv2.VideoCapture')
+    def test_frames_are_shrunk_to_fit(self, mock_video_capture, delivered, expected):
+        mock_video_capture.return_value = self._camera_delivering(delivered)
+        manager = CameraManager(width=1280, height=720)
+        manager.open()
+        assert manager.read_frame()[1].shape == expected
+
+    @patch('cv2.VideoCapture')
+    def test_without_a_size_frames_keep_the_camera_size(self, mock_video_capture):
+        mock_video_capture.return_value = self._camera_delivering((1080, 1920, 3))
+        manager = CameraManager()
+        manager.open()
+        assert manager.read_frame()[1].shape == (1080, 1920, 3)
+
+    @patch('cv2.VideoCapture')
+    def test_the_background_reader_shrinks_frames_too(self, mock_video_capture):
+        mock_video_capture.return_value = self._camera_delivering((1080, 1920, 3))
+        manager = CameraManager(width=1280, height=720, background_reader=True)
+        manager.open()
+        try:
+            assert manager.read_frame()[1].shape == (720, 1280, 3)
+        finally:
+            manager.release()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

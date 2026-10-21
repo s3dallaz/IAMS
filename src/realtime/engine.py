@@ -212,7 +212,8 @@ class VisionEngine:
         failure. The gallery loads in the background, so a large one cannot
         delay the start (the app gives the engine START_TIMEOUT_SECONDS).
         """
-        self.camera = CameraManager(self.camera_index, background_reader=True)
+        self.camera = CameraManager(self.camera_index, width=config.CAMERA_WIDTH or None,
+                                    height=config.CAMERA_HEIGHT or None, background_reader=True)
         if not self.camera.open():
             self._set_status(state="error", error="Could not open the camera. Is another app using it?")
             return False

@@ -90,6 +90,24 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an integer environment variable, falling back to `default`."""
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Camera frame size for live attendance and enrollment: 720p. The camera is
+# asked for this size; frames a camera still delivers larger are shrunk to
+# fit (aspect ratio kept) in the camera reader thread, ~2 ms per frame. The
+# development laptop's Logitech Brio 100 sends 1920x1080 whatever OpenCV asks
+# for, and at 720p every later step (liveness, detection, the preview JPEG)
+# handles 2.25x fewer pixels. Set both to 0 in .env for the camera's own size.
+CAMERA_WIDTH: int = _env_int("CAMERA_WIDTH", 1280)
+CAMERA_HEIGHT: int = _env_int("CAMERA_HEIGHT", 720)
+
+
 # ============================================================================
 # Phase 6: AI Assistant Configuration (OmniRoute)
 # ============================================================================
