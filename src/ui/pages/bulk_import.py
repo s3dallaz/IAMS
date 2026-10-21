@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from src.services.bulk_import_service import (
+    MAX_ZIP_PHOTOS,
     BulkImportError,
     StudentImportPlan,
     apply_student_import,
@@ -161,6 +162,8 @@ def _render_face_import(student_service: StudentService, enrollment_service: Enr
             "    └── side.jpg", language=None)
     st.caption("Use clear, front-facing photos with one face each. Large photos are fine; they are "
                "shrunk automatically. Keep this page open while the import runs.")
+    st.caption(f"Each ZIP can be up to {st.get_option('server.maxUploadSize'):,} MB with up to "
+               f"{MAX_ZIP_PHOTOS:,} photos; split larger photo sets into several ZIPs.")
 
     if 'bulk_faces_upload_key' not in st.session_state:
         st.session_state['bulk_faces_upload_key'] = 0
@@ -184,7 +187,7 @@ def _render_face_import(student_service: StudentService, enrollment_service: Enr
             progress_bar.progress(done / total, text=recognition_data_progress_text(done, total))
 
         try:
-            report = import_face_zip(uploaded.getvalue(), enrollment_service, student_service,
+            report = import_face_zip(uploaded, enrollment_service, student_service,   # no in-memory copy
                                      skip_students_with_faces=skip_existing, progress=show_progress,
                                      gallery_progress=show_gallery_progress)
         except BulkImportError as e:

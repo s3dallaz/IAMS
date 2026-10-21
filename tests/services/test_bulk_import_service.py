@@ -24,6 +24,7 @@ from src.computer_vision.face_embedder import FaceEmbedding
 from src.database.schema import initialize_database
 from src.services.bulk_import_service import (
     MAX_PHOTO_SIDE,
+    _Gallery,
     BulkImportError,
     apply_student_import,
     import_face_zip,
@@ -365,3 +366,35 @@ def test_imported_faces_are_added_to_the_recognition_data(faces, students):
                     gallery_progress=lambda done, total: gallery_calls.append((done, total)))
     assert faces.gallery_cache_status() == {"samples": 2, "pending": 0}
     assert gallery_calls[-1] == (2, 2)                   # the two new samples, read once at the end
+
+
+def test_a_file_object_is_imported_without_copying_it(faces, students):
+    """The page passes the uploaded file itself, not getvalue() (a second copy of a large ZIP)."""
+    upload = io.BytesIO(_zip({"2021001.jpg": _photo(PERSON_A)}))
+    upload.seek(0, io.SEEK_END)                          # wherever the uploader left it
+    report = import_face_zip(upload, faces, students)
+    assert report.counts["enrolled"] == 1
+
+
+def test_duplicate_check_gallery_matches_a_brute_force_search():
+    """The gallery grows in place past its first capacity and still finds the right faces."""
+    enrollment = MagicMock()
+    rng = np.random.default_rng(0)
+    entries = [(f"s{i % 700}", FaceEmbedding(rng.standard_normal(128))) for i in range(1000)]
+    enrollment.load_active_gallery.return_value = entries
+    gallery = _Gallery(enrollment)
+    ids, vectors = [sid for sid, _ in entries], [e.encoding for _, e in entries]
+    for i in range(1500):                                # crosses the 1024 and 2048 capacities
+        sid, vector = f"s{rng.integers(0, 900)}", rng.standard_normal(128)
+        gallery.add(sid, vector)
+        ids.append(sid)
+        vectors.append(vector)
+
+    for student_id in ("s5", "s850", "new-student"):
+        query = rng.standard_normal(128)
+        distances = np.linalg.norm(np.array(vectors) - query, axis=1)
+        own_mask = np.array(ids) == student_id
+        own, other_id, other_distance = gallery.compare(query, student_id)
+        assert own == (pytest.approx(distances[own_mask].min()) if own_mask.any() else None)
+        closest = int(np.argmin(np.where(own_mask, np.inf, distances)))
+        assert other_id == ids[closest] and other_distance == pytest.approx(distances[closest])

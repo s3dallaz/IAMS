@@ -20,7 +20,7 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import cv2
 import numpy as np
@@ -45,7 +45,7 @@ class BulkImportError(Exception):
 STUDENT_COLUMNS = ("student_id", "name", "email", "department", "notes")
 REQUIRED_COLUMNS = ("student_id", "name")
 OPTIONAL_COLUMNS = ("email", "department", "notes")
-MAX_STUDENT_ROWS = 20000
+MAX_STUDENT_ROWS = 50000   # checking 50,000 rows takes under a second
 
 # Header spellings accepted for each column (compared lower-case, with _ and - as spaces)
 COLUMN_ALIASES = {
@@ -286,9 +286,9 @@ def _csv_bytes(columns: List[str], rows: List[Dict[str, Any]]) -> bytes:
 # ============================================================================
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-MAX_ZIP_PHOTOS = 20000
-MAX_PHOTO_BYTES = 25 * 1024 * 1024           # one photo
-MAX_ZIP_TOTAL_BYTES = 4 * 1024 * 1024 * 1024  # all photos, uncompressed (guards against zip bombs)
+MAX_ZIP_PHOTOS = 50000
+MAX_PHOTO_BYTES = 25 * 1024 * 1024            # one photo
+MAX_ZIP_TOTAL_BYTES = 10 * 1024 * 1024 * 1024  # all photos, uncompressed (guards against zip bombs)
 MAX_PHOTO_SIDE = 1280      # larger photos are shrunk first: same face, much faster detection
 MIN_FACE_PIXELS = 60       # smaller faces give unreliable embeddings
 # A face closer than this fraction of the recognition threshold to ANOTHER
@@ -360,9 +360,12 @@ def list_zip_photos(zip_file: zipfile.ZipFile, known_ids: Set[str]) -> Tuple[Lis
         if info.file_size > MAX_PHOTO_BYTES:
             raise BulkImportError(f"{info.filename} is larger than {MAX_PHOTO_BYTES // (1024 * 1024)} MB.")
         total += info.file_size
-        if total > MAX_ZIP_TOTAL_BYTES or len(photos) >= MAX_ZIP_PHOTOS:
-            raise BulkImportError(f"The ZIP file is too large (limit {MAX_ZIP_PHOTOS} photos, "
-                                  f"{MAX_ZIP_TOTAL_BYTES // (1024 ** 3)} GB); split it into smaller ZIP files.")
+        if len(photos) >= MAX_ZIP_PHOTOS:
+            raise BulkImportError(f"The ZIP file has more than {MAX_ZIP_PHOTOS:,} photos; "
+                                  f"split it into smaller ZIP files.")
+        if total > MAX_ZIP_TOTAL_BYTES:
+            raise BulkImportError(f"The photos in the ZIP file add up to more than "
+                                  f"{MAX_ZIP_TOTAL_BYTES // (1024 ** 3)} GB unpacked; split it into smaller ZIP files.")
         student_id = _student_id_for(path, known_ids)
         photos.append(ZipPhoto(path=info.filename, student_id=student_id or path.stem, known=student_id is not None))
     photos.sort(key=lambda photo: photo.path)
@@ -383,7 +386,7 @@ def _student_id_for(path: PurePosixPath, known_ids: Set[str]) -> Optional[str]:
 
 
 def import_face_zip(
-    zip_bytes: bytes,
+    zip_source: Union[bytes, BinaryIO],
     enrollment_service: EnrollmentService,
     student_service: StudentService,
     skip_students_with_faces: bool = True,
@@ -397,14 +400,19 @@ def import_face_zip(
     attendance engine does not have to read them at its next start.
 
     Args:
+        zip_source: the ZIP's bytes, or a seekable file object (e.g. the
+            uploaded file itself, so a large ZIP is not copied in memory)
         skip_students_with_faces: leave students who already have face data
             alone (makes a re-run continue where an interrupted one stopped)
         progress: called as progress(done, total, current_file)
         gallery_progress: called as gallery_progress(done, total) while face
             samples are read into the gallery cache (before and after the photos)
     """
+    if isinstance(zip_source, (bytes, bytearray)):
+        zip_source = io.BytesIO(zip_source)
     try:
-        zip_file = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        zip_source.seek(0)
+        zip_file = zipfile.ZipFile(zip_source)
     except zipfile.BadZipFile:
         raise BulkImportError("This is not a valid ZIP file.")
 
@@ -447,24 +455,64 @@ def import_face_zip(
 
 
 class _Gallery:
-    """Embeddings of every enrolled face, growing as photos are enrolled, for the duplicate checks."""
+    """
+    Embeddings of every enrolled face, growing as photos are enrolled, for the
+    duplicate checks. The arrays grow in place (doubling, like a list), so
+    adding a face does not copy the whole gallery and a check stays one
+    matrix-vector product even with tens of thousands of faces.
+    """
 
     def __init__(self, enrollment_service: EnrollmentService,
                  progress: Optional[Callable[[int, int], None]] = None):
         self.backend = enrollment_service._gallery_backend()
         entries = enrollment_service.load_active_gallery(progress=progress)
-        self.ids: List[str] = [student_id for student_id, _ in entries]
-        self.matrix = (np.array([embedding.encoding for _, embedding in entries], dtype=np.float64)
-                       if entries else np.zeros((0, 128)))
+        self.size = 0
+        self.matrix = np.zeros((0, 0))
+        self.sq_norms = np.zeros(0)
+        self.labels = np.zeros(0, dtype=np.int64)    # row -> index into self.student_ids
+        self.student_ids: List[str] = []
+        self._label_of: Dict[str, int] = {}
+        for student_id, embedding in entries:
+            self.add(student_id, embedding.encoding)
 
     def add(self, student_id: str, encoding: np.ndarray) -> None:
-        self.ids.append(student_id)
-        self.matrix = np.vstack([self.matrix, np.asarray(encoding, dtype=np.float64)[np.newaxis]])
+        encoding = np.asarray(encoding, dtype=np.float64).ravel()
+        if self.size == len(self.matrix):
+            capacity = max(1024, 2 * len(self.matrix))
+            matrix = np.zeros((capacity, len(encoding)))
+            if self.size:
+                matrix[:self.size] = self.matrix[:self.size]
+            self.matrix = matrix
+            self.sq_norms = np.resize(self.sq_norms, capacity)
+            self.labels = np.resize(self.labels, capacity)
+        if student_id not in self._label_of:
+            self._label_of[student_id] = len(self.student_ids)
+            self.student_ids.append(student_id)
+        self.matrix[self.size] = encoding
+        self.sq_norms[self.size] = encoding @ encoding
+        self.labels[self.size] = self._label_of[student_id]
+        self.size += 1
 
-    def distances(self, encoding: np.ndarray) -> np.ndarray:
-        if not self.ids:
-            return np.zeros(0)
-        return np.linalg.norm(self.matrix - np.asarray(encoding, dtype=np.float64), axis=1)
+    def compare(self, encoding: np.ndarray, student_id: str) -> Tuple[Optional[float], Optional[str], float]:
+        """
+        Returns:
+            (closest distance to this student's own faces or None,
+             the closest OTHER student or None, the distance to that student)
+        """
+        if not self.size:
+            return None, None, float("inf")
+        encoding = np.asarray(encoding, dtype=np.float64).ravel()
+        # |a - b|^2 = |a|^2 - 2 a.b + |b|^2: no (faces x dims) temporary array
+        sq = self.sq_norms[:self.size] - 2.0 * (self.matrix[:self.size] @ encoding) + encoding @ encoding
+        distances = np.sqrt(np.maximum(sq, 0.0))
+        label = self._label_of.get(student_id, -1)
+        own_mask = self.labels[:self.size] == label
+        own = float(distances[own_mask].min()) if own_mask.any() else None
+        others = np.where(own_mask, np.inf, distances)
+        closest = int(np.argmin(others))
+        if not np.isfinite(others[closest]):
+            return own, None, float("inf")
+        return own, self.student_ids[self.labels[closest]], float(others[closest])
 
 
 def _import_one_photo(zip_file, photo: ZipPhoto, students, sample_counts, enrolled_now, gallery: _Gallery,
@@ -498,22 +546,17 @@ def _import_one_photo(zip_file, photo: ZipPhoto, students, sample_counts, enroll
         return failed(f"Face too small ({w}x{h} px, at least {MIN_FACE_PIXELS} px needed) - use a closer photo")
 
     # Duplicate checks against every enrolled face (including this import's)
-    distances = gallery.distances(embedding.encoding)
-    ids = np.array(gallery.ids, dtype=object)
-    others = distances[ids != photo.student_id] if len(ids) else distances
-    other_ids = ids[ids != photo.student_id] if len(ids) else ids
-    own = distances[ids == photo.student_id] if len(ids) else distances
+    own, other_id, other_distance = gallery.compare(embedding.encoding, photo.student_id)
     warning = ""
-    if len(others):
-        closest = int(np.argmin(others))
-        if others[closest] < DUPLICATE_BLOCK_FRACTION * threshold:
-            return failed(f"Same face as student {other_ids[closest]} (distance {others[closest]:.2f}) - "
+    if other_id is not None:
+        if other_distance < DUPLICATE_BLOCK_FRACTION * threshold:
+            return failed(f"Same face as student {other_id} (distance {other_distance:.2f}) - "
                           f"check the photo is named correctly; not enrolled")
-        if others[closest] < threshold:
-            warning = (f"Looks similar to student {other_ids[closest]} (distance {others[closest]:.2f}); "
+        if other_distance < threshold:
+            warning = (f"Looks similar to student {other_id} (distance {other_distance:.2f}); "
                        f"enrolled, but check it is the right person")
-    if len(own) and own.min() >= threshold:
-        return failed(f"Does not match this student's other face photos (distance {own.min():.2f}) - "
+    if own is not None and own >= threshold:
+        return failed(f"Does not match this student's other face photos (distance {own:.2f}) - "
                       f"check the photo is named correctly; not enrolled")
 
     enrollment_service.save_face_sample(student, face_crop, embedding, float(face.confidence),
