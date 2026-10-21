@@ -9,6 +9,9 @@ Provides a clean, reliable, single-page Streamlit interface for:
 5. Managing student face datasets (continuous live preview, photo capture, approve/retake workflow, and reset dataset confirmation).
 """
 
+import csv
+import io
+
 import streamlit as st
 import cv2
 import numpy as np
@@ -24,8 +27,10 @@ from src.services.student_service import (
     StudentServiceError
 )
 from src.services.enrollment_service import (
+    DuplicateFaceError,
     EnrollmentService,
     EnrollmentServiceError,
+    FaceNeedsConfirmationError,
     InvalidFaceImageError
 )
 from src.computer_vision.camera_manager import CameraManager
@@ -47,6 +52,7 @@ def release_registration_camera():
         st.session_state['reg_cam_manager'] = None
     st.session_state['reg_cam_active'] = False
     st.session_state['captured_photo_preview'] = None
+    st.session_state['camera_face_confirm'] = None
 
 
 def render_student_registry():
@@ -159,6 +165,77 @@ def render_recognition_data_panel(enrollment_service: EnrollmentService):
     st.rerun()
 
 
+DUPLICATE_SCAN_ROWS = 500   # pairs shown in the table (the CSV has all of them)
+
+
+def render_duplicate_faces_panel(student_service: StudentService, enrollment_service: EnrollmentService):
+    """
+    Scan every enrolled face against all the others for students who share a
+    face (one person enrolled under two IDs, or a photo under the wrong ID).
+    Live attendance rejects such faces as ambiguous, so neither is marked.
+    """
+    scan = st.session_state.get('duplicate_face_scan')
+    with st.expander("🔎 Find students who share a face", expanded=scan is not None):
+        st.caption("Compares every enrolled face with all the others. A face enrolled under two student IDs "
+                   "is not recognized at attendance, so neither student is marked present.")
+        if st.button("🔎 Scan for duplicate faces", key="btn_scan_duplicate_faces"):
+            release_registration_camera()
+            progress_bar = st.progress(0.0, text="Comparing faces...")
+
+            def show_progress(done: int, total: int):
+                progress_bar.progress(done / total, text=f"Comparing faces: {done * 100 // total}%")
+
+            started = time.time()
+            try:
+                pairs = enrollment_service.find_duplicate_faces(progress=show_progress)
+            except Exception as e:
+                logger.exception("Duplicate face scan failed")
+                st.error(f"❌ The scan failed: {e}")
+                return
+            st.session_state['duplicate_face_scan'] = (pairs, time.time() - started)
+            st.rerun()
+        if scan is None:
+            return
+
+        pairs, seconds = scan
+        if not pairs:
+            st.success(f"✅ No students share a face (scanned in {seconds:.0f} s).")
+            return
+        same = sum(1 for pair in pairs if pair.same_face)
+        st.warning(f"⚠️ **{len(pairs):,} pair(s) of students** have very similar faces "
+                   f"({same:,} almost certainly the same person) - scanned in {seconds:.0f} s. "
+                   f"Open the student whose face data is wrong and use **Reset Face Dataset**, then enroll "
+                   f"the right photo.")
+        students = {s['student_id']: s for s in student_service.get_all_students(active_only=False)}
+
+        def name(student_id: str) -> str:
+            return students[student_id]['name'] if student_id in students else "?"
+
+        rows = [{"Student A": pair.student_a, "Name A": name(pair.student_a),
+                 "Student B": pair.student_b, "Name B": name(pair.student_b),
+                 "Distance": round(pair.distance, 3),
+                 "Verdict": "⛔ Same face" if pair.same_face else "⚠️ Similar"} for pair in pairs]
+        st.dataframe(rows[:DUPLICATE_SCAN_ROWS], hide_index=True, width="stretch")
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["student_a", "name_a", "student_b", "name_b", "distance", "verdict"])
+        writer.writerows([r["Student A"], r["Name A"], r["Student B"], r["Name B"], r["Distance"],
+                          "same face" if pair.same_face else "similar"] for r, pair in zip(rows, pairs))
+        col_csv, col_pick, col_open = st.columns([1, 2, 1])
+        col_csv.download_button("⬇️ All pairs (CSV)", buffer.getvalue().encode("utf-8-sig"),
+                                file_name="duplicate_faces.csv",
+                                mime="text/csv", key="btn_duplicate_faces_csv")
+        listed = sorted({sid for pair in pairs[:DUPLICATE_SCAN_ROWS] for sid in (pair.student_a, pair.student_b)
+                         if sid in students})
+        picked = col_pick.selectbox("Student", listed, format_func=lambda sid: f"{sid} - {name(sid)}",
+                                    key="select_duplicate_student", label_visibility="collapsed")
+        if col_open.button("📸 Open face data", key="btn_open_duplicate_student", disabled=not listed):
+            st.session_state['duplicate_face_scan'] = None   # the data is about to change
+            st.session_state['selected_student_id'] = students[picked]['id']
+            st.session_state['current_view'] = 'manage_face'
+            st.rerun()
+
+
 # ============================================================================
 # View 1: Main Directory & Student List
 # ============================================================================
@@ -183,6 +260,7 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
             st.rerun()
 
     render_recognition_data_panel(enrollment_service)
+    render_duplicate_faces_panel(service, enrollment_service)
 
     # Search and Filter
     col_s1, col_s2 = st.columns([2, 1])
@@ -573,13 +651,17 @@ def render_manage_face_view(
             key="file_uploader_samples"
         )
         
+        render_upload_confirmations(enrollment_service, student, student_db_id)
+
         if uploaded_files:
             st.caption(f"{len(uploaded_files)} file(s) selected")
             if st.button("🔍 Process & Enroll Uploaded Faces", type="primary", width="stretch", key="btn_process_uploaded"):
                 with st.spinner("Analyzing and validating face samples..."):
                     success_count = 0
                     errors = []
-                    
+                    refused = []
+                    to_confirm = []
+
                     for f in uploaded_files:
                         file_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
                         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -595,20 +677,19 @@ def render_manage_face_view(
                                 enrollment_method="upload"
                             )
                             success_count += 1
+                        except DuplicateFaceError as e:
+                            refused.append(f"{f.name}: {e}")
+                        except FaceNeedsConfirmationError as e:
+                            to_confirm.append({"name": f.name, "image": img, "message": str(e)})
                         except InvalidFaceImageError as e:
                             errors.append(f"{f.name}: {e}")
                         except Exception as e:
                             errors.append(f"{f.name}: {e}")
                             
-                    if success_count > 0:
-                        st.success(f"✅ Successfully enrolled **{success_count}** face sample(s) for **{student['name']}**!")
-                        
-                    if errors:
-                        for err in errors:
-                            st.warning(f"⚠️ {err}")
-                            
-                    if success_count > 0:
-                        st.rerun()
+                    # Kept in the session so they survive the rerun below
+                    st.session_state['upload_face_results'] = (student_db_id, success_count, refused, errors)
+                    st.session_state['upload_face_confirm'] = (student_db_id, to_confirm)
+                    st.rerun()
                         
     elif enroll_method == "📹 Take Photo with Live Camera":
         st.markdown("#### Live Camera Capture — Multi-Angle Enrollment")
@@ -706,11 +787,16 @@ def render_manage_face_view(
                     width="stretch"
                 )
                 
+                confirm_message = st.session_state.get('camera_face_confirm')
+                if confirm_message:
+                    st.warning(f"⚠️ {confirm_message}")
                 col_app, col_ret = st.columns(2)
                 with col_app:
                     approve_label = "✓ Approve / Use Photo"
                     if is_multi_angle:
                         approve_label = f"✓ Approve {angle_steps[current_step]['name']}"
+                    if confirm_message:
+                        approve_label = "⚠️ Enroll anyway"
                     if st.button(approve_label, type="primary", width="stretch", key="btn_approve_captured"):
                         with st.spinner("Validating face and saving embedding..."):
                             try:
@@ -730,10 +816,12 @@ def render_manage_face_view(
                                     student_db_id=student_db_id,
                                     face_image=captured_frame,
                                     enrollment_method="camera",
-                                    view_angle=view_angle
+                                    view_angle=view_angle,
+                                    confirmed=bool(confirm_message)
                                 )
                                 st.session_state['captured_photo_preview'] = None
-                                
+                                st.session_state['camera_face_confirm'] = None
+
                                 if is_multi_angle:
                                     # Track this angle as captured
                                     captured_samples = st.session_state.get('angle_captured_samples', [])
@@ -751,6 +839,11 @@ def render_manage_face_view(
                                 else:
                                     st.success(f"✅ Face sample approved and enrolled for **{student['name']}**!")
                                 st.rerun()
+                            except FaceNeedsConfirmationError as e:
+                                st.session_state['camera_face_confirm'] = str(e)
+                                st.rerun()
+                            except DuplicateFaceError as e:
+                                st.error(f"⛔ Not enrolled: {e}")
                             except InvalidFaceImageError as e:
                                 st.error(f"❌ Validation failed: {e}")
                             except Exception as e:
@@ -760,6 +853,7 @@ def render_manage_face_view(
                     if st.button("↻ Retake", width="stretch", key="btn_retake_captured"):
                         # Discard frame and return immediately to live streaming without reopening camera
                         st.session_state['captured_photo_preview'] = None
+                        st.session_state['camera_face_confirm'] = None
                         st.rerun()
                         
                 st.markdown("---")
@@ -837,6 +931,50 @@ def render_manage_face_view(
                 logger.error(f"Error in enrollment camera loop: {e}")
                 video_placeholder.error(f"❌ Camera error: {e}")
                 release_registration_camera()
+
+
+def render_upload_confirmations(enrollment_service: EnrollmentService, student: dict, student_db_id: int):
+    """
+    The outcome of the last upload for this student: enrolled count, refused
+    faces (already enrolled for someone else) and the faces waiting for an
+    "Enroll anyway" / "Don't enroll" decision.
+    """
+    results = st.session_state.get('upload_face_results')
+    if results and results[0] == student_db_id:
+        _, success_count, refused, errors = results
+        if success_count:
+            st.success(f"✅ Successfully enrolled **{success_count}** face sample(s) for **{student['name']}**!")
+        for message in refused:
+            st.error(f"⛔ Not enrolled - {message}")
+        for message in errors:
+            st.warning(f"⚠️ {message}")
+        st.session_state['upload_face_results'] = None
+
+    pending = st.session_state.get('upload_face_confirm')
+    if not pending or pending[0] != student_db_id or not pending[1]:
+        return
+    st.markdown("#### ⚠️ Check these photos before enrolling them")
+    for n, item in enumerate(list(pending[1])):
+        with st.container(border=True):
+            col_img, col_msg = st.columns([1, 3])
+            col_img.image(cv2.cvtColor(item["image"], cv2.COLOR_BGR2RGB), width="stretch")
+            with col_msg:
+                st.markdown(f"**{item['name']}**")
+                st.warning(item["message"])
+                col_yes, col_no = st.columns(2)
+                enroll = col_yes.button("⚠️ Enroll anyway", key=f"btn_confirm_upload_{n}", width="stretch")
+                skip = col_no.button("✖ Don't enroll", key=f"btn_skip_upload_{n}", width="stretch")
+        if enroll or skip:
+            pending[1].remove(item)
+            if enroll:
+                try:
+                    enrollment_service.add_face_sample(student_db_id=student_db_id, face_image=item["image"],
+                                                       enrollment_method="upload", confirmed=True)
+                    st.session_state['registry_feedback'] = (
+                        'success', f"✅ {item['name']} enrolled for **{student['name']}**.")
+                except Exception as e:
+                    st.session_state['registry_feedback'] = ('error', f"❌ {item['name']}: {e}")
+            st.rerun()
 
 
 # Backward compatibility helpers for tests

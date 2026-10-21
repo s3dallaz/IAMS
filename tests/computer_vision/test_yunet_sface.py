@@ -175,6 +175,8 @@ def test_new_enrollment_with_sface_writes_a_tagged_encoding(enrolled_with_dlib, 
 
     service.add_face_sample(student["id"], FRAME)
 
-    tagged = list(dlib_file.parent.glob("enc_sface_*.npy"))
+    # The duplicate-face check loads the SFace gallery, which also converts the old dlib sample
+    converted = encoding_file_for_backend(dlib_file, "sface")
+    tagged = [path for path in dlib_file.parent.glob("enc_sface_*.npy") if path != converted]
     assert len(tagged) == 1
     assert np.linalg.norm(np.load(tagged[0])) == pytest.approx(1.0)

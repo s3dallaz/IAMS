@@ -20,12 +20,21 @@ from src.computer_vision.face_detector import FaceDetector, DetectedFace
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding, FaceEmbeddingError
 from src.data.repositories.enrollment_repository import EnrollmentRepository
 from src.data.repositories.student_repository import StudentRepository
+from src.services.face_index import SIMILAR_WARN_FRACTION, DuplicatePair, FaceCheck, FaceIndex
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 # Gallery cache file layout; a file with another version is rebuilt
 GALLERY_CACHE_VERSION = 2
+
+# Duplicate-check index per (database, encodings folder, backend), shared by
+# every EnrollmentService of this process (the pages create a new service on
+# each rerun): {key: (gallery fingerprint, FaceIndex)}. Built from the gallery
+# cache the first time a face is checked, then kept in step with the samples
+# this process saves, so a check costs one ~25 ms query plus ~7 ms of maths.
+_face_indexes: Dict[tuple, Tuple[tuple, FaceIndex]] = {}
+_face_indexes_lock = threading.Lock()
 
 # progress(done, total) while a gallery load reads sample files
 GalleryProgress = Callable[[int, int], None]
@@ -75,6 +84,25 @@ class EnrollmentServiceError(Exception):
 class InvalidFaceImageError(EnrollmentServiceError):
     """Raised when an uploaded/captured face image is invalid or has no detectable face."""
     pass
+
+
+class DuplicateFaceError(InvalidFaceImageError):
+    """The face is already enrolled for another student (almost certainly the same person)."""
+
+    def __init__(self, message: str, check: FaceCheck):
+        super().__init__(message)
+        self.check = check
+
+
+class FaceNeedsConfirmationError(EnrollmentServiceError):
+    """
+    The face looks like another student's, or not like this student's own
+    samples. Nothing was saved; add_face_sample(..., confirmed=True) saves it.
+    """
+
+    def __init__(self, message: str, check: FaceCheck):
+        super().__init__(message)
+        self.check = check
 
 
 class EnrollmentService:
@@ -171,20 +199,28 @@ class EnrollmentService:
         student_db_id: int,
         face_image: np.ndarray,
         enrollment_method: str = 'camera',
-        view_angle: str = 'unknown'
+        view_angle: str = 'unknown',
+        confirmed: bool = False
     ) -> int:
         """
         Add a single face sample for a student, generate embedding, and record in database.
         Supports adding multiple samples over time (e.g. changed appearance).
-        
+
         Args:
             student_db_id: Student database ID
             face_image: Full or cropped face image as numpy array
             enrollment_method: 'camera' or 'upload'
             view_angle: Face angle ('frontal', 'left', 'right', 'unknown')
-            
+            confirmed: the user chose to enroll a face that needed confirmation
+                (FaceNeedsConfirmationError); a duplicate is refused regardless
+
         Returns:
             Enrollment record database ID
+
+        Raises:
+            DuplicateFaceError: the face is already enrolled for another student
+            FaceNeedsConfirmationError: similar to another student, or unlike
+                this student's own samples, and not `confirmed`
         """
         student = self.student_repo.get_by_id(student_db_id)
         if not student:
@@ -192,6 +228,13 @@ class EnrollmentService:
 
         # Steps 1-2: validate the face, crop it and generate its embedding
         face, face_crop, embedding = self.prepare_face_sample(face_image)
+
+        # Compare with every enrolled face before anything is saved
+        check = self.check_face(embedding, student['student_id'])
+        if check.status == "duplicate":
+            raise DuplicateFaceError(self.describe_face_check(check), check)
+        if check.needs_confirmation and not confirmed:
+            raise FaceNeedsConfirmationError(self.describe_face_check(check), check)
 
         # Steps 3-4: save the files and the enrollment record
         enrollment_id = self.save_face_sample(student, face_crop, embedding, float(face.confidence),
@@ -269,13 +312,99 @@ class EnrollmentService:
             view_angle=view_angle,
             is_active=True
         )
-        
+        if student.get('is_active', 1):
+            self._add_to_face_index(enrollment_id, student, embedding.encoding)
+
         logger.info(
             f"Enrolled face sample for student {student_id_str} (DB ID: {student_db_id}, "
             f"Enrollment ID: {enrollment_id})"
         )
         return enrollment_id
         
+    # ------------------------------------------------------------------
+    # Duplicate-face checks
+    # ------------------------------------------------------------------
+
+    def recognition_threshold(self) -> float:
+        """Distance below which live attendance treats two faces as the same person."""
+        backend = self._gallery_backend()
+        return config.SFACE_RECOGNITION_THRESHOLD if backend == "sface" else config.FACE_RECOGNITION_THRESHOLD
+
+    def _face_index_key(self) -> tuple:
+        return (str(self.database_path), str(self.encodings_dir), self._gallery_backend())
+
+    def _with_face_index(self, use: Callable[[FaceIndex], Any]) -> Any:
+        """
+        Run use(index) on the up-to-date duplicate-check index. The index is
+        rebuilt (from the gallery cache, ~1 s for 65,000 samples) only when the
+        gallery changed in a way this process did not record itself.
+        """
+        key = self._face_index_key()
+        with _face_indexes_lock:
+            # Fingerprint BEFORE loading: a sample added during the load makes it stale, never missed
+            fingerprint = self.enrollment_repo.get_active_gallery_fingerprint()
+            entry = _face_indexes.get(key)
+            if entry is None or entry[0] != fingerprint:
+                started = time.perf_counter()
+                gallery = self.load_active_gallery()
+                entry = (fingerprint, FaceIndex((sid, embedding.encoding) for sid, embedding in gallery))
+                _face_indexes[key] = entry
+                logger.info(f"Built the duplicate-face index: {entry[1].size} samples "
+                            f"in {time.perf_counter() - started:.2f} s")
+            return use(entry[1])
+
+    def _add_to_face_index(self, enrollment_id: int, student: Dict[str, Any], encoding: np.ndarray) -> None:
+        """
+        Keep a built index in step with a sample this process just saved, so the
+        next check does not rebuild it. The fingerprint is advanced by exactly
+        this sample: if anything else changed the gallery it still differs.
+        """
+        key = self._face_index_key()
+        with _face_indexes_lock:
+            entry = _face_indexes.get(key)
+            if entry is None:
+                return
+            count, max_id, id_sum, student_sum, length_sum = entry[0]
+            entry[1].add(student['student_id'], encoding)
+            _face_indexes[key] = ((count + 1, max(max_id, enrollment_id), id_sum + enrollment_id,
+                                   student_sum + student['id'], length_sum + len(student['student_id'])),
+                                  entry[1])
+
+    def check_face(self, embedding: FaceEmbedding, student_id_str: str) -> FaceCheck:
+        """How a new face sample of `student_id_str` compares with every enrolled face."""
+        threshold = self.recognition_threshold()
+        return self._with_face_index(lambda index: index.check(embedding.encoding, student_id_str, threshold))
+
+    def describe_face_check(self, check: FaceCheck) -> str:
+        """A message for the user about a duplicate / similar / mismatching face."""
+        threshold = self.recognition_threshold()
+        other = ""
+        if check.other_student_id is not None:
+            record = self.student_repo.get_by_student_id(check.other_student_id)
+            name = record['name'] if record else "another student"
+            other = f"{name} ({check.other_student_id})"
+        if check.status == "duplicate":
+            return (f"This face is already enrolled for {other} (distance {check.other_distance:.2f}). "
+                    f"One person enrolled under two student IDs is not recognized at attendance - neither "
+                    f"student is marked. If the face was enrolled for the wrong student, reset that "
+                    f"student's face data first.")
+        if check.status == "similar":
+            return (f"This face looks like {other} (distance {check.other_distance:.2f}; photos of the same "
+                    f"person are usually closer than {SIMILAR_WARN_FRACTION * threshold:.2f}). Enroll it only "
+                    f"if they are different people; faces this close can be rejected as ambiguous at attendance.")
+        if check.status == "mismatch":
+            return (f"This face does not match this student's other face samples (closest distance "
+                    f"{check.own_distance:.2f}, the same-person limit is {threshold:.2f}). Check it is the "
+                    f"right person; enroll it anyway only if their appearance changed.")
+        return ""
+
+    def find_duplicate_faces(self, progress: Optional[GalleryProgress] = None) -> List[DuplicatePair]:
+        """Every pair of different students whose faces are similar (see face_index), closest first."""
+        threshold = self.recognition_threshold()
+        # Scan a copy, so checks in other sessions are not held up for the whole scan
+        snapshot = self._with_face_index(lambda index: index.copy())
+        return snapshot.duplicate_pairs(threshold, progress=progress)
+
     def add_multiple_face_samples(
         self,
         student_db_id: int,

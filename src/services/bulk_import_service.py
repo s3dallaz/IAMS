@@ -26,8 +26,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from src.computer_vision.face_recognizer import FaceRecognizer
 from src.services.enrollment_service import EnrollmentService, InvalidFaceImageError
+from src.services.face_index import FaceIndex
 from src.services.student_service import StudentService
 from src.utils.logger import get_logger
 
@@ -291,10 +291,6 @@ MAX_PHOTO_BYTES = 25 * 1024 * 1024            # one photo
 MAX_ZIP_TOTAL_BYTES = 10 * 1024 * 1024 * 1024  # all photos, uncompressed (guards against zip bombs)
 MAX_PHOTO_SIDE = 1280      # larger photos are shrunk first: same face, much faster detection
 MIN_FACE_PIXELS = 60       # smaller faces give unreliable embeddings
-# A face closer than this fraction of the recognition threshold to ANOTHER
-# student's face is treated as the same person (e.g. one photo under two IDs)
-# and not enrolled; up to the full threshold it is enrolled with a warning.
-DUPLICATE_BLOCK_FRACTION = 0.5
 
 
 @dataclass
@@ -423,8 +419,10 @@ def import_face_zip(
         raise BulkImportError("No photos (.jpg, .jpeg, .png, .bmp, .webp) were found in the ZIP file.")
 
     sample_counts = enrollment_service.get_all_samples_counts()
-    gallery = _Gallery(enrollment_service, gallery_progress)
-    threshold = FaceRecognizer(backend=gallery.backend).threshold
+    # Its own index (grows with this import's faces), checked with the same rules as a manual enrollment
+    gallery = FaceIndex((sid, embedding.encoding)
+                        for sid, embedding in enrollment_service.load_active_gallery(progress=gallery_progress))
+    threshold = enrollment_service.recognition_threshold()
     enrolled_now: Set[str] = set()
 
     for done, photo in enumerate(photos):
@@ -454,68 +452,7 @@ def import_face_zip(
     return report
 
 
-class _Gallery:
-    """
-    Embeddings of every enrolled face, growing as photos are enrolled, for the
-    duplicate checks. The arrays grow in place (doubling, like a list), so
-    adding a face does not copy the whole gallery and a check stays one
-    matrix-vector product even with tens of thousands of faces.
-    """
-
-    def __init__(self, enrollment_service: EnrollmentService,
-                 progress: Optional[Callable[[int, int], None]] = None):
-        self.backend = enrollment_service._gallery_backend()
-        entries = enrollment_service.load_active_gallery(progress=progress)
-        self.size = 0
-        self.matrix = np.zeros((0, 0))
-        self.sq_norms = np.zeros(0)
-        self.labels = np.zeros(0, dtype=np.int64)    # row -> index into self.student_ids
-        self.student_ids: List[str] = []
-        self._label_of: Dict[str, int] = {}
-        for student_id, embedding in entries:
-            self.add(student_id, embedding.encoding)
-
-    def add(self, student_id: str, encoding: np.ndarray) -> None:
-        encoding = np.asarray(encoding, dtype=np.float64).ravel()
-        if self.size == len(self.matrix):
-            capacity = max(1024, 2 * len(self.matrix))
-            matrix = np.zeros((capacity, len(encoding)))
-            if self.size:
-                matrix[:self.size] = self.matrix[:self.size]
-            self.matrix = matrix
-            self.sq_norms = np.resize(self.sq_norms, capacity)
-            self.labels = np.resize(self.labels, capacity)
-        if student_id not in self._label_of:
-            self._label_of[student_id] = len(self.student_ids)
-            self.student_ids.append(student_id)
-        self.matrix[self.size] = encoding
-        self.sq_norms[self.size] = encoding @ encoding
-        self.labels[self.size] = self._label_of[student_id]
-        self.size += 1
-
-    def compare(self, encoding: np.ndarray, student_id: str) -> Tuple[Optional[float], Optional[str], float]:
-        """
-        Returns:
-            (closest distance to this student's own faces or None,
-             the closest OTHER student or None, the distance to that student)
-        """
-        if not self.size:
-            return None, None, float("inf")
-        encoding = np.asarray(encoding, dtype=np.float64).ravel()
-        # |a - b|^2 = |a|^2 - 2 a.b + |b|^2: no (faces x dims) temporary array
-        sq = self.sq_norms[:self.size] - 2.0 * (self.matrix[:self.size] @ encoding) + encoding @ encoding
-        distances = np.sqrt(np.maximum(sq, 0.0))
-        label = self._label_of.get(student_id, -1)
-        own_mask = self.labels[:self.size] == label
-        own = float(distances[own_mask].min()) if own_mask.any() else None
-        others = np.where(own_mask, np.inf, distances)
-        closest = int(np.argmin(others))
-        if not np.isfinite(others[closest]):
-            return own, None, float("inf")
-        return own, self.student_ids[self.labels[closest]], float(others[closest])
-
-
-def _import_one_photo(zip_file, photo: ZipPhoto, students, sample_counts, enrolled_now, gallery: _Gallery,
+def _import_one_photo(zip_file, photo: ZipPhoto, students, sample_counts, enrolled_now, gallery: FaceIndex,
                       threshold: float, enrollment_service: EnrollmentService,
                       skip_students_with_faces: bool) -> PhotoResult:
     def failed(message):
@@ -546,17 +483,16 @@ def _import_one_photo(zip_file, photo: ZipPhoto, students, sample_counts, enroll
         return failed(f"Face too small ({w}x{h} px, at least {MIN_FACE_PIXELS} px needed) - use a closer photo")
 
     # Duplicate checks against every enrolled face (including this import's)
-    own, other_id, other_distance = gallery.compare(embedding.encoding, photo.student_id)
+    check = gallery.check(embedding.encoding, photo.student_id, threshold)
     warning = ""
-    if other_id is not None:
-        if other_distance < DUPLICATE_BLOCK_FRACTION * threshold:
-            return failed(f"Same face as student {other_id} (distance {other_distance:.2f}) - "
-                          f"check the photo is named correctly; not enrolled")
-        if other_distance < threshold:
-            warning = (f"Looks similar to student {other_id} (distance {other_distance:.2f}); "
-                       f"enrolled, but check it is the right person")
-    if own is not None and own >= threshold:
-        return failed(f"Does not match this student's other face photos (distance {own:.2f}) - "
+    if check.status == "duplicate":
+        return failed(f"Same face as student {check.other_student_id} (distance {check.other_distance:.2f}) - "
+                      f"check the photo is named correctly; not enrolled")
+    if check.status == "similar":
+        warning = (f"Looks similar to student {check.other_student_id} (distance {check.other_distance:.2f}); "
+                   f"enrolled, but check it is the right person")
+    if check.status == "mismatch":
+        return failed(f"Does not match this student's other face photos (distance {check.own_distance:.2f}) - "
                       f"check the photo is named correctly; not enrolled")
 
     enrollment_service.save_face_sample(student, face_crop, embedding, float(face.confidence),

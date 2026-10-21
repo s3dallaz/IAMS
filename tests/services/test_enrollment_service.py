@@ -13,9 +13,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import numpy as np
 
+import src.services.enrollment_service as enrollment_module
 from src.services.enrollment_service import (
+    DuplicateFaceError,
     EnrollmentService,
     EnrollmentServiceError,
+    FaceNeedsConfirmationError,
     InvalidFaceImageError
 )
 from src.services.student_service import StudentService
@@ -88,6 +91,17 @@ def enrollment_service(temp_db, temp_dirs, mock_detector, mock_embedder):
 
 def _make_face_image():
     return np.random.randint(0, 255, (200, 200, 3), dtype=np.uint8)
+
+
+def _other_face():
+    """A different person: a random 128-D vector is far from any other."""
+    return FaceEmbedding(np.random.randn(128))
+
+
+def _near(embedding, distance):
+    """A face `distance` away from `embedding`."""
+    direction = np.random.randn(128)
+    return FaceEmbedding(embedding.encoding + distance * direction / np.linalg.norm(direction))
 
 
 def test_existing_student_can_open_manage_face(enrollment_service, sample_student):
@@ -295,6 +309,7 @@ def test_gallery_signature_tracks_gallery_changes(enrollment_service, student_se
     other = student_service.create_student(student_id="2021002", name="Jane Roe")
     assert enrollment_service.gallery_signature() == one_sample      # a student without samples adds nothing
 
+    enrollment_service._get_embedder().generate_embedding.return_value = _other_face()   # a different person
     enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image())
     two_students = enrollment_service.gallery_signature()
     assert two_students != one_sample
@@ -428,3 +443,96 @@ def test_unreadable_or_old_gallery_cache_is_rebuilt(enrollment_service, sample_s
             cache.write_bytes(content)
         assert [i for i, _ in enrollment_service.load_active_gallery()] == ["2021001"]
         assert enrollment_service.gallery_cache_status()["pending"] == 0   # rewritten
+
+
+# ============================================================================
+# Duplicate-face checks
+# ============================================================================
+
+@pytest.fixture
+def two_students(enrollment_service, student_service, sample_student):
+    """2021001 enrolled with the fixture's face; 2021002 without face data."""
+    enrollment_service.add_face_sample(student_db_id=sample_student, face_image=_make_face_image())
+    other = student_service.create_student(student_id="2021002", name="Jane Roe")
+    return sample_student, other
+
+
+def _set_face(service, embedding):
+    service._get_embedder().generate_embedding.return_value = embedding
+
+
+def test_the_same_face_for_another_student_is_refused(enrollment_service, two_students):
+    first, other = two_students
+    with pytest.raises(DuplicateFaceError, match=r"already enrolled for John Doe \(2021001\)") as raised:
+        enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image())
+    assert raised.value.check.other_student_id == "2021001"
+    # Not even with confirmation: it would make attendance reject both students
+    with pytest.raises(DuplicateFaceError):
+        enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image(), confirmed=True)
+    assert enrollment_service.get_student_samples_count(other) == 0
+
+
+def test_a_similar_face_needs_confirmation(enrollment_service, two_students):
+    first, other = two_students
+    enrolled = enrollment_service._get_embedder().generate_embedding.return_value
+    _set_face(enrollment_service, _near(enrolled, 0.4))      # under 0.45 (0.75 x 0.6), above the 0.3 duplicate limit
+    with pytest.raises(FaceNeedsConfirmationError, match="looks like John Doe") as raised:
+        enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image())
+    assert raised.value.check.status == "similar"
+    assert enrollment_service.get_student_samples_count(other) == 0
+
+    enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image(), confirmed=True)
+    assert enrollment_service.get_student_samples_count(other) == 1
+
+
+def test_a_face_unlike_the_students_own_samples_needs_confirmation(enrollment_service, two_students):
+    first, _ = two_students
+    _set_face(enrollment_service, _other_face())
+    with pytest.raises(FaceNeedsConfirmationError, match="does not match this student's other face samples"):
+        enrollment_service.add_face_sample(student_db_id=first, face_image=_make_face_image())
+    enrollment_service.add_face_sample(student_db_id=first, face_image=_make_face_image(), confirmed=True)
+    assert enrollment_service.get_student_samples_count(first) == 2
+
+
+def test_more_samples_of_the_same_student_need_no_confirmation(enrollment_service, two_students):
+    first, _ = two_students
+    enrolled = enrollment_service._get_embedder().generate_embedding.return_value
+    _set_face(enrollment_service, _near(enrolled, 0.2))
+    enrollment_service.add_face_sample(student_db_id=first, face_image=_make_face_image())
+    assert enrollment_service.get_student_samples_count(first) == 2
+
+
+def test_the_face_index_is_not_rebuilt_for_this_process_s_own_enrollments(
+        enrollment_service, student_service, two_students, monkeypatch):
+    """Checking a face must not reload the gallery each time (performance)."""
+    first, other = two_students
+    loads = []
+    real_load = enrollment_service.load_active_gallery
+    monkeypatch.setattr(enrollment_service, "load_active_gallery",
+                        lambda *a, **k: loads.append(1) or real_load(*a, **k))
+    builds = []
+    real_index = enrollment_module.FaceIndex
+    monkeypatch.setattr(enrollment_module, "FaceIndex", lambda *a: builds.append(1) or real_index(*a))
+
+    for sid in ("2021003", "2021004", "2021005"):
+        new = student_service.create_student(student_id=sid, name=f"Student {sid}")
+        _set_face(enrollment_service, _other_face())
+        enrollment_service.add_face_sample(student_db_id=new, face_image=_make_face_image())
+    assert builds == []                     # built once (by the fixture), then kept in step
+
+    # A change this process did not record (here: a reset) rebuilds it once
+    enrollment_service.clear_student_face_dataset(first)
+    _set_face(enrollment_service, _other_face())
+    enrollment_service.add_face_sample(student_db_id=other, face_image=_make_face_image())
+    assert builds == [1]
+
+
+def test_find_duplicate_faces_lists_students_sharing_a_face(enrollment_service, two_students):
+    first, other = two_students
+    enrolled = enrollment_service._get_embedder().generate_embedding.return_value
+    # Enrolled before the checks existed (or by another tool): straight to save_face_sample
+    student = enrollment_service.student_repo.get_by_id(other)
+    enrollment_service.save_face_sample(student, np.zeros((10, 10, 3), np.uint8), enrolled, 0.9)
+
+    pairs = enrollment_service.find_duplicate_faces()
+    assert [(p.student_a, p.student_b, p.same_face) for p in pairs] == [("2021001", "2021002", True)]
