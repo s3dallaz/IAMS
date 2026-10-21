@@ -304,3 +304,127 @@ def test_gallery_signature_tracks_gallery_changes(enrollment_service, student_se
 
     enrollment_service.clear_student_face_dataset(sample_student)
     assert enrollment_service.gallery_signature() == empty
+
+
+def _gallery_cache(enrollment_service):
+    return enrollment_service._gallery_cache_path(enrollment_service._gallery_backend())
+
+
+def _count_sample_reads(enrollment_service, monkeypatch):
+    """List that receives the key of every sample read from its own encoding file."""
+    reads = []
+    original = enrollment_service._read_sample_encoding
+
+    def counting(key, backend):
+        reads.append(key)
+        return original(key, backend)
+
+    monkeypatch.setattr(enrollment_service, "_read_sample_encoding", counting)
+    return reads
+
+
+def _add_samples(enrollment_service, student_db_id, count):
+    for _ in range(count):
+        enrollment_service.save_face_sample(
+            enrollment_service.student_repo.get_by_id(student_db_id), np.zeros((20, 20, 3), dtype=np.uint8),
+            FaceEmbedding(np.random.randn(128)), 0.9)
+
+
+def test_gallery_is_read_from_the_cache_file_while_unchanged(enrollment_service, sample_student, temp_dirs):
+    """Reading one file per sample took ~44 s for 11,200 samples after a restart."""
+    _add_samples(enrollment_service, sample_student, 2)
+    first = enrollment_service.load_active_gallery()
+    assert _gallery_cache(enrollment_service).exists()
+
+    enc_dir, _ = temp_dirs
+    for sample_file in (enc_dir / "2021001").glob("*.npy"):
+        sample_file.unlink()                            # the cache alone must be enough now
+    cached = enrollment_service.load_active_gallery()
+
+    assert [identity for identity, _ in cached] == [identity for identity, _ in first] == ["2021001"] * 2
+    for (_, a), (_, b) in zip(cached, first):
+        np.testing.assert_array_equal(a.encoding, b.encoding)
+
+
+def test_gallery_load_reads_only_samples_missing_from_the_cache(enrollment_service, student_service,
+                                                                sample_student, monkeypatch):
+    _add_samples(enrollment_service, sample_student, 3)
+    enrollment_service.load_active_gallery()
+    reads = _count_sample_reads(enrollment_service, monkeypatch)
+
+    other = student_service.create_student(student_id="2021002", name="Jane Roe")
+    _add_samples(enrollment_service, other, 1)
+    gallery = enrollment_service.load_active_gallery()
+    assert len(reads) == 1                              # only the new sample, not all four
+    assert sorted(i for i, _ in gallery) == ["2021001"] * 3 + ["2021002"]
+
+    reads.clear()
+    student_service.deactivate_student(other)
+    assert [i for i, _ in enrollment_service.load_active_gallery()] == ["2021001"] * 3
+    assert reads == []                                  # leaving needs no file reads
+    student_service.activate_student(other)
+    assert len(enrollment_service.load_active_gallery()) == 4
+    assert len(reads) == 1                              # returning reads only that student's sample
+
+    enrollment_service.clear_student_face_dataset(sample_student)
+    assert [i for i, _ in enrollment_service.load_active_gallery()] == ["2021002"]
+
+
+def test_rebuild_reads_every_sample_again(enrollment_service, sample_student, monkeypatch):
+    _add_samples(enrollment_service, sample_student, 3)
+    enrollment_service.load_active_gallery()
+    reads = _count_sample_reads(enrollment_service, monkeypatch)
+    assert enrollment_service.prepare_recognition_data(rebuild=True) == 3
+    assert len(reads) == 3
+
+
+def test_gallery_load_reports_progress_only_for_files_it_reads(enrollment_service, sample_student):
+    _add_samples(enrollment_service, sample_student, 3)
+    calls = []
+    enrollment_service.load_active_gallery(progress=lambda done, total: calls.append((done, total)))
+    assert calls[0] == (0, 3) and calls[-1] == (3, 3)
+
+    calls.clear()
+    enrollment_service.load_active_gallery(progress=lambda done, total: calls.append((done, total)))
+    assert calls == []                                  # all from the cache
+
+
+def test_gallery_cache_status(enrollment_service, sample_student):
+    assert enrollment_service.gallery_cache_status() == {"samples": 0, "pending": 0}
+    _add_samples(enrollment_service, sample_student, 2)
+    assert enrollment_service.gallery_cache_status() == {"samples": 2, "pending": 2}
+    enrollment_service.prepare_recognition_data()
+    assert enrollment_service.gallery_cache_status() == {"samples": 2, "pending": 0}
+
+
+def test_adding_a_face_updates_an_existing_cache_only(enrollment_service, sample_student, monkeypatch):
+    enrollment_service.add_face_sample(student_db_id=sample_student, face_image=_make_face_image())
+    assert not _gallery_cache(enrollment_service).exists()   # no cache: building one is the button's job
+
+    enrollment_service.prepare_recognition_data()
+    enrollment_service.add_face_sample(student_db_id=sample_student, face_image=_make_face_image())
+    assert enrollment_service.gallery_cache_status() == {"samples": 2, "pending": 0}
+
+
+def test_missing_sample_file_is_not_read_again(enrollment_service, sample_student, temp_dirs, monkeypatch):
+    _add_samples(enrollment_service, sample_student, 2)
+    enc_dir, _ = temp_dirs
+    next((enc_dir / "2021001").glob("*.npy")).unlink()
+    assert len(enrollment_service.load_active_gallery()) == 1
+    reads = _count_sample_reads(enrollment_service, monkeypatch)
+    assert len(enrollment_service.load_active_gallery()) == 1
+    assert reads == []                                  # remembered as missing; a rebuild checks again
+
+
+def test_unreadable_or_old_gallery_cache_is_rebuilt(enrollment_service, sample_student):
+    _add_samples(enrollment_service, sample_student, 1)
+    cache = _gallery_cache(enrollment_service)
+    for content in (b"not a numpy file", None):
+        if content is None:                             # the first cache format (no per-sample keys)
+            with open(cache, "wb") as f:
+                np.savez(f, signature=np.array("x"), identities=np.array(["2021001"]),
+                         encodings=np.zeros((1, 128)))
+        else:
+            cache.write_bytes(content)
+        assert [i for i, _ in enrollment_service.load_active_gallery()] == ["2021001"]
+        assert enrollment_service.gallery_cache_status()["pending"] == 0   # rewritten

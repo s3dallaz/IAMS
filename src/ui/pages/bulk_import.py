@@ -30,6 +30,11 @@ logger = get_logger(__name__)
 PREVIEW_ROWS = 500   # rows shown per preview table (the import itself has no such limit)
 
 
+def recognition_data_progress_text(done: int, total: int) -> str:
+    """Progress bar text while face samples are read into the recognition data (gallery cache)."""
+    return f"Preparing recognition data: {done:,} / {total:,} face samples ({done * 100 // total}%)"
+
+
 def render_bulk_import_view(student_service: StudentService, enrollment_service: EnrollmentService):
     """Bulk import page: students from Excel/CSV, then their face photos from a ZIP."""
     st.subheader("📥 Bulk Import")
@@ -175,9 +180,13 @@ def _render_face_import(student_service: StudentService, enrollment_service: Enr
                 text = f"{done} / {total} photos" + (f" - {current}" if current else "")
                 progress_bar.progress(done / total if total else 1.0, text=text)
 
+        def show_gallery_progress(done: int, total: int):
+            progress_bar.progress(done / total, text=recognition_data_progress_text(done, total))
+
         try:
             report = import_face_zip(uploaded.getvalue(), enrollment_service, student_service,
-                                     skip_students_with_faces=skip_existing, progress=show_progress)
+                                     skip_students_with_faces=skip_existing, progress=show_progress,
+                                     gallery_progress=show_gallery_progress)
         except BulkImportError as e:
             st.error(f"❌ {e}")
             return

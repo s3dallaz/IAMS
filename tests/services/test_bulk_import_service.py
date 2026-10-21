@@ -356,3 +356,12 @@ def test_report_csv_lists_every_photo(faces, students):
     report = import_face_zip(_zip({"2021001.jpg": _photo(PERSON_A), "9.jpg": _photo(PERSON_B)}), faces, students)
     lines = report.report_csv().decode("utf-8-sig").splitlines()
     assert lines[0] == "file,student_id,status,message" and len(lines) == 3
+
+
+def test_imported_faces_are_added_to_the_recognition_data(faces, students):
+    """The attendance engine must not read thousands of new sample files at its next start."""
+    gallery_calls = []
+    import_face_zip(_zip({"2021001.jpg": _photo(PERSON_A), "2021002.jpg": _photo(PERSON_B)}), faces, students,
+                    gallery_progress=lambda done, total: gallery_calls.append((done, total)))
+    assert faces.gallery_cache_status() == {"samples": 2, "pending": 0}
+    assert gallery_calls[-1] == (2, 2)                   # the two new samples, read once at the end

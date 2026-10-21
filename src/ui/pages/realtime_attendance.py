@@ -58,6 +58,19 @@ def _get_engine() -> EngineController:
     return EngineController()
 
 
+def _show_recognition_data_hint() -> None:
+    """Before starting: say so when face samples still need preparing (the engine reads them first)."""
+    try:
+        status = EnrollmentService().gallery_cache_status()
+    except Exception as e:
+        logger.warning(f"Could not read the recognition data status: {e}")
+        return
+    if status["pending"]:
+        st.info(f"ℹ️ {status['pending']:,} of {status['samples']:,} face samples are not prepared yet: "
+                f"recognition begins once they are read (the video shows the progress). To skip the wait, "
+                f"use **Student Registry → Prepare recognition data** before starting.")
+
+
 def render_realtime_attendance():
     """Main function to render the Real-Time Attendance page."""
     st.title("📹 Real-Time Attendance Monitoring")
@@ -197,6 +210,9 @@ def render_realtime_attendance():
         "cooldown_seconds": cooldown_seconds,
         "head_turn_angle": float(head_turn_angle),
     }
+
+    if not st.session_state.att_camera_active:
+        _show_recognition_data_hint()
 
     # Camera Control Buttons
     col_cam1, col_cam2 = st.columns(2)

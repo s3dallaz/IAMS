@@ -29,7 +29,7 @@ from src.services.enrollment_service import (
     InvalidFaceImageError
 )
 from src.computer_vision.camera_manager import CameraManager
-from src.ui.pages.bulk_import import render_bulk_import_view
+from src.ui.pages.bulk_import import recognition_data_progress_text, render_bulk_import_view
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -104,6 +104,62 @@ def render_student_registry():
 
 
 # ============================================================================
+# Recognition data (gallery cache)
+# ============================================================================
+
+def render_recognition_data_panel(enrollment_service: EnrollmentService):
+    """
+    Whether the face samples are prepared for live attendance, with a button
+    that prepares them (progress bar). Samples added here or by a bulk import
+    are prepared automatically; a full preparation is needed on a new machine,
+    after copying the data, or as a repair.
+    """
+    try:
+        status = enrollment_service.gallery_cache_status()
+    except Exception as e:
+        logger.warning(f"Could not read the recognition data status: {e}")
+        return
+    samples, pending = status["samples"], status["pending"]
+    if samples == 0:
+        return
+
+    col_msg, col_btn = st.columns([3, 1])
+    with col_msg:
+        if pending:
+            st.warning(f"⚠️ **Recognition data needs preparing:** {pending:,} of {samples:,} face samples "
+                       f"are not prepared. Prepare them now - otherwise starting attendance does it first "
+                       f"(about a minute for 10,000 samples).")
+        else:
+            st.caption(f"✅ Recognition data ready: {samples:,} face samples. Attendance starts at once.")
+    with col_btn:
+        if pending:
+            clicked = st.button("⚙️ Prepare recognition data", type="primary", width="stretch",
+                                key="btn_prepare_recognition_data")
+        else:
+            clicked = st.button("🔄 Rebuild recognition data", width="stretch", key="btn_rebuild_recognition_data",
+                                help="Reads every face sample again (repair). Takes about a minute for 10,000 samples.")
+    if not clicked:
+        return
+
+    release_registration_camera()
+    progress_bar = st.progress(0.0, text="Preparing recognition data...")
+
+    def show_progress(done: int, total: int):
+        progress_bar.progress(done / total, text=recognition_data_progress_text(done, total))
+
+    started = time.time()
+    try:
+        prepared = enrollment_service.prepare_recognition_data(progress=show_progress, rebuild=not pending)
+    except Exception as e:
+        logger.exception("Preparing the recognition data failed")
+        st.error(f"❌ Could not prepare the recognition data: {e}")
+        return
+    st.session_state['registry_feedback'] = (
+        'success', f"✅ Recognition data ready: {prepared:,} face samples prepared in {time.time() - started:.0f} s.")
+    st.rerun()
+
+
+# ============================================================================
 # View 1: Main Directory & Student List
 # ============================================================================
 
@@ -125,6 +181,8 @@ def render_directory_view(service: StudentService, enrollment_service: Enrollmen
             release_registration_camera()
             st.session_state['current_view'] = 'bulk_import'
             st.rerun()
+
+    render_recognition_data_panel(enrollment_service)
 
     # Search and Filter
     col_s1, col_s2 = st.columns([2, 1])

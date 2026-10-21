@@ -168,6 +168,7 @@ def test_delete_confirmation_warning_box():
     mock_service.get_student_by_id.return_value = {'id': 1, 'student_id': 'DEL101', 'name': 'John Delete'}
     mock_enroll_svc = MagicMock()
     mock_enroll_svc.get_all_samples_counts.return_value = {1: 2}
+    mock_enroll_svc.gallery_cache_status.return_value = {"samples": 2, "pending": 0}
 
     fake_state = {
         'confirm_delete_id': 1,
@@ -239,6 +240,7 @@ def test_directory_shows_action_buttons_one_page_at_a_time():
          'is_active': 1, 'enrolled_at': None} for i in range(1, 61)]
     mock_enroll_svc = MagicMock()
     mock_enroll_svc.get_all_samples_counts.return_value = {1: 1}
+    mock_enroll_svc.gallery_cache_status.return_value = {"samples": 1, "pending": 0}
 
     with patch("streamlit.session_state", {'current_view': 'directory'}), \
          patch("streamlit.button", return_value=False) as mock_btn, \
@@ -251,3 +253,43 @@ def test_directory_shows_action_buttons_one_page_at_a_time():
     face_buttons = [c.kwargs["key"] for c in mock_btn.call_args_list if c.kwargs.get("key", "").startswith("btn_face_")]
     assert face_buttons == [f"btn_face_{i}" for i in range(51, 61)]   # page 3: students 51-60
     mock_enroll_svc.get_student_samples_count.assert_not_called()   # one query for all counts
+
+
+def test_recognition_data_panel_prepares_pending_samples_with_a_progress_bar():
+    from src.ui.pages.student_registry import render_recognition_data_panel
+    mock_enroll_svc = MagicMock()
+    mock_enroll_svc.gallery_cache_status.return_value = {"samples": 11200, "pending": 11200}
+
+    def prepare(progress=None, rebuild=False):
+        progress(0, 11200)
+        progress(4200, 11200)
+        return 11200
+
+    mock_enroll_svc.prepare_recognition_data.side_effect = prepare
+    fake_state = {}
+    with patch("streamlit.session_state", fake_state), \
+         patch("streamlit.warning") as mock_warn, \
+         patch("streamlit.button", return_value=True) as mock_btn, \
+         patch("streamlit.progress") as mock_progress, \
+         patch("streamlit.rerun"):
+        render_recognition_data_panel(mock_enroll_svc)
+
+    assert "needs preparing" in mock_warn.call_args.args[0]
+    assert mock_btn.call_args.kwargs["key"] == "btn_prepare_recognition_data"
+    assert mock_enroll_svc.prepare_recognition_data.call_args.kwargs["rebuild"] is False
+    texts = [c.kwargs["text"] for c in mock_progress.return_value.progress.call_args_list]
+    assert texts[-1] == "Preparing recognition data: 4,200 / 11,200 face samples (37%)"
+    assert fake_state["registry_feedback"][0] == "success"
+
+
+def test_recognition_data_panel_offers_a_rebuild_when_ready():
+    from src.ui.pages.student_registry import render_recognition_data_panel
+    mock_enroll_svc = MagicMock()
+    mock_enroll_svc.gallery_cache_status.return_value = {"samples": 5, "pending": 0}
+    with patch("streamlit.session_state", {}), \
+         patch("streamlit.warning") as mock_warn, \
+         patch("streamlit.button", return_value=False) as mock_btn:
+        render_recognition_data_panel(mock_enroll_svc)
+    mock_warn.assert_not_called()
+    assert mock_btn.call_args.kwargs["key"] == "btn_rebuild_recognition_data"
+    mock_enroll_svc.prepare_recognition_data.assert_not_called()

@@ -8,8 +8,10 @@ and constructing the active recognition gallery.
 
 import hashlib
 import os
+import threading
+import time
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any
 import numpy as np
 import cv2
 
@@ -21,6 +23,32 @@ from src.data.repositories.student_repository import StudentRepository
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Gallery cache file layout; a file with another version is rebuilt
+GALLERY_CACHE_VERSION = 2
+
+# progress(done, total) while a gallery load reads sample files
+GalleryProgress = Callable[[int, int], None]
+
+
+def _throttled(progress: Optional[GalleryProgress], total: int, interval: float = 0.1) -> Callable[[int], None]:
+    """
+    report(done) that calls progress(done, total) at most every `interval`
+    seconds, plus at the start and the end (a progress bar updated for each
+    of 11,000 files would slow the load down).
+    """
+    if progress is None or total == 0:
+        return lambda done: None
+    progress(0, total)
+    last = time.perf_counter()
+
+    def report(done: int) -> None:
+        nonlocal last
+        now = time.perf_counter()
+        if done == total or now - last >= interval:
+            last = now
+            progress(done, total)
+    return report
 
 
 def encoding_file_for_backend(encoding_path: Path, backend: str) -> Path:
@@ -166,8 +194,12 @@ class EnrollmentService:
         face, face_crop, embedding = self.prepare_face_sample(face_image)
 
         # Steps 3-4: save the files and the enrollment record
-        return self.save_face_sample(student, face_crop, embedding, float(face.confidence),
-                                     enrollment_method=enrollment_method, view_angle=view_angle)
+        enrollment_id = self.save_face_sample(student, face_crop, embedding, float(face.confidence),
+                                              enrollment_method=enrollment_method, view_angle=view_angle)
+        # The attendance engine then finds the new sample in the cache instead
+        # of reading it at start-up (bulk imports update the cache once at the end)
+        self.update_gallery_cache()
+        return enrollment_id
 
     def prepare_face_sample(self, face_image: np.ndarray) -> Tuple[DetectedFace, np.ndarray, FaceEmbedding]:
         """
@@ -315,51 +347,170 @@ class EnrollmentService:
             'angles_present': list(angles_present)
         }
         
-    def load_active_gallery(self) -> List[Tuple[str, FaceEmbedding]]:
+    def load_active_gallery(
+        self,
+        progress: Optional[GalleryProgress] = None,
+        rebuild: bool = False
+    ) -> List[Tuple[str, FaceEmbedding]]:
         """
-        Load all active face embeddings from disk/database for all active students.
-        
+        Load all active face embeddings for all active students.
+
+        The encodings are kept in one cache file (gallery_cache_<backend>.npz
+        in the encodings folder), one row per enrollment sample. A load reads
+        only the samples that are not in the cache yet and saves the updated
+        cache: after a restart, reading 11,200 sample files took ~44 s (cold
+        disk cache, antivirus scanning every file) and timed the engine out,
+        while the cache loads in ~30 ms. Removed or deactivated samples are
+        simply left out.
+
+        Args:
+            progress: called as progress(done, total) while sample files are
+                read (not called when everything comes from the cache)
+            rebuild: ignore the cache and read every sample file again
+
         Returns:
             List of (student_id_string, FaceEmbedding) tuples ready for FaceRecognizer
         """
-        gallery: List[Tuple[str, FaceEmbedding]] = []
         backend = self._gallery_backend()
+        keys = self.enrollment_repo.get_active_gallery_keys()
+        cached = {} if rebuild else self._read_gallery_cache(backend)
 
-        # Get all active students
-        students = self.student_repo.get_all(active_only=True)
-        student_map = {s['id']: s['student_id'] for s in students}
-        
-        enrollments = self.enrollment_repo.get_all(active_only=True)
-        
-        for record in enrollments:
-            student_db_id = record['student_id']
-            if student_db_id not in student_map:
-                continue  # Student inactive or deleted
-                
-            student_id_str = student_map[student_db_id]
-            encoding_path = encoding_file_for_backend(Path(record['encoding_path']), backend)
-            if not encoding_path.exists() and backend == "sface":
-                encoding_path = self._create_sface_encoding(encoding_path, student_id_str) or encoding_path
+        to_read = [key for key in keys if key not in cached]
+        rows: Dict[tuple, Optional[np.ndarray]] = dict(cached)
+        unreadable = set()
+        report = _throttled(progress, len(to_read))
+        for done, key in enumerate(to_read, start=1):
+            encoding, readable = self._read_sample_encoding(key, backend)
+            rows[key] = encoding
+            if not readable:
+                unreadable.add(key)  # try again next time instead of caching the failure
+            report(done)
 
-            if encoding_path.exists():
-                try:
-                    encoding_arr = np.load(str(encoding_path))
-                    if encoding_arr.shape == (128,):
-                        gallery.append((student_id_str, FaceEmbedding(encoding_arr)))
-                except Exception as e:
-                    logger.warning(f"Could not load encoding from {encoding_path}: {e}")
-            else:
-                logger.debug(f"Encoding file missing: {encoding_path}")
-                
-        logger.info(f"Loaded active recognition gallery with {len(gallery)} face samples ({backend})")
+        gallery = [(key[2], FaceEmbedding(rows[key])) for key in keys if rows[key] is not None]
+        if to_read or len(cached) != len(keys):
+            self._write_gallery_cache(backend, [key for key in keys if key not in unreadable], rows)
+        logger.info(f"Loaded active recognition gallery with {len(gallery)} face samples ({backend}, "
+                    f"{len(to_read)} read from their files, {len(keys) - len(to_read)} from the cache)")
         return gallery
+
+    def update_gallery_cache(self) -> None:
+        """
+        Bring an existing gallery cache up to date after an enrollment change
+        (reads only the new samples). Without a cache it does nothing: building
+        one reads every sample, which prepare_recognition_data() does with a
+        progress bar.
+        """
+        if not self._gallery_cache_path(self._gallery_backend()).exists():
+            return
+        try:
+            self.load_active_gallery()
+        except Exception as e:
+            logger.warning(f"Could not update the gallery cache: {e}")
+
+    def prepare_recognition_data(self, progress: Optional[GalleryProgress] = None,
+                                 rebuild: bool = False) -> int:
+        """Build the gallery cache ahead of an attendance session. Returns the number of face samples."""
+        return len(self.load_active_gallery(progress=progress, rebuild=rebuild))
+
+    def gallery_cache_status(self) -> Dict[str, int]:
+        """
+        {'samples': active face samples, 'pending': samples not in the gallery
+        cache yet}. Cheap: one SQL query and the cache's keys, no encodings.
+        """
+        keys = self.enrollment_repo.get_active_gallery_keys()
+        cached = self._read_gallery_cache(self._gallery_backend(), keys_only=True)
+        return {"samples": len(keys), "pending": sum(1 for key in keys if key not in cached)}
+
+    def _read_sample_encoding(self, key: tuple, backend: str) -> Tuple[Optional[np.ndarray], bool]:
+        """
+        (encoding or None, readable) of one sample from its own file. A missing
+        file or wrong shape is a final None; readable is False only for a read
+        error, which is worth retrying.
+        """
+        _, encoding_path, student_id_str = key
+        path = encoding_file_for_backend(Path(encoding_path), backend)
+        if not path.exists() and backend == "sface":
+            path = self._create_sface_encoding(path, student_id_str) or path
+        if not path.exists():
+            logger.debug(f"Encoding file missing: {path}")
+            return None, True
+        try:
+            encoding = np.load(str(path))
+        except Exception as e:
+            logger.warning(f"Could not load encoding from {path}: {e}")
+            return None, False
+        return (encoding if encoding.shape == (128,) else None), True
+
+    def _gallery_cache_path(self, backend: str) -> Path:
+        return self.encodings_dir / f"gallery_cache_{backend}.npz"
+
+    def _read_gallery_cache(self, backend: str, keys_only: bool = False) -> Dict[tuple, Optional[np.ndarray]]:
+        """
+        Cached rows as {(enrollment id, encoding path, student_id): encoding,
+        or None for a sample without a usable encoding}; {} if there is no
+        usable cache. keys_only skips reading the encodings (values are None).
+        """
+        path = self._gallery_cache_path(backend)
+        if not path.exists():
+            return {}
+        try:
+            with np.load(str(path), allow_pickle=False) as data:
+                if "version" not in data.files or int(data["version"]) != GALLERY_CACHE_VERSION:
+                    logger.info(f"Gallery cache {path.name} has an older format; it will be rebuilt")
+                    return {}
+                ids, paths, identities = data["enrollment_ids"], data["paths"], data["identities"]
+                valid = encodings = None
+                if not keys_only:
+                    valid, encodings = data["valid"], data["encodings"]
+            if not len(ids) == len(paths) == len(identities):
+                raise ValueError("key arrays differ in length")
+            keys = list(zip(map(int, ids.tolist()), paths.tolist(), identities.tolist()))
+            if keys_only:
+                return dict.fromkeys(keys)
+            if encodings.shape != (len(keys), 128) or len(valid) != len(keys):
+                raise ValueError(f"unexpected shapes {encodings.shape} / {valid.shape} for {len(keys)} rows")
+            return {key: (encodings[n] if valid[n] else None) for n, key in enumerate(keys)}
+        except Exception as e:
+            logger.warning(f"Ignoring unreadable gallery cache {path.name}: {e}")
+            return {}
+
+    def _write_gallery_cache(self, backend: str, keys: List[tuple],
+                             rows: Dict[tuple, Optional[np.ndarray]]) -> None:
+        """
+        Save the rows of `keys` as one file. Encodings are stored as float64
+        (they are float64 already; recognition computes in float64 anyway).
+        A failure only costs the next load its speed.
+        """
+        path = self._gallery_cache_path(backend)
+        # Unique temporary name, then an atomic replace: a reader never sees a half-written file
+        tmp_path = path.with_name(f"{path.stem}.{os.getpid()}-{threading.get_ident()}.tmp")
+        encodings = np.zeros((len(keys), 128), dtype=np.float64)
+        valid = np.zeros(len(keys), dtype=bool)
+        for n, key in enumerate(keys):
+            if rows[key] is not None:
+                encodings[n] = rows[key]
+                valid[n] = True
+        try:
+            with open(tmp_path, "wb") as f:
+                np.savez(f, version=np.array(GALLERY_CACHE_VERSION),
+                         enrollment_ids=np.array([key[0] for key in keys], dtype=np.int64),
+                         paths=np.array([key[1] for key in keys], dtype=str),
+                         identities=np.array([key[2] for key in keys], dtype=str),
+                         valid=valid, encodings=encodings)
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.warning(f"Could not save the gallery cache {path.name}: {e}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def gallery_signature(self) -> str:
         """
         Fingerprint of what load_active_gallery() would load: changes when a
         sample is added, removed or (de)activated, or a student is
-        (de)activated or renamed. One SQL query (~tens of ms), while loading
-        the gallery reads every encoding file (~2.6 s for 11,000 samples).
+        (de)activated or renamed. One SQL query (~tens of ms), cheaper than
+        even a cached gallery load.
         """
         digest = hashlib.blake2b(self._gallery_backend().encode(), digest_size=16)
         for key in self.enrollment_repo.get_active_gallery_keys():

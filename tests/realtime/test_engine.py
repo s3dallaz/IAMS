@@ -17,7 +17,7 @@ import pytest
 
 from src.computer_vision.liveness_detector import LivenessState
 from src.realtime import engine as engine_module
-from src.realtime.engine import VisionEngine, draw_preview, instruction_bar, make_handler
+from src.realtime.engine import VisionEngine, draw_preview, gallery_loading_texts, instruction_bar, make_handler
 from src.realtime.engine_client import EngineController, _free_port
 from src.realtime.protocol import result_from_dict, result_to_dict
 from src.services.real_time_attendance_service import FaceProcessingResult, RealTimeAttendanceResult
@@ -127,6 +127,7 @@ def running_engine(monkeypatch):
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     assert engine.start()
+    assert engine._gallery_ready.wait(5)              # the background gallery load
     loop = threading.Thread(target=engine.run, daemon=True)
     loop.start()
     yield engine, f"http://127.0.0.1:{port}", manager, camera, enrollment, loop
@@ -240,7 +241,7 @@ def test_gallery_reload_runs_off_the_frame_loop_and_only_on_changes(monkeypatch)
     signature = {"value": "v1"}
     loads = []
 
-    def slow_load():
+    def slow_load(*_, **__):
         loads.append(signature["value"])
         if len(loads) > 1:
             time.sleep(0.5)                       # a large gallery takes seconds to load
@@ -271,3 +272,117 @@ def test_gallery_reload_runs_off_the_frame_loop_and_only_on_changes(monkeypatch)
     assert manager.set_gallery.call_count == 2
     gaps = np.diff(frame_times)
     assert gaps.max() < 0.25                                # the 0.5 s load did not freeze the frames
+
+
+def _engine_with_gallery_load(monkeypatch, load_active_gallery):
+    """A started VisionEngine (fake camera and manager) whose gallery loads with `load_active_gallery`."""
+    camera = MagicMock()
+    camera.open.return_value = True
+
+    def read_frame():
+        time.sleep(0.005)
+        return True, np.zeros((48, 64, 3), dtype=np.uint8)
+
+    camera.read_frame.side_effect = read_frame
+    manager = MagicMock()
+    manager.process_frame_async.return_value = _result(_face())
+    enrollment = MagicMock()
+    enrollment.return_value.gallery_signature.return_value = "v1"
+    enrollment.return_value.load_active_gallery.side_effect = load_active_gallery
+    monkeypatch.setattr(engine_module, "CameraManager", MagicMock(return_value=camera))
+    monkeypatch.setattr(engine_module, "RealTimeAttendanceManager", MagicMock(return_value=manager))
+    monkeypatch.setattr(engine_module, "EnrollmentService", enrollment)
+    monkeypatch.setattr(engine_module, "GALLERY_RETRY_SECONDS", 0.05)
+
+    engine = VisionEngine(session_id=3, settings={})
+    started = time.perf_counter()
+    assert engine.start()
+    start_seconds = time.perf_counter() - started
+    loop = threading.Thread(target=engine.run, daemon=True)
+    loop.start()
+    return engine, manager, loop, start_seconds
+
+
+def test_engine_starts_without_waiting_for_a_slow_gallery(monkeypatch):
+    """A large gallery used to load inside start() and time the engine out (45 s)."""
+    release = threading.Event()
+
+    def blocked_load(*_, **__):
+        release.wait(5)                                 # 11,200 sample files after a restart
+        return []
+
+    engine, manager, loop, start_seconds = _engine_with_gallery_load(monkeypatch, blocked_load)
+    try:
+        assert start_seconds < 1.0
+        time.sleep(0.2)
+        status = engine.status()
+        assert status["state"] == "running"
+        assert "Loading the student gallery" in status["error"]
+        assert status["result"] is None
+        assert engine.wait_for_frame(-1)[1] is not None  # the video already runs
+        manager.process_frame_async.assert_not_called()  # nobody is shown as "Unknown" meanwhile
+        manager.set_gallery.assert_not_called()
+
+        release.set()
+        assert engine._gallery_ready.wait(2)
+        time.sleep(0.2)
+        status = engine.status()
+        assert status["error"] is None
+        assert status["result"]["processed_faces"][0]["identity"] == "2021001"
+        manager.set_gallery.assert_called_once()
+    finally:
+        release.set()
+        engine.stop()
+        loop.join(timeout=5)
+
+
+def test_failed_first_gallery_load_is_shown_and_retried(monkeypatch):
+    attempts = []
+
+    def flaky_load(*_, **__):
+        attempts.append(time.perf_counter())
+        if len(attempts) == 1:
+            raise OSError("disk busy")
+        return []
+
+    engine, manager, loop, _ = _engine_with_gallery_load(monkeypatch, flaky_load)
+    try:
+        assert engine._gallery_ready.wait(2)
+        assert len(attempts) == 2
+        assert engine._gallery_error and "disk busy" in engine._gallery_error
+        time.sleep(0.2)
+        assert engine.status()["error"] is None
+        manager.process_frame_async.assert_called()
+    finally:
+        engine.stop()
+        loop.join(timeout=5)
+
+
+def test_gallery_loading_shows_the_percentage(monkeypatch):
+    release = threading.Event()
+
+    def load_with_progress(progress=None, **_):
+        progress(0, 200)
+        progress(50, 200)                               # 50 of 200 unprepared samples read
+        release.wait(5)
+        progress(200, 200)
+        return []
+
+    engine, manager, loop, _ = _engine_with_gallery_load(monkeypatch, load_with_progress)
+    try:
+        time.sleep(0.2)
+        assert "25%" in engine.status()["error"]
+        assert "50 / 200" in engine.status()["error"]
+        release.set()
+        assert engine._gallery_ready.wait(2)
+    finally:
+        release.set()
+        engine.stop()
+        loop.join(timeout=5)
+
+
+def test_gallery_loading_texts():
+    assert gallery_loading_texts(None)[0] == "Loading students - please wait"
+    bar, panel = gallery_loading_texts((4200, 11200))
+    assert bar == "Loading students 37% - please wait"
+    assert "4,200 / 11,200" in panel and "Prepare recognition data" in panel

@@ -12,10 +12,12 @@ delivered ~15 fps and each st.image() call took ~57 ms):
         --> MJPEG stream to the browser
 
     recognition worker thread: detection, recognition, spoof checks, marking
-    gallery reload thread: every GALLERY_RELOAD_SECONDS checks whether the
-        enrollments changed and, only then, loads the new gallery and swaps
-        it in (loading 11,000 samples takes ~2.6 s; in the main loop it froze
-        the video)
+    gallery thread: loads the gallery after start-up (the video runs
+        meanwhile; recognition waits for it), then every
+        GALLERY_RELOAD_SECONDS checks whether the enrollments changed and,
+        only then, loads the new gallery and swaps it in (11,000 samples
+        take ~2.6 s without the gallery cache, ~44 s after a restart - in
+        start-up that timed the engine out, in the main loop it froze the video)
 
 HTTP API on 127.0.0.1 (the only way in):
     GET  /stream.mjpg   annotated video (multipart MJPEG, shown with <img>)
@@ -37,7 +39,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import config  # noqa: F401 - sets the camera flags before cv2 is imported
 import cv2
@@ -59,6 +61,7 @@ logger = get_logger(__name__)
 
 JPEG_QUALITY = 80
 GALLERY_RELOAD_SECONDS = 30.0   # students enrolled during a session are picked up (background thread)
+GALLERY_RETRY_SECONDS = 5.0     # retry of a failed first gallery load
 MARK_BANNER_SECONDS = 3.0       # how long "Marked: <name>" stays on the video
 PERF_LOG_FRAMES = 150
 
@@ -102,6 +105,17 @@ def instruction_bar(result: RealTimeAttendanceResult, last_mark: Optional[Dict[s
     return text, YELLOW
 
 
+def gallery_loading_texts(progress: Optional[Tuple[int, int]]) -> Tuple[str, str]:
+    """(video bar text, status panel text) while the gallery loads; progress is (done, total) samples."""
+    if not progress or not progress[1]:
+        return "Loading students - please wait", "Loading the student gallery..."
+    done, total = progress
+    percent = done * 100 // total
+    return (f"Loading students {percent}% - please wait",
+            f"Loading the student gallery: {percent}% ({done:,} / {total:,} face samples not prepared yet). "
+            f"Student Registry → Prepare recognition data avoids this wait.")
+
+
 def draw_preview(frame: np.ndarray, text: Optional[str], color) -> np.ndarray:
     """Mirror the frame (like a mirror / front camera) and draw the instruction bar."""
     view = cv2.flip(frame, 1)
@@ -138,6 +152,9 @@ class VisionEngine:
         self.manager: Optional[RealTimeAttendanceManager] = None
         self._last_mark: Optional[Dict[str, Any]] = None
         self._gallery_signature: Optional[str] = None
+        self._gallery_ready = threading.Event()
+        self._gallery_error: Optional[str] = None
+        self._gallery_progress: Optional[Tuple[int, int]] = None  # (done, total) of the first load
 
     # -- control ---------------------------------------------------------
 
@@ -190,21 +207,22 @@ class VisionEngine:
     # -- main loop -----------------------------------------------------------
 
     def start(self) -> bool:
-        """Open the camera and load the pipeline. False (status 'error') on failure."""
+        """
+        Open the camera and set up the pipeline. False (status 'error') on
+        failure. The gallery loads in the background, so a large one cannot
+        delay the start (the app gives the engine START_TIMEOUT_SECONDS).
+        """
         self.camera = CameraManager(self.camera_index, background_reader=True)
         if not self.camera.open():
             self._set_status(state="error", error="Could not open the camera. Is another app using it?")
             return False
         self.manager = RealTimeAttendanceManager(session_id=self.session_id, marked_by="cv_realtime")
         self._apply_settings()
-        enrollment = EnrollmentService()
-        self._gallery_signature = enrollment.gallery_signature()
-        self.manager.set_gallery(enrollment.load_active_gallery())
         self.manager.fast_liveness = True
         self.manager.min_processing_interval = config.RECOGNITION_INTERVAL
         self.manager.enable_background_processing()
         threading.Thread(target=self._gil_probe, name="gil-probe", daemon=True).start()
-        threading.Thread(target=self._reload_gallery_loop, name="gallery-reload", daemon=True).start()
+        threading.Thread(target=self._gallery_loop, name="gallery", daemon=True).start()
         self._set_status(state="running", error=None)
         logger.info(f"Vision engine running for session #{self.session_id}")
         return True
@@ -221,14 +239,20 @@ class VisionEngine:
                     self._set_status(state="running", error="Waiting for the camera...")
                     continue
 
-                with time_operation("liveness_per_frame"):
-                    manager.update_liveness(frame)
-                result = manager.process_frame_async(frame, session_id=self.session_id)
-                manager.refresh_liveness_display(result)
-
-                now = time.time()
-                self._remember_mark(result, now)
-                text, color = instruction_bar(result, self._last_mark, now)
+                gallery_ready = self._gallery_ready.is_set()
+                if gallery_ready:
+                    with time_operation("liveness_per_frame"):
+                        manager.update_liveness(frame)
+                    result = manager.process_frame_async(frame, session_id=self.session_id)
+                    manager.refresh_liveness_display(result)
+                    now = time.time()
+                    self._remember_mark(result, now)
+                    text, color = instruction_bar(result, self._last_mark, now)
+                else:
+                    # Recognition waits for the gallery: with an empty one every
+                    # student would be shown as "Unknown person - not enrolled"
+                    result, color = None, BLUE
+                    text, loading_status = gallery_loading_texts(self._gallery_progress)
                 with time_operation("preview_encode"):
                     view = draw_preview(frame, text, color)
                     ok, jpeg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -241,8 +265,10 @@ class VisionEngine:
                 if elapsed >= 1.0:
                     preview_fps = fps_frames / elapsed
                     fps_frames, fps_start = 0, time.perf_counter()
-                self._set_status(state="running", error=None, preview_fps=round(preview_fps, 1),
-                                 result=result_to_dict(result), last_mark=self._last_mark)
+                self._set_status(state="running", preview_fps=round(preview_fps, 1),
+                                 error=None if gallery_ready else (self._gallery_error or loading_status),
+                                 result=result_to_dict(result) if result is not None else None,
+                                 last_mark=self._last_mark)
 
                 if frames % PERF_LOG_FRAMES == 0:
                     logger.info(f"ENGINE PERFORMANCE: preview {preview_fps:.1f} fps")
@@ -253,25 +279,36 @@ class VisionEngine:
         finally:
             self.shutdown()
 
-    def _reload_gallery_loop(self) -> None:
+    def _gallery_loop(self) -> None:
         """
-        Pick up students enrolled / removed during the session, off the frame
-        loop. A cheap signature query runs every GALLERY_RELOAD_SECONDS; the
-        slow full load only when it changed. set_gallery() swaps the new
-        gallery in with one assignment.
+        Load the gallery, then pick up students enrolled / removed during the
+        session - all off the frame loop. A cheap signature query runs every
+        GALLERY_RELOAD_SECONDS; the slow full load only when it changed.
+        set_gallery() swaps the new gallery in with one assignment.
         """
         enrollment = EnrollmentService()
-        while not self._stop.wait(GALLERY_RELOAD_SECONDS):
+        while not self.stopped:
             try:
                 signature = enrollment.gallery_signature()
-                if signature == self._gallery_signature:
-                    continue
-                with time_operation("gallery_reload"):
-                    gallery = enrollment.load_active_gallery()
-                self.manager.set_gallery(gallery)
-                self._gallery_signature = signature
+                if signature != self._gallery_signature:
+                    with time_operation("gallery_load"):
+                        gallery = enrollment.load_active_gallery(progress=self._on_gallery_progress)
+                    self.manager.set_gallery(gallery)
+                    self._gallery_signature = signature
+                    self._gallery_ready.set()
             except Exception as e:
-                logger.warning(f"Gallery reload failed (keeping the current gallery): {e}")
+                if self._gallery_ready.is_set():
+                    logger.warning(f"Gallery reload failed (keeping the current gallery): {e}")
+                else:
+                    logger.error(f"Gallery load failed (retrying): {e}")
+                    self._gallery_error = f"Could not load the student gallery ({e}) - retrying"
+            wait = GALLERY_RELOAD_SECONDS if self._gallery_ready.is_set() else GALLERY_RETRY_SECONDS
+            if self._stop.wait(wait):
+                break
+
+    def _on_gallery_progress(self, done: int, total: int) -> None:
+        if not self._gallery_ready.is_set():  # reloads during the session run silently
+            self._gallery_progress = (done, total)
 
     def _gil_probe(self) -> None:
         """

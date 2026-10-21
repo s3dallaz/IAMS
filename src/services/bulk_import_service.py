@@ -388,15 +388,20 @@ def import_face_zip(
     student_service: StudentService,
     skip_students_with_faces: bool = True,
     progress: Optional[Callable[[int, int, str], None]] = None,
+    gallery_progress: Optional[Callable[[int, int], None]] = None,
 ) -> FaceImportReport:
     """
     Enroll the face photos in a ZIP file. Each photo is checked on its own; a
-    bad photo is reported and the import continues with the next one.
+    bad photo is reported and the import continues with the next one. At the
+    end the new samples are added to the recognition gallery cache, so the
+    attendance engine does not have to read them at its next start.
 
     Args:
         skip_students_with_faces: leave students who already have face data
             alone (makes a re-run continue where an interrupted one stopped)
         progress: called as progress(done, total, current_file)
+        gallery_progress: called as gallery_progress(done, total) while face
+            samples are read into the gallery cache (before and after the photos)
     """
     try:
         zip_file = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -410,7 +415,7 @@ def import_face_zip(
         raise BulkImportError("No photos (.jpg, .jpeg, .png, .bmp, .webp) were found in the ZIP file.")
 
     sample_counts = enrollment_service.get_all_samples_counts()
-    gallery = _Gallery(enrollment_service)
+    gallery = _Gallery(enrollment_service, gallery_progress)
     threshold = FaceRecognizer(backend=gallery.backend).threshold
     enrolled_now: Set[str] = set()
 
@@ -424,6 +429,11 @@ def import_face_zip(
             enrolled_now.add(photo.student_id)
     if progress:
         progress(len(photos), len(photos), "")
+
+    try:
+        enrollment_service.load_active_gallery(progress=gallery_progress)  # reads only the new samples
+    except Exception as e:
+        logger.warning(f"Could not add the imported faces to the gallery cache: {e}")
 
     counts_after = enrollment_service.get_all_samples_counts()
     report.students_without_faces = [
@@ -439,9 +449,10 @@ def import_face_zip(
 class _Gallery:
     """Embeddings of every enrolled face, growing as photos are enrolled, for the duplicate checks."""
 
-    def __init__(self, enrollment_service: EnrollmentService):
+    def __init__(self, enrollment_service: EnrollmentService,
+                 progress: Optional[Callable[[int, int], None]] = None):
         self.backend = enrollment_service._gallery_backend()
-        entries = enrollment_service.load_active_gallery()
+        entries = enrollment_service.load_active_gallery(progress=progress)
         self.ids: List[str] = [student_id for student_id, _ in entries]
         self.matrix = (np.array([embedding.encoding for _, embedding in entries], dtype=np.float64)
                        if entries else np.zeros((0, 128)))
