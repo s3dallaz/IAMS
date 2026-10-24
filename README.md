@@ -2,19 +2,30 @@
 
 ## 📌 Overview
 
-This project is an AI-powered attendance system that automates student attendance using Computer Vision and face recognition techniques. The system detects and recognizes faces in real-time, records attendance, and tracks student presence duration during lectures.
+This project is an AI-powered attendance system that automates student attendance using Computer Vision and face recognition techniques. A camera recognizes each student, checks that the face is a real, live person (not a photo or a phone screen), and marks them present or late in the running session.
 
 ## 🚀 Features
 
-* Real-time face detection and recognition
-* Automatic attendance recording
-* Attendance duration tracking
-* Late arrival and early leaving detection
-* Liveness detection to prevent cheating
-* Manual identity verification using student ID
-* Adaptive face data updating for improved accuracy
-* Instructor dashboard for monitoring and editing attendance
-* Attendance reports generation
+**Attendance**
+* Real-time face detection and recognition (one camera, one student at a time)
+* Automatic marking as **present** or **late** (late threshold per session)
+* Liveness check against cheating: random blinks + a random head turn, plus anti-spoof models that catch photos and phone / screen replays
+* People far behind the student are ignored, so a queue does not block marking (two people side by side still have to step up one at a time)
+* A small photo is saved with every mark, so an instructor can check it later
+
+**Sessions**
+* Create sessions as **Scheduled** or **Active (start now)**, with an optional end time
+* Scheduled sessions **start by themselves** at their start time and **close by themselves** at their end time — no page needs to be open, and missed times are caught up after a restart
+* Start a session by hand at any time. Started **after** its scheduled time, it starts fresh: lateness counts from the moment it was started
+* Edit any session at any time; changing its start time or late threshold re-checks who was present or late
+* Session details list **every** expected student — present, late and absent — with counts, a status filter and a search box
+* The camera turns itself off when its session ends
+
+**Students & reports**
+* Student registry with face enrollment from the camera or from photos
+* Bulk import of students (Excel / CSV) and face photos (ZIP), with a duplicate-face check
+* Statistics, CSV export and PDF reports
+* AI Assistant: ask questions about attendance in plain language (needs an API key)
 
 ## 🧠 Technologies Used
 
@@ -83,7 +94,7 @@ Every package in `requirements.txt` installs from a prebuilt wheel, so **no C++ 
    ```cmd
    run.bat
    ```
-   This starts the Streamlit server with the `.venv` interpreter (nothing is reinstalled) and opens `http://localhost:8501` in your browser.
+   This starts the app with the `.venv` interpreter (nothing is reinstalled) and opens `http://localhost:8501` in your browser. It runs `run_app.py`, which first starts the **session scheduler** (the part that starts and closes scheduled sessions on time) and then the Streamlit server. Other devices on the same network can open the app too, using the "Network URL" printed in the window.
 
 4. **Uninstall** (optional):
    ```cmd
@@ -101,19 +112,41 @@ If you prefer manual control:
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m streamlit run app.py
+.venv\Scripts\python.exe run_app.py
 ```
+`run_app.py` starts the session scheduler (scheduled sessions start and close on time even when no page is open) and then Streamlit; it accepts the usual Streamlit options. A plain `streamlit run app.py` also works, but then the scheduler only starts once the first page is opened.
 
 ### Installing the software vs. your data
 Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.venv` folder and the packages inside it. It never creates or changes **your data** — the database (`data/database/`), face encodings (`data/face_encodings/`), enrollment photos (`data/enrollment_images/`), unknown-face captures (`data/unknown_faces/`), logs and `.env`. Moving the system to another PC therefore means moving `data/` and `.env` yourself; re-running `setup.bat` rebuilds the software but does **not** re-enroll students — enrollment happens in the app's Student Registry.
 
 ## 🎯 Using the System
 
-1. **Student Registry** - Add/edit students via the sidebar navigation
-2. **Session Management** - Create and activate attendance sessions
-3. **Real-Time Attendance** - Start camera feed, students are auto-recognized
-4. **Statistics & Reports** - View attendance analytics and export PDFs
-5. **AI Assistant** - Query attendance data via natural language (requires OmniRoute API key in `.env`)
+The app opens on **Real-Time Attendance**. The sidebar has five pages:
+
+1. **Real-Time Attendance** - pick an **active** session, press **Start Attendance Stream**, and students in front of the camera are recognized, liveness-checked and marked. A scheduled session can be started early here with **Activate Session**.
+2. **Session Management** - three tabs:
+   * **Sessions List** - every session with its status and present / late counts. Click a row to get its buttons: **Start Now**, **Close**, **View**, **Edit**, **Delete** (an active session must be closed before it can be deleted).
+   * **Create New Session** - name, course, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*.
+   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast.
+3. **Student Registry** - add / edit students, manage their face photos, bulk import.
+4. **Statistics & Reports** - attendance analytics, CSV and PDF exports.
+5. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
+
+### How sessions behave
+
+| Situation | What happens |
+|---|---|
+| A scheduled session's start time arrives | It becomes **Active** within about 5 seconds, even if no one has the app open |
+| An active session's end time arrives | It becomes **Closed**, and a running camera turns itself off |
+| The app was off when those times passed | On the next start, sessions that should have started are started; sessions whose end time also passed are closed |
+| A session is started by hand **after** its scheduled time | It starts fresh: its start time becomes "now", so nobody is late because the session began late |
+| A session is started by hand **before** its scheduled time | It keeps its scheduled start time |
+| The start time or late threshold of a session is edited | Every mark in it is re-checked as present or late against the new values |
+| A session has no end time | It stays active until someone closes it |
+
+**Who counts as "expected" (and so as absent if not marked)?** Every active student who was registered before the session started, plus anyone who was marked in it. Courses / class lists are planned for a later phase; then only that class's students will be expected.
+
+Open pages notice when a session starts or closes by itself and refresh within about 10 seconds. Times are the attendance computer's local time.
 
 ### Adding many students at once (Student Registry → 📥 Bulk Import)
 
@@ -123,7 +156,8 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 ## 📁 Project Structure
 
 ```
-├── app.py                      # Streamlit entry point
+├── app.py                      # Streamlit entry point (pages and navigation)
+├── run_app.py                  # Starts the session scheduler, then Streamlit (used by run.bat)
 ├── config.py                   # Centralized configuration
 ├── requirements.txt            # Runtime dependencies (pinned, verified)
 ├── requirements-dev.txt        # Test-only tooling (pytest)
@@ -143,7 +177,8 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 ├── src/
 │   ├── computer_vision/        # Face detection, embedding, recognition, liveness
 │   ├── data/                   # Database schema, repositories
-│   ├── services/               # Business logic (attendance, enrollment, etc.)
+│   ├── services/               # Business logic (attendance, enrollment, the session scheduler, etc.)
+│   ├── realtime/               # Camera / vision engine process and its connection to the app
 │   ├── ui/pages/               # Streamlit page components
 │   ├── utils/                  # Logging, performance timing
 │   └── ai/                     # LLM integration
@@ -174,6 +209,9 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 # FACE_RECOGNITION_THRESHOLD=0.6
 # FACE_RECOGNITION_MARGIN=0.1
 # LIVENESS_HEAD_TURN_ANGLE=15
+# A face narrower than this share of the face in front counts as someone in
+# the background and is ignored (0 = any second face blocks marking)
+# BACKGROUND_FACE_MAX_RATIO=0.5
 
 # Server
 # STREAMLIT_SERVER_PORT=8502
@@ -229,6 +267,14 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 ### Camera not detected
 - **Fix:** ensure the webcam is connected and not used by another app, then allow camera access: *Windows Settings → Privacy & security → Camera → let desktop apps access your camera*
 
+### A scheduled session did not start
+- **Check:** the app must be running at the start time (the scheduler runs inside it). If it was off, the session starts as soon as the app starts again — unless its end time has also passed, then it is closed.
+- **Check:** the start time is the attendance computer's local time.
+
+### "Multiple faces detected" although only one student is in front
+- **Cause:** a second face of similar size is in view (e.g. someone standing right beside the student). Faces clearly further back are ignored.
+- **Fix:** one student at a time in front of the camera; point the camera away from the queue. `BACKGROUND_FACE_MAX_RATIO` in `.env` sets how much smaller a face must be to count as background.
+
 ### "No virtual environment found" from `run.bat`
 - **Fix:** run `setup.bat` first
 
@@ -238,6 +284,18 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 ### Installation fails behind a corporate firewall
 - **Cause:** pip cannot reach PyPI to download packages, including the dlib source archive
 - **Fix:** allow `pypi.org` and `files.pythonhosted.org`, or configure an internal mirror with `pip config set global.index-url <url>`
+
+## 🗺️ Next Phases
+
+Planned, not built yet:
+
+* **Courses / sections and class lists** - sessions belong to a section; only its students are expected (and counted absent)
+* **Instructor screen** - an instructor picks their course and session and starts it
+* **Login for instructors and admins** - each instructor sees and manages only their own sessions
+* **Use from several devices** - the app is already reachable on the local network; multi-device use will come together with the login
+* **New Home page** - a useful start page (the old one was removed)
+* **AI Assistant updates** - e.g. answering questions about absent students
+* **New design** - a visual redesign of the whole app
 
 ## 📚 Documentation
 
