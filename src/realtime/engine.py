@@ -49,6 +49,7 @@ from src.computer_vision.camera_manager import CameraManager
 from src.computer_vision.liveness_detector import LivenessState
 from src.realtime.protocol import result_to_dict
 from src.services.enrollment_service import EnrollmentService
+from src.services.session_service import SessionService, SessionStatus
 from src.services.real_time_attendance_service import (
     SPOOF_RECHECK_PREFIX,
     RealTimeAttendanceManager,
@@ -63,6 +64,7 @@ JPEG_QUALITY = 80
 GALLERY_RELOAD_SECONDS = 30.0   # students enrolled during a session are picked up (background thread)
 GALLERY_RETRY_SECONDS = 5.0     # retry of a failed first gallery load
 MARK_BANNER_SECONDS = 3.0       # how long "Marked: <name>" stays on the video
+SESSION_CHECK_SECONDS = 5.0     # the engine stops once its session is closed or deleted
 PERF_LOG_FRAMES = 150
 
 # Instruction bar colours (BGR)
@@ -224,6 +226,7 @@ class VisionEngine:
         self.manager.enable_background_processing()
         threading.Thread(target=self._gil_probe, name="gil-probe", daemon=True).start()
         threading.Thread(target=self._gallery_loop, name="gallery", daemon=True).start()
+        threading.Thread(target=self._session_watch, name="session-watch", daemon=True).start()
         self._set_status(state="running", error=None)
         logger.info(f"Vision engine running for session #{self.session_id}")
         return True
@@ -306,6 +309,26 @@ class VisionEngine:
             wait = GALLERY_RELOAD_SECONDS if self._gallery_ready.is_set() else GALLERY_RETRY_SECONDS
             if self._stop.wait(wait):
                 break
+
+    def _session_watch(self) -> None:
+        """
+        Stop once the session is closed (by hand or automatically at its end
+        time) or deleted, so the camera does not keep running for a session
+        that can no longer take attendance - also when no page is open.
+        """
+        sessions = SessionService()
+        while not self._stop.wait(SESSION_CHECK_SECONDS):
+            try:
+                session = sessions.get_session(self.session_id)
+            except Exception as e:
+                logger.warning(f"Could not check session #{self.session_id}: {e}")
+                continue
+            if session is None or session['status'] == SessionStatus.CLOSED:
+                reason = "deleted" if session is None else "closed"
+                logger.info(f"Session #{self.session_id} was {reason}; stopping the vision engine")
+                self._set_status(session_ended=reason)
+                self.stop()
+                return
 
     def _on_gallery_progress(self, done: int, total: int) -> None:
         if not self._gallery_ready.is_set():  # reloads during the session run silently

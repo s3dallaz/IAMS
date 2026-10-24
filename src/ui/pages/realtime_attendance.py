@@ -39,7 +39,6 @@ from src.services.real_time_attendance_service import (
 )
 from src.services.session_service import SessionService, SessionStatus
 from src.services.attendance_service import AttendanceService, AttendanceStatus
-from src.services.student_service import StudentService
 from src.services.enrollment_service import EnrollmentService
 from src.realtime.engine_client import EngineController
 from src.realtime.protocol import result_from_dict
@@ -49,6 +48,13 @@ logger = get_logger(__name__)
 
 STATUS_REFRESH_SECONDS = 0.5   # side panel refresh while streaming
 RECORDS_REFRESH_SECONDS = 2.0  # marked-students table refresh while streaming
+LIVE_TABLE_ROWS = 25           # latest marks shown while streaming (the full list is in Session Management)
+STATUS_CHECK_SECONDS = 10      # idle page notices a scheduled start / automatic close this fast
+ATTENDANCE_LABELS = {
+    AttendanceStatus.PRESENT: "✅ Present",
+    AttendanceStatus.LATE: "⏰ Late",
+    AttendanceStatus.ABSENT: "❌ Absent",
+}
 PERSON_PANEL_HEIGHT = 300      # px; fixed so the changing text never moves the page
 
 
@@ -81,7 +87,6 @@ def render_realtime_attendance():
     # Initialize services
     session_service = SessionService()
     attendance_service = AttendanceService()
-    student_service = StudentService()
 
     # Sidebar Configuration
     with st.sidebar:
@@ -129,6 +134,13 @@ def render_realtime_attendance():
         6. Click **Stop Attendance Stream** when finished.
         """)
 
+    # Apply due scheduled starts / automatic closes before showing statuses
+    # (the background scheduler does this too, every few seconds)
+    try:
+        session_service.apply_scheduled_transitions()
+    except Exception as e:
+        logger.error(f"Could not apply scheduled session changes: {e}")
+
     # Get active and scheduled sessions
     all_sessions = session_service.get_all_sessions()
     active_sessions = [s for s in all_sessions if s['status'] == SessionStatus.ACTIVE]
@@ -148,12 +160,18 @@ def render_realtime_attendance():
             session_options = {s['id']: f"🟢 #{s['id']} - {s['session_name']} (Active)" for s in active_sessions}
             # Also allow choosing scheduled sessions to activate
             for s in scheduled_sessions:
-                session_options[s['id']] = f"🟡 #{s['id']} - {s['session_name']} (Scheduled)"
+                session_options[s['id']] = _scheduled_label(s)
         else:
-            session_options = {s['id']: f"🟡 #{s['id']} - {s['session_name']} (Scheduled)" for s in scheduled_sessions}
+            session_options = {s['id']: _scheduled_label(s) for s in scheduled_sessions}
             for s in all_sessions:
                 if s['id'] not in session_options:
                     session_options[s['id']] = f"🔴 #{s['id']} - {s['session_name']} (Closed)"
+        # Keep the chosen session listed after it closes (e.g. automatically
+        # at its end time), so the page says so instead of switching sessions
+        current = st.session_state.get("realtime_session_selector")
+        for s in all_sessions:
+            if s['id'] == current and current not in session_options:
+                session_options[current] = f"🔴 #{s['id']} - {s['session_name']} (Closed)"
 
         selected_session_id = st.selectbox(
             "Select Session for Attendance",
@@ -163,13 +181,15 @@ def render_realtime_attendance():
         )
 
     selected_session = session_service.get_session(selected_session_id)
-    is_active = selected_session and selected_session['status'] == SessionStatus.ACTIVE
+    is_active = bool(selected_session and selected_session['status'] == SessionStatus.ACTIVE)
+    is_scheduled = bool(selected_session and selected_session['status'] == SessionStatus.SCHEDULED)
 
     with col_activate:
         st.write("")
         st.write("")
         if not is_active and selected_session and selected_session['status'] == SessionStatus.SCHEDULED:
-            if st.button("▶️ Activate Session", type="primary", width="stretch"):
+            if st.button("▶️ Activate Session", type="primary", width="stretch",
+                         help="Start now. Started after its scheduled time, the session starts fresh: lateness counts from now."):
                 try:
                     session_service.activate_session(selected_session_id)
                     st.success(f"Session #{selected_session_id} activated!")
@@ -196,6 +216,9 @@ def render_realtime_attendance():
             f"Status: :{status_color}[**{selected_session['status'].upper()}**] | "
             f"Late Cutoff: `{selected_session.get('late_threshold_minutes', 15)} min`"
         )
+        if is_scheduled:
+            st.caption(f"⏰ Starts automatically at {selected_session['start_time']}. "
+                       f"The camera can be started once the session is active.")
 
     st.markdown("---")
 
@@ -210,6 +233,14 @@ def render_realtime_attendance():
         "cooldown_seconds": cooldown_seconds,
         "head_turn_angle": float(head_turn_angle),
     }
+
+    # The session was closed (by hand elsewhere, or automatically at its end
+    # time) or deleted while the camera ran: stop the camera
+    if st.session_state.att_camera_active and not is_active:
+        if engine.session_id in (None, selected_session_id):
+            engine.stop()
+            st.session_state.att_camera_active = False
+            st.info("ℹ️ This session is closed, so the camera stream was stopped.")
 
     if not st.session_state.att_camera_active:
         _show_recognition_data_hint()
@@ -253,21 +284,29 @@ def render_realtime_attendance():
         _render_live_stream(
             engine=engine,
             session_id=selected_session_id,
+            session_status=selected_session['status'],
             settings=engine_settings,
-            attendance_service=attendance_service,
-            student_service=student_service
+            session_service=session_service,
+            attendance_service=attendance_service
         )
     else:
         # Show Current Session Attendance Records Table when stream is idle
-        render_session_records_panel(selected_session_id, attendance_service, student_service)
+        render_session_records_panel(selected_session_id, attendance_service)
+        if is_scheduled or is_active:
+            _session_status_watcher(session_service, selected_session_id, selected_session['status'])
+
+
+def _scheduled_label(session: Dict[str, Any]) -> str:
+    return f"🟡 #{session['id']} - {session['session_name']} (Scheduled, starts {session['start_time'][:16]})"
 
 
 def _render_live_stream(
     engine: EngineController,
     session_id: int,
+    session_status: str,
     settings: Dict[str, Any],
-    attendance_service: AttendanceService,
-    student_service: StudentService
+    session_service: SessionService,
+    attendance_service: AttendanceService
 ):
     """
     Show the engine's live video and the status panel.
@@ -276,7 +315,13 @@ def _render_live_stream(
     it at the camera's frame rate without Streamlit handling any frames. Only
     the status panel is refreshed, a few times per second, by a fragment.
     """
-    if not engine.is_running() or engine.session_id != session_id:
+    if engine.is_running() and engine.session_id != session_id:
+        # Another session was selected while the camera runs: say so, keep
+        # it running (the Stop button stays) rather than silently stopping it
+        st.warning(f"📹 The camera is running for session #{engine.session_id}. Select that session "
+                   f"to watch it, or stop the stream.")
+        return
+    if not engine.is_running():
         st.session_state.att_camera_active = False
         st.error("❌ The camera stream stopped. Click **Start Attendance Stream** to start it again.")
         return
@@ -294,28 +339,36 @@ def _render_live_stream(
             unsafe_allow_html=True
         )
     with col_live_status:
-        _live_status_panel(engine, session_id, attendance_service)
+        _live_status_panel(engine, session_id, session_status, session_service, attendance_service)
 
     st.markdown("---")
-    st.markdown("### 📋 Marked Students in this Session")
-    _live_records_table(session_id, attendance_service, student_service)
+    st.markdown("### 📋 Latest Marked Students")
+    _live_records_table(session_id, attendance_service)
 
 
 @st.fragment(run_every=STATUS_REFRESH_SECONDS)
 def _live_status_panel(
     engine: EngineController,
     session_id: int,
+    session_status: str,
+    session_service: SessionService,
     attendance_service: AttendanceService
 ):
     """Live stats and the person in front of the camera (refreshed twice per second)."""
+    # The engine stopped (e.g. its session closed at its end time) or the
+    # session started / closed: redraw the whole page to show it
+    session = session_service.get_session(session_id)
+    if not engine.is_running() or session is None or session['status'] != session_status:
+        st.rerun(scope="app")
+
     status = engine.status() or {}
-    records = attendance_service.get_session_attendance(session_id)
-    present_cnt = sum(1 for r in records if r['status'] == AttendanceStatus.PRESENT)
-    late_cnt = sum(1 for r in records if r['status'] == AttendanceStatus.LATE)
+    counts = attendance_service.get_session_status_counts(session_id)
+    present_cnt = counts.get(AttendanceStatus.PRESENT, 0)
+    late_cnt = counts.get(AttendanceStatus.LATE, 0)
     st.markdown("### 📊 Live Session Stats")
     fps = status.get("preview_fps")
     fps_text = f" | **Preview:** {fps:.0f} fps" if fps is not None else ""
-    st.markdown(f"**Total:** {len(records)} | **Present:** {present_cnt} | **Late:** {late_cnt}{fps_text}")
+    st.markdown(f"**Total:** {sum(counts.values())} | **Present:** {present_cnt} | **Late:** {late_cnt}{fps_text}")
 
     st.markdown("### 👤 Last Detected Person")
     # Fixed height: the text changes every refresh (instructions, warnings),
@@ -340,19 +393,39 @@ def _live_status_panel(
 @st.fragment(run_every=RECORDS_REFRESH_SECONDS)
 def _live_records_table(
     session_id: int,
-    attendance_service: AttendanceService,
-    student_service: StudentService
+    attendance_service: AttendanceService
 ):
     """
-    Students marked in this session, newest first. A static table (st.table):
-    unlike the interactive st.dataframe grid it does not flicker or reset
-    its scroll position when it is refreshed with the same rows.
+    The latest LIVE_TABLE_ROWS students marked in this session, newest first.
+    A static table (st.table): unlike the interactive st.dataframe grid it
+    does not flicker or reset its scroll position when it is refreshed with
+    the same rows. Kept short so a refresh every two seconds stays light;
+    Session Management lists every student, absent ones included.
     """
-    rows = _live_records_rows(attendance_service.get_session_attendance(session_id), student_service)
+    records = attendance_service.get_session_records_with_students(
+        session_id, newest_first=True, limit=LIVE_TABLE_ROWS
+    )
+    rows = _live_records_rows(records)
     if not rows:
         st.info("No attendance recorded yet.")
         return
     st.table(pd.DataFrame(rows).style.hide(axis="index"))
+    total = sum(attendance_service.get_session_status_counts(session_id).values())
+    if total > len(rows):
+        st.caption(f"Latest {len(rows)} of {total} marked students — the full list (with absent students) "
+                   f"is in **Session Management → Session Details**.")
+
+
+@st.fragment(run_every=STATUS_CHECK_SECONDS)
+def _session_status_watcher(session_service: SessionService, session_id: int, rendered_status: str):
+    """While the camera is off: redraw the page when the session starts or closes by itself."""
+    try:
+        session = session_service.get_session(session_id)
+    except Exception as e:
+        logger.warning(f"Session status check failed: {e}")
+        return
+    if session is None or session['status'] != rendered_status:
+        st.rerun(scope="app")
 
 
 def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
@@ -514,39 +587,28 @@ def _result_faces(result) -> List[DetectedFace]:
     return faces
 
 
-def _live_records_rows(
-    records: List[Dict[str, Any]],
-    student_service: StudentService
-) -> List[Dict[str, Any]]:
-    """Rows of the live marked-students table, newest first."""
-    table_data = []
-    for r in reversed(records):  # Show newest first
-        student = student_service.get_student_by_id(r['student_id'])
-        student_id_str = student['student_id'] if student else f"DB#{r['student_id']}"
-        student_name_str = student['name'] if student else "Unknown"
-
-        table_data.append({
-            'Student ID': student_id_str,
-            'Name': student_name_str,
-            'Status': "✅ Present" if r['status'] == AttendanceStatus.PRESENT else "⏰ Late",
-            'Marked At': r['marked_at'],
-            'Confidence': f"{r['detection_confidence']:.2f}" if r.get('detection_confidence') is not None else "—",
-            'Liveness': f"{r['liveness_score']:.2f}" if r.get('liveness_score') is not None else "—",
-            'Marked By': r.get('marked_by') or 'system'
-        })
-    return table_data
+def _live_records_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rows of the live marked-students table (records already joined with the student)."""
+    return [{
+        'Student ID': r.get('student_code') or f"DB#{r['student_id']}",
+        'Name': r.get('student_name') or "Unknown",
+        'Status': ATTENDANCE_LABELS.get(r['status'], r['status']),
+        'Marked At': r['marked_at'],
+        'Confidence': f"{r['detection_confidence']:.2f}" if r.get('detection_confidence') is not None else "—",
+        'Liveness': f"{r['liveness_score']:.2f}" if r.get('liveness_score') is not None else "—",
+        'Marked By': r.get('marked_by') or 'system'
+    } for r in records]
 
 
 def render_session_records_panel(
     session_id: Optional[int],
-    attendance_service: AttendanceService,
-    student_service: StudentService
+    attendance_service: AttendanceService
 ):
     """Render attendance records panel when camera is idle."""
     if not session_id:
         return
 
-    records = attendance_service.get_session_attendance(session_id)
+    records = attendance_service.get_session_records_with_students(session_id)
 
     st.markdown("### 📋 Session Attendance Records")
     col_m1, col_m2, col_m3, col_ref = st.columns([1, 1, 1, 1])
@@ -566,29 +628,16 @@ def render_session_records_panel(
         if st.button("🔄 Refresh Table", key="refresh_idle_records", width="stretch"):
             st.rerun()
 
+    st.caption("Marked students only. **Session Management → Session Details** lists every student, "
+               "absent ones included.")
+
     if not records:
         st.info("No attendance records for this session yet.")
         return
 
-    table_data = []
-    for r in records:
-        student = student_service.get_student_by_id(r['student_id'])
-        student_id_str = student['student_id'] if student else f"DB#{r['student_id']}"
-        student_name_str = student['name'] if student else "Unknown"
-
-        table_data.append({
-            'Record ID': r['id'],
-            'Student ID': student_id_str,
-            'Name': student_name_str,
-            'Status': "✅ Present" if r['status'] == AttendanceStatus.PRESENT else "⏰ Late",
-            'Marked At': r['marked_at'],
-            'Confidence': f"{r['detection_confidence']:.2f}" if r.get('detection_confidence') is not None else "—",
-            'Liveness': f"{r['liveness_score']:.2f}" if r.get('liveness_score') is not None else "—",
-            'Marked By': r.get('marked_by') or 'system'
-        })
-
     st.dataframe(
-        table_data,
+        _live_records_rows(records),
         width="stretch",
-        hide_index=True
+        hide_index=True,
+        height=min(38 + 35 * len(records), 460)
     )

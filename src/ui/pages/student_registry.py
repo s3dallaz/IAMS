@@ -17,7 +17,7 @@ import streamlit as st
 import cv2
 import numpy as np
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 
 from src.services.student_service import (
@@ -1009,11 +1009,16 @@ def render_edit_student_tab(service: StudentService):
             st.info("No students registered.")
 
 def format_datetime(dt_string: Optional[str]) -> str:
-    """Format a datetime string for display."""
+    """
+    Format a database-default timestamp (enrolled_at) for display. SQLite's
+    CURRENT_TIMESTAMP is UTC, so it is shown converted to local time.
+    """
     if not dt_string:
         return '—'
     try:
         dt = datetime.fromisoformat(dt_string.replace(' ', 'T'))
-        return dt.strftime('%Y-%m-%d %H:%M')
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime('%Y-%m-%d %H:%M')
     except Exception:
         return dt_string

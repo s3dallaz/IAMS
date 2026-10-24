@@ -337,3 +337,175 @@ class AttendanceRepository:
         except sqlite3.Error as e:
             logger.error(f"Database error getting attendance by status {status}: {e}")
             raise
+    
+    # ------------------------------------------------------------------
+    # Session roster: every expected student with their status
+    # ------------------------------------------------------------------
+    
+    # Students expected in a session: anyone with a record in it, plus every
+    # active student registered before the session started (no class rosters
+    # exist yet, so the register is the roster). :registered_before is UTC,
+    # like the database-default enrolled_at, so the two compare directly.
+    _ROSTER_FROM = """
+        FROM students s
+        LEFT JOIN attendance_records a ON a.student_id = s.id AND a.session_id = :session_id
+        WHERE (a.id IS NOT NULL
+               OR (s.is_active = 1 AND (:registered_before IS NULL OR s.enrolled_at <= :registered_before)))
+    """
+    
+    # Present -> Late -> Absent, then by name
+    _ROSTER_ORDER = """
+        ORDER BY CASE COALESCE(a.status, 'absent')
+                     WHEN 'present' THEN 0 WHEN 'late' THEN 1 ELSE 2 END,
+                 s.name COLLATE NOCASE, s.student_id
+    """
+    
+    def get_session_roster_counts(self, session_id: int, registered_before: Optional[str]) -> Dict[str, int]:
+        """
+        Number of expected students per status for a session.
+        
+        Args:
+            session_id: Session database ID
+            registered_before: UTC 'YYYY-MM-DD HH:MM:SS'; active students
+                registered later are not expected (None = no limit)
+        
+        Returns:
+            {status: count}; students without a record count as 'absent'
+        """
+        query = f"SELECT COALESCE(a.status, 'absent') AS status, COUNT(*) AS n {self._ROSTER_FROM} GROUP BY 1"
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                rows = conn.execute(query, {'session_id': session_id,
+                                            'registered_before': registered_before}).fetchall()
+                return {row['status']: row['n'] for row in rows}
+        except sqlite3.Error as e:
+            logger.error(f"Database error counting the roster of session {session_id}: {e}")
+            raise
+    
+    def get_session_roster(
+        self,
+        session_id: int,
+        registered_before: Optional[str],
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Expected students of a session with their status, sorted
+        Present -> Late -> Absent and by name. Filtering and the row limit
+        run in SQL, so a large register never reaches the page in full.
+        
+        Args:
+            session_id: Session database ID
+            registered_before: UTC 'YYYY-MM-DD HH:MM:SS'; active students
+                registered later are not expected (None = no limit)
+            status: Only this status('absent' = no record or an absent record)
+            search: Case-insensitive part of the name or student ID
+            limit: Maximum number of rows
+        
+        Returns:
+            Rows with student_db_id, student_id, name, status, record_id,
+            marked_at, detection_confidence, liveness_score, marked_by, notes
+        """
+        query = f"""
+            SELECT s.id AS student_db_id, s.student_id, s.name,
+                   COALESCE(a.status, 'absent') AS status, a.id AS record_id, a.marked_at,
+                   a.detection_confidence, a.liveness_score, a.marked_by, a.notes
+            {self._ROSTER_FROM}
+        """
+        params: Dict[str, Any] = {'session_id': session_id, 'registered_before': registered_before}
+        if status:
+            query += " AND COALESCE(a.status, 'absent') = :status"
+            params['status'] = status
+        if search:
+            # '!' escapes LIKE wildcards, so "%" or "_" typed by the user match literally
+            escaped = search.replace('!', '!!').replace('%', '!%').replace('_', '!_')
+            query += " AND (s.name LIKE :search ESCAPE '!' OR s.student_id LIKE :search ESCAPE '!')"
+            params['search'] = f"%{escaped}%"
+        query += self._ROSTER_ORDER
+        if limit:
+            query += " LIMIT :limit"
+            params['limit'] = int(limit)
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [dict(row) for row in conn.execute(query, params).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting the roster of session {session_id}: {e}")
+            raise
+    
+    def get_session_records_with_students(
+        self,
+        session_id: int,
+        newest_first: bool = False,
+        limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Attendance records of a session joined with the student's ID and name
+        (one query instead of one student lookup per record).
+        
+        Returns:
+            Attendance records plus 'student_code' and 'student_name'
+        """
+        order = "DESC" if newest_first else "ASC"
+        query = f"""
+            SELECT a.*, s.student_id AS student_code, s.name AS student_name
+            FROM attendance_records a
+            LEFT JOIN students s ON s.id = a.student_id
+            WHERE a.session_id = ?
+            ORDER BY a.marked_at {order}, a.id {order}
+        """
+        params: List[Any] = [session_id]
+        if limit:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [dict(row) for row in conn.execute(query, params).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting records of session {session_id}: {e}")
+            raise
+    
+    def regrade_session(self, session_id: int, late_cutoff: str) -> int:
+        """
+        Re-decide present / late for every present or late record of a
+        session: marked before `late_cutoff` = present, otherwise late.
+        Absent records are left alone.
+        
+        Args:
+            session_id: Session database ID
+            late_cutoff: Local time 'YYYY-MM-DD HH:MM:SS' (start + late threshold)
+        
+        Returns:
+            Number of records whose status changed
+        """
+        query = """
+            UPDATE attendance_records
+            SET status = CASE WHEN datetime(marked_at) < datetime(:cutoff) THEN 'present' ELSE 'late' END
+            WHERE session_id = :session_id
+              AND status IN ('present', 'late')
+              AND status != CASE WHEN datetime(marked_at) < datetime(:cutoff) THEN 'present' ELSE 'late' END
+        """
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                cursor = conn.execute(query, {'session_id': session_id, 'cutoff': late_cutoff})
+                if cursor.rowcount:
+                    logger.info(f"Re-graded {cursor.rowcount} record(s) of session {session_id}")
+                return cursor.rowcount
+        except sqlite3.Error as e:
+            logger.error(f"Database error re-grading session {session_id}: {e}")
+            raise
+    
+    def get_session_status_counts(self, session_id: int) -> Dict[str, int]:
+        """Number of attendance records per status in a session."""
+        query = "SELECT status, COUNT(*) AS n FROM attendance_records WHERE session_id = ? GROUP BY status"
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return {row['status']: row['n'] for row in conn.execute(query, (session_id,)).fetchall()}
+        except sqlite3.Error as e:
+            logger.error(f"Database error counting records of session {session_id}: {e}")
+            raise

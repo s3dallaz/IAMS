@@ -28,7 +28,9 @@ echo Stop:    press Ctrl+C in this window.
 echo.
 
 set "APP_RC=0"
-".venv\Scripts\python.exe" -m streamlit run app.py
+REM run_app.py starts the session scheduler, then Streamlit - so scheduled
+REM sessions start and close on time even when no page is open
+".venv\Scripts\python.exe" run_app.py
 set "APP_RC=%ERRORLEVEL%"
 
 echo.

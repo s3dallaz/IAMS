@@ -8,7 +8,7 @@ status calculation, and business rule enforcement.
 import sqlite3
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.data.repositories.attendance_repository import AttendanceRepository
 from src.data.repositories.student_repository import StudentRepository
@@ -507,3 +507,93 @@ class AttendanceService:
             )
         
         return self.attendance_repo.get_by_status(status)
+
+    def _roster_cutoff(self, session_id: int) -> Optional[str]:
+        """
+        UTC time before which active students must have been registered to
+        be expected in the session: its start time. Students registered
+        later (e.g. a bulk import after the class) are not listed absent.
+        """
+        if not isinstance(session_id, int) or session_id <= 0:
+            raise InvalidAttendanceDataError("session_id must be a positive integer")
+        session = self.session_repo.get_by_id(session_id)
+        if not session:
+            raise InvalidAttendanceDataError(f"Session with ID {session_id} does not exist")
+        try:
+            start = datetime.fromisoformat(session['start_time'].replace(' ', 'T'))
+        except (TypeError, ValueError):
+            return None
+        # Session times are local; enrolled_at is the database's UTC default
+        return start.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    
+    def get_session_roster_counts(self, session_id: int) -> Dict[str, int]:
+        """
+        Expected students of a session per status.
+        
+        Expected students are everyone with a record in the session plus
+        every active student registered before the session started (there
+        are no class rosters yet). Students without a record are absent.
+        
+        Returns:
+            {'present': n, 'late': n, 'absent': n, 'expected': total}
+        """
+        counts = self.attendance_repo.get_session_roster_counts(session_id, self._roster_cutoff(session_id))
+        result = {status: counts.get(status, 0) for status in
+                  (AttendanceStatus.PRESENT, AttendanceStatus.LATE, AttendanceStatus.ABSENT)}
+        result['expected'] = sum(counts.values())
+        return result
+    
+    def get_session_roster(
+        self,
+        session_id: int,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Expected students of a session with their status (see
+        get_session_roster_counts), sorted Present -> Late -> Absent and by
+        name within each status.
+        
+        Args:
+            session_id: Session database ID
+            status: Only students with this status
+            search: Part of a student's name or student ID
+            limit: Maximum number of rows
+        
+        Raises:
+            InvalidAttendanceDataError: If an argument is invalid
+        """
+        cutoff = self._roster_cutoff(session_id)
+        if status is not None:
+            status = status.strip().lower()
+            if status not in VALID_STATUSES:
+                raise InvalidAttendanceDataError(
+                    f"Invalid status '{status}'. Must be one of: {', '.join(VALID_STATUSES)}"
+                )
+        search = (search or "").strip() or None
+        return self.attendance_repo.get_session_roster(
+            session_id, cutoff, status=status, search=search, limit=limit
+        )
+    
+    def get_session_records_with_students(
+        self,
+        session_id: int,
+        newest_first: bool = False,
+        limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Attendance records of a session with each student's ID
+        ('student_code') and name ('student_name'), in one query.
+        """
+        if not isinstance(session_id, int) or session_id <= 0:
+            raise InvalidAttendanceDataError("session_id must be a positive integer")
+        return self.attendance_repo.get_session_records_with_students(
+            session_id, newest_first=newest_first, limit=limit
+        )
+    
+    def get_session_status_counts(self, session_id: int) -> Dict[str, int]:
+        """Recorded attendance of a session per status ({status: count})."""
+        if not isinstance(session_id, int) or session_id <= 0:
+            raise InvalidAttendanceDataError("session_id must be a positive integer")
+        return self.attendance_repo.get_session_status_counts(session_id)

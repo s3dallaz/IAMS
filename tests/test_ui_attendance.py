@@ -7,6 +7,7 @@ error handling, and rendering utilities without physical camera or browser.
 
 import pytest
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import numpy as np
@@ -20,7 +21,10 @@ from src.ui.pages.session_management import (
     handle_create_session,
     handle_activate_session,
     handle_close_session,
-    format_datetime
+    handle_delete_session,
+    format_datetime,
+    format_db_timestamp,
+    FLASH_KEY
 )
 from src.ui.pages.realtime_attendance import (
     render_realtime_attendance,
@@ -68,26 +72,75 @@ def student_service(temp_db):
 # ============================================================================
 
 def test_handle_create_session_success(session_service):
-    """Test successful session creation via UI handler."""
-    with patch("streamlit.success") as mock_success, \
-         patch("streamlit.rerun") as mock_rerun, \
-         patch("streamlit.session_state", {}):
+    """Test successful session creation via UI handler (message shown after the rerun)."""
+    start = (datetime.now() + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+    state = {}
+    with patch("streamlit.rerun") as mock_rerun, \
+         patch("streamlit.session_state", state):
         handle_create_session(
             session_service=session_service,
             session_name="CS101 Lab 1",
-            start_time="2026-10-04 10:00:00",
+            start_dt=start,
+            end_dt=start + timedelta(hours=1),
             course_code="CS101",
             late_threshold_minutes=15,
             status=SessionStatus.SCHEDULED,
             created_by="Instructor A",
             notes="Introductory lab"
         )
-        mock_success.assert_called_once()
         mock_rerun.assert_called_once()
-        
+
+    kind, message = state[FLASH_KEY]
+    assert kind == "success" and "starts automatically" in message
     sessions = session_service.get_all_sessions()
     assert len(sessions) == 1
     assert sessions[0]['session_name'] == "CS101 Lab 1"
+    assert sessions[0]['status'] == SessionStatus.SCHEDULED
+    assert sessions[0]['end_time'] == (start + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def test_handle_create_session_past_start_starts_right_away(session_service):
+    """A scheduled session whose start time already passed starts at once."""
+    start = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=5)
+    state = {}
+    with patch("streamlit.rerun"), patch("streamlit.session_state", state):
+        handle_create_session(
+            session_service=session_service, session_name="Late create", start_dt=start,
+            end_dt=None, course_code=None, late_threshold_minutes=15,
+            status=SessionStatus.SCHEDULED, created_by=None, notes=None
+        )
+
+    assert "started right away" in state[FLASH_KEY][1]
+    assert session_service.get_all_sessions()[0]['status'] == SessionStatus.ACTIVE
+
+
+def test_handle_create_session_rejects_end_in_the_past(session_service):
+    start = datetime.now() - timedelta(hours=2)
+    with patch("streamlit.error") as mock_error:
+        handle_create_session(
+            session_service=session_service, session_name="Old", start_dt=start,
+            end_dt=start + timedelta(hours=1), course_code=None, late_threshold_minutes=15,
+            status=SessionStatus.SCHEDULED, created_by=None, notes=None
+        )
+        mock_error.assert_called_once()
+    assert session_service.get_all_sessions() == []
+
+
+def test_handle_create_session_warns_about_an_overlap(session_service):
+    start = (datetime.now() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    existing = session_service.create_session(
+        "CS101 Lecture", start.strftime('%Y-%m-%d %H:%M:%S'), course_code="CS101",
+        end_time=(start + timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S')
+    )
+    state = {}
+    with patch("streamlit.rerun"), patch("streamlit.session_state", state):
+        handle_create_session(
+            session_service=session_service, session_name="CS101 Lab", start_dt=start + timedelta(hours=1),
+            end_dt=start + timedelta(hours=3), course_code="CS101", late_threshold_minutes=15,
+            status=SessionStatus.SCHEDULED, created_by=None, notes=None
+        )
+
+    assert f"#{existing}" in state[FLASH_KEY][1]
 
 
 def test_handle_create_session_empty_name_error(session_service):
@@ -96,7 +149,8 @@ def test_handle_create_session_empty_name_error(session_service):
         handle_create_session(
             session_service=session_service,
             session_name="",
-            start_time="2026-10-04 10:00:00",
+            start_dt=datetime(2026, 10, 4, 10, 0),
+            end_dt=None,
             course_code="CS101",
             late_threshold_minutes=15,
             status=SessionStatus.SCHEDULED,
@@ -117,12 +171,13 @@ def test_handle_activate_session_flow(session_service):
         status=SessionStatus.SCHEDULED
     )
     
-    with patch("streamlit.success") as mock_success, \
+    state = {}
+    with patch("streamlit.session_state", state), \
          patch("streamlit.rerun") as mock_rerun:
         handle_activate_session(session_service, sess_id)
-        mock_success.assert_called_once()
         mock_rerun.assert_called_once()
-        
+    assert state[FLASH_KEY][0] == "success"
+
     session = session_service.get_session(sess_id)
     assert session['status'] == SessionStatus.ACTIVE
 
@@ -135,12 +190,13 @@ def test_handle_close_session_flow(session_service):
         status=SessionStatus.ACTIVE
     )
     
-    with patch("streamlit.success") as mock_success, \
+    state = {}
+    with patch("streamlit.session_state", state), \
          patch("streamlit.rerun") as mock_rerun:
         handle_close_session(session_service, sess_id)
-        mock_success.assert_called_once()
         mock_rerun.assert_called_once()
-        
+    assert state[FLASH_KEY][0] == "success"
+
     session = session_service.get_session(sess_id)
     assert session['status'] == SessionStatus.CLOSED
     assert session['closed_at'] is not None
@@ -157,6 +213,31 @@ def test_handle_activate_closed_session_rejected(session_service):
     with patch("streamlit.error") as mock_error:
         handle_activate_session(session_service, sess_id)
         mock_error.assert_called_once()
+
+
+def test_handle_delete_session(session_service):
+    sess_id = session_service.create_session("Old", "2026-10-04 10:00:00", status=SessionStatus.CLOSED)
+    state = {}
+    with patch("streamlit.session_state", state), patch("streamlit.rerun") as mock_rerun:
+        handle_delete_session(session_service, sess_id)
+        mock_rerun.assert_called_once()
+    assert session_service.get_session(sess_id) is None
+
+
+def test_handle_delete_active_session_rejected(session_service):
+    sess_id = session_service.create_session("Now", "2026-10-04 10:00:00", status=SessionStatus.ACTIVE)
+    with patch("streamlit.error") as mock_error:
+        handle_delete_session(session_service, sess_id)
+        mock_error.assert_called_once()
+    assert session_service.get_session(sess_id) is not None
+
+
+def test_format_db_timestamp_converts_utc_to_local():
+    from datetime import timezone
+    utc = datetime(2026, 10, 4, 8, 0, 0)
+    expected = utc.replace(tzinfo=timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')
+    assert format_db_timestamp("2026-10-04 08:00:00") == expected
+    assert format_db_timestamp(None) == '—'
 
 
 # ============================================================================
@@ -342,8 +423,8 @@ def test_live_stream_reports_a_stopped_engine():
     state = SimpleNamespace(att_camera_active=True)
 
     with patch("streamlit.session_state", state), patch("streamlit.error") as mock_error:
-        _render_live_stream(engine=engine, session_id=7, settings={},
-                            attendance_service=MagicMock(), student_service=MagicMock())
+        _render_live_stream(engine=engine, session_id=7, session_status="active", settings={},
+                            session_service=MagicMock(), attendance_service=MagicMock())
 
     assert state.att_camera_active is False
     mock_error.assert_called_once()
@@ -365,8 +446,8 @@ def test_live_stream_sends_changed_settings_to_the_engine():
          patch("streamlit.columns", return_value=(MagicMock(), MagicMock())), \
          patch("streamlit.markdown") as mock_markdown, \
          patch("src.ui.pages.realtime_attendance._live_status_panel"):
-        _render_live_stream(engine=engine, session_id=7, settings=new_settings,
-                            attendance_service=MagicMock(), student_service=MagicMock())
+        _render_live_stream(engine=engine, session_id=7, session_status="active", settings=new_settings,
+                            session_service=MagicMock(), attendance_service=MagicMock())
 
     engine.update_settings.assert_called_once_with(new_settings)
     assert state.att_engine_settings == new_settings
@@ -377,11 +458,15 @@ def test_live_stream_sends_changed_settings_to_the_engine():
 # Streamlit Render Function Tests (Mocked UI Environment)
 # ============================================================================
 
+@patch("src.services.session_service.SessionService.get_status_signature", return_value=(0,))
+@patch("src.services.session_service.SessionService.apply_scheduled_transitions")
+@patch("src.services.session_service.SessionService.get_sessions_overview")
 @patch("src.services.session_service.SessionService.get_all_sessions")
 @patch("streamlit.tabs")
-def test_render_session_management_page(mock_tabs, mock_get_sessions):
+def test_render_session_management_page(mock_tabs, mock_get_sessions, mock_overview, mock_apply, _signature):
     """Test rendering the session management page structure."""
     mock_get_sessions.return_value = []
+    mock_overview.return_value = []
     mock_tabs.return_value = [MagicMock(), MagicMock(), MagicMock()]
     
     with patch("streamlit.session_state", {}):
@@ -389,8 +474,9 @@ def test_render_session_management_page(mock_tabs, mock_get_sessions):
         mock_tabs.assert_called_once()
 
 
+@patch("src.services.session_service.SessionService.apply_scheduled_transitions")
 @patch("src.services.session_service.SessionService.get_all_sessions")
-def test_render_realtime_attendance_no_sessions(mock_get_sessions):
+def test_render_realtime_attendance_no_sessions(mock_get_sessions, _apply):
     """Test real-time attendance page rendering when no sessions exist."""
     mock_get_sessions.return_value = []
     
