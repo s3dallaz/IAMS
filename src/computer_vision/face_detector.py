@@ -57,6 +57,34 @@ class DetectedFace:
         return f"DetectedFace(bbox={self.bbox}, confidence={self.confidence:.3f})"
 
 
+def select_foreground_face(
+    bboxes: List[Tuple[int, int, int, int]],
+    max_background_ratio: Optional[float] = None
+) -> Optional[int]:
+    """
+    Index of the one face in front of the camera, or None.
+
+    A face narrower than `max_background_ratio` times the widest face is
+    someone in the background and is ignored. None when there is no face, or
+    when two or more faces are about the same size (nobody can tell whose
+    blink or head turn it is, so nobody may be checked).
+
+    Args:
+        bboxes: Face boxes (x, y, width, height)
+        max_background_ratio: Default config.BACKGROUND_FACE_MAX_RATIO; 0 =
+            every face counts, so only a single face in view qualifies
+    """
+    if not bboxes:
+        return None
+    ratio = config.BACKGROUND_FACE_MAX_RATIO if max_background_ratio is None else max_background_ratio
+    widths = [box[2] for box in bboxes]
+    main = max(range(len(widths)), key=widths.__getitem__)
+    for index, width in enumerate(widths):
+        if index != main and width >= ratio * widths[main]:
+            return None
+    return main
+
+
 class FaceDetector:
     """
     Detects faces in images with YuNet (OpenCV DNN) or MediaPipe BlazeFace.

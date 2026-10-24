@@ -344,6 +344,14 @@ LIVENESS_REQUIRE_CHALLENGE: Final[bool] = os.getenv("LIVENESS_REQUIRE_CHALLENGE"
 # once would wipe the progress the challenge asks for.
 LIVENESS_FACE_LOST_GRACE: float = _env_float("LIVENESS_FACE_LOST_GRACE", 2.0)
 
+# A face narrower than this share of the widest face in view counts as someone
+# in the background (about twice as far away at 0.5) and is ignored, so a
+# queue behind the student does not block marking. Recognition, the blink /
+# head-turn check and the spoof checks all use only the face in front. Two
+# faces of similar size still mean "one person at a time". 0 turns this off
+# (any second face blocks marking).
+BACKGROUND_FACE_MAX_RATIO: float = _env_float("BACKGROUND_FACE_MAX_RATIO", 0.5)
+
 # ----------------------------------------------------------------------------
 # Spoof (presentation attack) detection - part of the liveness requirement
 # ----------------------------------------------------------------------------

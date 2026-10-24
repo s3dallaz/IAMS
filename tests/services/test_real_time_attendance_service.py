@@ -809,6 +809,35 @@ def test_multiple_faces_in_frame_nobody_marked(
     assert att_service.get_session_attendance(active_session) == []
 
 
+def test_small_background_face_does_not_block_marking(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    """A much smaller face behind the student (config.BACKGROUND_FACE_MAX_RATIO) is ignored."""
+    detector = mock_cv_components['detector']
+    detector.detect_faces.return_value = [
+        DetectedFace(bbox=(5, 5, 12, 12), confidence=0.9),      # someone far behind
+        DetectedFace(bbox=(10, 10, 50, 50), confidence=0.95),   # the student in front
+    ]
+    mock_cv_components['recognizer'].recognize.return_value = ALICE
+    mock_cv_components['embedder'].generate_embedding.return_value = FaceEmbedding(np.random.rand(128))
+    manager = RealTimeAttendanceManager(
+        session_id=active_session,
+        database_path=temp_db,
+        face_detector=detector,
+        face_embedder=mock_cv_components['embedder'],
+        face_recognizer=mock_cv_components['recognizer'],
+        liveness_detector=mock_cv_components['liveness']
+    )
+    manager.set_gallery([("2021001", FaceEmbedding(np.random.rand(128)))])
+
+    result = manager.process_frame(sample_frame)
+
+    assert result.multiple_faces is False
+    assert len(result.processed_faces) == 1
+    assert result.processed_faces[0].bbox == (10, 10, 50, 50)
+    assert result.marked_count == 1
+
+
 def test_single_face_result_has_no_multi_face_message(
     temp_db, active_session, sample_student, sample_frame, mock_cv_components
 ):

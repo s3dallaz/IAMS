@@ -22,7 +22,7 @@ import config
 import cv2
 import numpy as np
 
-from src.computer_vision.face_detector import FaceDetector, DetectedFace
+from src.computer_vision.face_detector import FaceDetector, DetectedFace, select_foreground_face
 from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding, FaceEmbeddingError
 from src.computer_vision.face_recognizer import FaceGallery, FaceRecognizer, RecognitionResult
 from src.computer_vision.detection_diagnostics import get_diagnostics
@@ -1057,6 +1057,14 @@ class RealTimeAttendanceManager:
         # from a single face, so one person's blink and head turn would
         # otherwise verify every face in the frame. Skipping recognition here
         # also avoids a ~230 ms embedding per face on every CV frame.
+        # Faces much smaller than the one in front are people in the
+        # background: ignored (config.BACKGROUND_FACE_MAX_RATIO). The blink /
+        # head-turn landmarks follow the same rule and are tied to this face.
+        if len(detected_faces) > 1:
+            main = select_foreground_face([face.bbox for face in detected_faces])
+            if main is not None:
+                detected_faces = [detected_faces[main]]
+
         if len(detected_faces) > 1:
             self._tracked_face = None
             self._last_face = None

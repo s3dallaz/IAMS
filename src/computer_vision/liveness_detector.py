@@ -19,7 +19,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 import config
-from src.computer_vision.face_detector import DetectedFace
+from src.computer_vision.face_detector import DetectedFace, select_foreground_face
 from src.utils.logger import get_logger
 
 
@@ -565,17 +565,25 @@ class LivenessDetector:
             "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
         )
 
-    def _get_landmarks_for_frame(self, frame: np.ndarray):
+    def _get_landmarks_for_frame(self, frame: np.ndarray,
+                                 face_bbox: Optional[Tuple[int, int, int, int]] = None):
         """
         Run MediaPipe Face Landmarker exactly once per unique frame object, caching
         the raw face_landmarks list so both EAR extraction and head-yaw estimation
         can reuse the same inference result without a second detector call.
 
+        With several faces in view, the landmarks of the face in front are
+        used only if every other face is a small background face (the rule of
+        select_foreground_face, the same one recognition uses) AND that face
+        is the one being checked (its centre lies inside `face_bbox`), so a
+        blink is never read from a different person than the one recognised.
+
         Args:
             frame: Input frame (BGR format from OpenCV)
+            face_bbox: Box (x, y, w, h) of the face being checked
 
         Returns:
-            The first face's landmark list, or None if detection failed.
+            The landmark list of the face being checked, or None.
         """
         if self._landmarker is None:
             self._initialize_landmarker()
@@ -587,7 +595,7 @@ class LivenessDetector:
         frame_id = id(frame)
         if frame_id == self._cached_frame_id:
             # Same frame object — reuse cached result, no second inference needed.
-            return self._cached_landmarks
+            return self._select_landmarks(self._cached_landmarks, frame, face_bbox)
 
         try:
             frame_rgb = self._convert_to_rgb(frame)
@@ -599,26 +607,45 @@ class LivenessDetector:
             else:
                 detection_result = self._landmarker.detect(mp_image)
 
-            self.last_face_count = len(detection_result.face_landmarks or [])
-            if self.last_face_count == 0:
+            faces = list(detection_result.face_landmarks or [])
+            self.last_face_count = len(faces)
+            if not faces:
                 self.logger.debug("No face landmarks detected")
-                landmarks = None
-            elif self.last_face_count > 1:
-                # One person at a time: whose blink would it be?
-                landmarks = None
-            else:
-                landmarks = detection_result.face_landmarks[0]
 
-            # Cache for this frame
+            # Cache for this frame (every face; the selection depends on face_bbox)
             self._cached_frame_id = frame_id
-            self._cached_landmarks = landmarks
-            return landmarks
+            self._cached_landmarks = faces
+            return self._select_landmarks(faces, frame, face_bbox)
 
         except Exception as e:
             self.logger.error(f"Error running Face Landmarker: {e}")
             self._cached_frame_id = None
             self._cached_landmarks = None
             return None
+
+    @staticmethod
+    def _select_landmarks(faces, frame: np.ndarray, face_bbox: Optional[Tuple[int, int, int, int]]):
+        """The landmarks of the face being checked among `faces` (see _get_landmarks_for_frame)."""
+        if not faces:
+            return None
+        if len(faces) == 1:
+            return faces[0]
+        frame_h, frame_w = frame.shape[:2]
+        boxes = []
+        for landmarks in faces:
+            xs = [point.x * frame_w for point in landmarks]
+            ys = [point.y * frame_h for point in landmarks]
+            boxes.append((min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)))
+        main = select_foreground_face(boxes)
+        if main is None:
+            return None  # one person at a time: whose blink would it be?
+        if face_bbox is not None:
+            x, y, w, h = face_bbox
+            bx, by, bw, bh = boxes[main]
+            center_x, center_y = bx + bw / 2, by + bh / 2
+            if not (x <= center_x <= x + w and y <= center_y <= y + h):
+                return None  # not the face being checked
+        return faces[main]
 
     def _extract_eye_landmarks(
         self,
@@ -636,7 +663,7 @@ class LivenessDetector:
             Tuple of (left_eye_landmarks, right_eye_landmarks) as lists of (x, y) tuples,
             or None if landmarks cannot be extracted
         """
-        face_landmarks = self._get_landmarks_for_frame(frame)
+        face_landmarks = self._get_landmarks_for_frame(frame, detected_face.bbox if detected_face else None)
         if face_landmarks is None:
             return None
 
@@ -745,7 +772,7 @@ class LivenessDetector:
         Returns:
             Yaw angle in degrees (negative=left, positive=right), or None if estimation fails
         """
-        face_landmarks = self._get_landmarks_for_frame(frame)
+        face_landmarks = self._get_landmarks_for_frame(frame, detected_face.bbox if detected_face else None)
         if face_landmarks is None:
             return None
 

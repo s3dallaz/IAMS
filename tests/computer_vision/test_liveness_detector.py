@@ -2309,7 +2309,7 @@ class TestYawSignConvention:
         detector._cached_landmarks = landmarks
 
         # Patch _get_landmarks_for_frame to always return our landmarks
-        def _fake_get(frame):
+        def _fake_get(frame, face_bbox=None):
             detector._cached_frame_id = id(frame)
             detector._cached_landmarks = landmarks
             return landmarks
