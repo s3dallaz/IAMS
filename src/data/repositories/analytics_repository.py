@@ -107,6 +107,7 @@ class AnalyticsRepository:
                 s.name,
                 s.department,
                 s.is_active,
+                s.enrolled_at,
                 COUNT(a.id) AS total_marked,
                 SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present_count,
                 SUM(CASE WHEN a.status = 'late' THEN 1 ELSE 0 END) AS late_count
@@ -344,4 +345,101 @@ class AnalyticsRepository:
                 return [dict(r) for r in rows]
         except sqlite3.Error as e:
             logger.error(f"Database error querying filtered attendance history: {e}")
+            raise
+
+    # ------------------------------------------------------------------
+    # Absences. Expected students of a session are the ones Session
+    # Details lists (AttendanceRepository._ROSTER_FROM): everyone marked in
+    # it plus every active student registered (enrolled_at, UTC) before it
+    # started (start_time, local -> datetime(..., 'utc')). These queries
+    # return the pieces; StatisticsService counts with them.
+    # ------------------------------------------------------------------
+    
+    def get_session_expectations(self) -> List[Dict[str, Any]]:
+        """
+        Per session: its start time in UTC, how many students attended
+        (present / late), and how many of those are active students
+        registered before the start (they are already counted among the
+        registered students, so they must not be counted twice).
+        """
+        query = """
+            SELECT sess.id AS session_id, sess.session_name, sess.course_code, sess.status,
+                   datetime(sess.start_time, 'utc') AS start_utc,
+                   COALESCE(SUM(a.status IN ('present', 'late')), 0) AS attended,
+                   COALESCE(SUM(a.status IN ('present', 'late') AND s.is_active = 1
+                                AND s.enrolled_at <= datetime(sess.start_time, 'utc')), 0) AS attended_registered
+            FROM sessions sess
+            LEFT JOIN attendance_records a ON a.session_id = sess.id
+            LEFT JOIN students s ON s.id = a.student_id
+            GROUP BY sess.id
+            ORDER BY sess.start_time DESC
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [dict(row) for row in conn.execute(query).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting session expectations: {e}")
+            raise
+    
+    def get_active_registration_times(self) -> List[str]:
+        """Registration times (enrolled_at, UTC) of all active students, oldest first."""
+        query = """
+            SELECT enrolled_at FROM students
+            WHERE is_active = 1 AND enrolled_at IS NOT NULL
+            ORDER BY enrolled_at
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [row[0] for row in conn.execute(query).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting registration times: {e}")
+            raise
+    
+    def get_closed_session_attendance_by_student(self) -> Dict[int, Tuple[int, int]]:
+        """
+        Per student with attendance in closed sessions:
+        (closed sessions attended, of those the ones held after the student registered).
+        """
+        query = """
+            SELECT a.student_id,
+                   COUNT(*) AS attended,
+                   COALESCE(SUM(s.enrolled_at <= datetime(sess.start_time, 'utc')), 0) AS attended_registered
+            FROM attendance_records a
+            JOIN sessions sess ON sess.id = a.session_id AND sess.status = 'closed'
+            JOIN students s ON s.id = a.student_id
+            WHERE a.status IN ('present', 'late')
+            GROUP BY a.student_id
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return {row['student_id']: (row['attended'], row['attended_registered'])
+                        for row in conn.execute(query).fetchall()}
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting closed-session attendance by student: {e}")
+            raise
+    
+    def get_missed_sessions(self, student_db_id: int) -> List[Dict[str, Any]]:
+        """
+        Closed sessions an active student was expected at (held after they
+        registered) but did not attend, newest first. Empty for inactive
+        students, who are not expected anywhere.
+        """
+        query = """
+            SELECT sess.id AS session_id, sess.session_name, sess.course_code,
+                   sess.start_time AS session_start_time
+            FROM sessions sess
+            JOIN students s ON s.id = :student_id AND s.is_active = 1
+            WHERE sess.status = 'closed'
+              AND s.enrolled_at <= datetime(sess.start_time, 'utc')
+              AND NOT EXISTS (
+                  SELECT 1 FROM attendance_records a
+                  WHERE a.session_id = sess.id AND a.student_id = s.id
+                    AND a.status IN ('present', 'late'))
+            ORDER BY sess.start_time DESC
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [dict(row) for row in conn.execute(query, {'student_id': student_db_id}).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting missed sessions of student {student_db_id}: {e}")
             raise

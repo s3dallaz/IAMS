@@ -26,7 +26,8 @@ from src.services.session_service import (
 )
 from src.services.attendance_service import (
     AttendanceService,
-    AttendanceStatus
+    AttendanceStatus,
+    marked_by_label
 )
 from src.utils.logger import get_logger
 
@@ -38,6 +39,7 @@ TAB_DETAILS = "🔍 Session Details & Records"
 TABS_KEY = "session_mgmt_tab"
 DETAIL_SELECTOR_KEY = "session_detail_selector"
 FLASH_KEY = "session_mgmt_flash"
+ROSTER_EDIT_VERSION_KEY = "roster_edit_version"
 TABLE_VERSION_KEY = "sessions_table_version"
 CREATE_FORM_VERSION_KEY = "create_session_form_version"
 
@@ -369,17 +371,26 @@ def render_session_details_tab(
         st.info("No students are registered yet, so nobody is expected in this session.")
         return
 
-    _render_roster(attendance_service, selected_id, counts)
+    _render_roster(attendance_service, selected_id, session['status'], counts)
 
 
 @st.fragment
-def _render_roster(attendance_service: AttendanceService, session_id: int, counts: Dict[str, int]):
+def _render_roster(
+    attendance_service: AttendanceService,
+    session_id: int,
+    session_status: str,
+    counts: Dict[str, int]
+):
     """
     The session's students sorted Present -> Late -> Absent, then by name.
 
     A fragment: filtering and searching rerun only this part. Filtering,
     searching and the ROSTER_MAX_ROWS limit run in the database, so even a
     register of thousands of students stays quick and the page uncluttered.
+
+    Once the session has started, the Status column can be changed by hand
+    (e.g. a student the camera missed -> Present); each change is saved at
+    once and the page redrawn so the counts above follow.
     """
     filter_options = ["all", AttendanceStatus.PRESENT, AttendanceStatus.LATE, AttendanceStatus.ABSENT]
     filter_labels = {"all": f"All ({counts['expected']:,})"}
@@ -419,28 +430,77 @@ def _render_roster(attendance_service: AttendanceService, session_id: int, count
     truncated = len(rows) > ROSTER_MAX_ROWS
     rows = rows[:ROSTER_MAX_ROWS]
 
-    st.dataframe(
-        [{
-            'Status': ATTENDANCE_LABELS.get(r['status'], r['status']),
-            'Student ID': r['student_id'],
-            'Student Name': r['name'],
-            'Marked At': format_datetime(r['marked_at']) if r['marked_at'] else "",
-            'Confidence': r['detection_confidence'],
-            'Liveness': r['liveness_score'],
-            'Marked By': r['marked_by'] or "",
-        } for r in rows],
-        width="stretch",
-        hide_index=True,
-        height=min(38 + 35 * len(rows), 460),
-        column_config={
-            'Confidence': st.column_config.NumberColumn('Confidence', format="%.2f"),
-            'Liveness': st.column_config.NumberColumn('Liveness', format="%.2f"),
-        }
-    )
+    table = [{
+        'Status': ATTENDANCE_LABELS.get(r['status'], r['status']),
+        'Student ID': r['student_id'],
+        'Student Name': r['name'],
+        'Marked At': format_datetime(r['marked_at']) if r['marked_at'] else "",
+        'Confidence': r['detection_confidence'],
+        'Liveness': r['liveness_score'],
+        'Marked By': marked_by_label(r['marked_by'], r.get('verified_by')),
+    } for r in rows]
+    column_config = {
+        'Confidence': st.column_config.NumberColumn('Confidence', format="%.2f"),
+        'Liveness': st.column_config.NumberColumn('Liveness', format="%.2f"),
+    }
+    height = min(38 + 35 * len(rows), 460)
+
+    if session_status == SessionStatus.SCHEDULED:
+        st.dataframe(table, width="stretch", hide_index=True, height=height, column_config=column_config,
+                     placeholder="")
+        st.caption("Attendance can be changed by hand once the session has started.")
+    else:
+        st.caption("✏️ To fix attendance, change a student's **Status** in the table (e.g. Absent → Present). "
+                   "It is saved at once and shown as *Instructor* under Marked By.")
+        # A new key after each save: the editor starts clean on the re-sorted rows
+        editor_key = f"roster_editor_{session_id}_{st.session_state.get(ROSTER_EDIT_VERSION_KEY, 0)}"
+        column_config['Status'] = st.column_config.SelectboxColumn(
+            'Status', options=list(ATTENDANCE_LABELS.values()), required=True
+        )
+        st.data_editor(
+            table, width="stretch", hide_index=True, height=height, key=editor_key, placeholder="",
+            column_config=column_config,
+            disabled=[name for name in table[0] if name != 'Status'],
+        )
+        edited = (st.session_state.get(editor_key) or {}).get('edited_rows') or {}
+        if edited:
+            _save_status_changes(attendance_service, session_id, rows, edited)
+
     if truncated:
         total = counts['expected'] if status is None else counts.get(status, 0)
         shown = f"of {total:,}" if not search.strip() else "matches"
         st.caption(f"Showing the first {ROSTER_MAX_ROWS:,} {shown} — use the filter or search to find others.")
+
+
+def _save_status_changes(
+    attendance_service: AttendanceService,
+    session_id: int,
+    rows: list,
+    edited: Dict[int, Dict[str, Any]]
+):
+    """Save Status changes made in the roster editor, then redraw the whole page (counts included)."""
+    status_by_label = {label: status for status, label in ATTENDANCE_LABELS.items()}
+    changed, errors = [], []
+    for index, change in edited.items():
+        new_status = status_by_label.get(change.get('Status'))
+        if new_status is None or not (0 <= int(index) < len(rows)):
+            continue
+        row = rows[int(index)]
+        if new_status == row['status']:
+            continue
+        try:
+            attendance_service.set_attendance_manually(session_id, row['student_db_id'], new_status)
+            changed.append(f"{row['name']} → {ATTENDANCE_LABELS[new_status]}")
+        except Exception as e:
+            logger.error(f"Could not change attendance of {row['name']}: {e}")
+            errors.append(f"{row['name']}: {e}")
+
+    st.session_state[ROSTER_EDIT_VERSION_KEY] = st.session_state.get(ROSTER_EDIT_VERSION_KEY, 0) + 1
+    if errors:
+        _flash("❌ Not saved — " + "; ".join(errors), kind="error")
+    elif changed:
+        _flash("✅ Saved: " + ", ".join(changed))
+    st.rerun(scope="app")
 
 
 # ============================================================================

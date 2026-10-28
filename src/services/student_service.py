@@ -217,6 +217,16 @@ class StudentService:
         """
         return self.repository.get_all(active_only=active_only)
     
+    def search_students(self, text: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Students whose name or student ID contains `text`, at most `limit`
+        (keeps pickers light when thousands of students are registered).
+        """
+        text = (text or "").strip()
+        if not text:
+            return []
+        return self.repository.search(text, limit=limit)
+    
     def student_exists(self, student_id: str) -> bool:
         """
         Check if a student exists by student ID.

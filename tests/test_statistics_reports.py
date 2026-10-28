@@ -11,6 +11,8 @@ Tests:
 7. UI Page rendering in isolated environment
 """
 
+from contextlib import closing
+
 import pytest
 import tempfile
 import sqlite3
@@ -57,6 +59,9 @@ def populated_db(temp_db):
     s1 = student_svc.create_student("STU001", "Alice Smith", "alice@test.com", "Computer Science")
     s2 = student_svc.create_student("STU002", "Bob Jones", "bob@test.com", "Computer Science")
     s3 = student_svc.create_student("STU003", "Charlie Brown", "charlie@test.com", "Mathematics")
+    # Registered before the sessions below, so they are expected at them
+    with closing(sqlite3.connect(temp_db)) as conn, conn:
+        conn.execute("UPDATE students SET enrolled_at = '2026-09-01 00:00:00'")
     
     # Create sessions as ACTIVE first so attendance can be recorded, then close if needed
     sess1 = session_svc.create_session(
@@ -186,9 +191,12 @@ def test_stats_service_dashboard_metrics(populated_db):
     assert stats['total_present'] == 3
     assert stats['total_late'] == 1
     assert stats['punctuality_rate'] == 75.0  # 3 present out of 4 marked
-    assert stats['attendance_rate'] is None
-    assert stats['total_absent'] is None
-    assert stats['absence_supported'] is False
+    # Closed sessions only (session 1): 3 expected, Charlie absent
+    assert stats['closed_sessions'] == 1
+    assert stats['total_expected'] == 3
+    assert stats['total_absent'] == 1
+    assert stats['attendance_rate'] == 66.7
+    assert stats['absence_supported'] is True
 
 
 def test_stats_service_empty_database_edge_case(temp_db):
@@ -198,7 +206,8 @@ def test_stats_service_empty_database_edge_case(temp_db):
     assert stats['total_students'] == 0
     assert stats['total_sessions'] == 0
     assert stats['total_records'] == 0
-    assert stats['attendance_rate'] is None
+    assert stats['total_absent'] == 0
+    assert stats['attendance_rate'] == 0.0
     assert stats['punctuality_rate'] == 0.0
 
 
@@ -212,9 +221,22 @@ def test_stats_service_student_statistics(populated_db):
     assert stats['total_marked'] == 2
     assert stats['present_count'] == 2
     assert stats['late_count'] == 0
-    assert stats['absent_count'] is None
-    assert stats['attendance_percentage'] is None
+    # Only session 1 is closed; Alice attended it
+    assert stats['expected_sessions'] == 1
+    assert stats['absent_count'] == 0
+    assert stats['attendance_percentage'] == 100.0
+    assert stats['missed_sessions'] == []
     assert len(stats['history']) == 2
+
+
+def test_stats_service_student_missed_sessions(populated_db):
+    svc = StatisticsService(populated_db['db_path'])
+    charlie = populated_db['student_ids'][2]
+    
+    stats = svc.get_student_statistics(charlie)
+    
+    assert (stats['expected_sessions'], stats['absent_count'], stats['attendance_percentage']) == (1, 1, 0.0)
+    assert [s['session_name'] for s in stats['missed_sessions']] == ["CS101 Intro Lecture"]
 
 
 def test_stats_service_student_zero_attendance(populated_db, temp_db):
@@ -226,8 +248,10 @@ def test_stats_service_student_zero_attendance(populated_db, temp_db):
     
     assert stats['total_marked'] == 0
     assert stats['present_count'] == 0
-    assert stats['absent_count'] is None
-    assert stats['attendance_percentage'] is None
+    # Registered after every session: expected nowhere, so not absent
+    assert stats['expected_sessions'] == 0
+    assert stats['absent_count'] == 0
+    assert stats['attendance_percentage'] == 0.0
     assert len(stats['history']) == 0
 
 
@@ -237,12 +261,31 @@ def test_stats_service_session_statistics(populated_db):
     
     stats = svc.get_session_statistics(sess1_id)
     assert stats['session_name'] == "CS101 Intro Lecture"
-    assert stats['expected_students'] is None
+    assert stats['expected_students'] == 3
     assert stats['total_marked'] == 2
     assert stats['present_count'] == 1
     assert stats['late_count'] == 1
-    assert stats['absent_count'] is None
-    assert stats['attendance_percentage'] is None
+    assert stats['absent_count'] == 1
+    assert stats['attendance_percentage'] == 66.7
+
+
+def test_session_statistics_match_session_details(populated_db):
+    """Statistics and Session Details count the same absent students."""
+    svc = StatisticsService(populated_db['db_path'])
+    attendance = AttendanceService(populated_db['db_path'])
+    by_session = {s['session_id']: s for s in svc.get_all_sessions_statistics()}
+    for session_id in populated_db['session_ids'][:2]:
+        roster = attendance.get_session_roster_counts(session_id)
+        assert by_session[session_id]['absent_count'] == roster['absent']
+        assert by_session[session_id]['expected_students'] == roster['expected']
+        assert svc.get_session_statistics(session_id)['absent_count'] == roster['absent']
+
+
+def test_scheduled_session_has_no_absences(populated_db):
+    svc = StatisticsService(populated_db['db_path'])
+    stats = svc.get_session_statistics(populated_db['session_ids'][2])
+    assert stats['absence_supported'] is False
+    assert stats['absent_count'] is None and stats['expected_students'] is None
 
 
 def test_stats_service_all_students_statistics(populated_db):
@@ -254,7 +297,9 @@ def test_stats_service_all_students_statistics(populated_db):
     assert "STU001" in ids
     assert "STU002" in ids
     assert "STU003" in ids
-    assert all(student['attendance_percentage'] is None for student in all_stats)
+    absent = {s['student_id']: s['absent_count'] for s in all_stats}
+    assert absent == {"STU001": 0, "STU002": 0, "STU003": 1}
+    assert [s['student_id'] for s in svc.get_students_with_most_absences()] == ["STU003"]
 
 
 def test_stats_service_course_statistics(populated_db):
@@ -301,6 +346,18 @@ def test_report_service_export_student_summary_csv(populated_db):
     assert "STUDENT ATTENDANCE REPORT" in csv_str
     assert "STU001" in csv_str
     assert "Alice Smith" in csv_str
+    assert "Absences (closed sessions),0" in csv_str
+
+
+def test_report_student_csv_lists_missed_sessions(populated_db):
+    stats_svc = StatisticsService(populated_db['db_path'])
+    report_svc = ReportService(statistics_service=stats_svc)
+    stats = stats_svc.get_student_statistics(populated_db['student_ids'][2])  # Charlie
+    
+    rows = list(csv.reader(io.StringIO(report_svc.export_student_summary_csv(stats))))
+    
+    assert ["Absences (closed sessions)", "1"] in rows
+    assert any(r and r[0] == "CS101 Intro Lecture" and r[4] == "ABSENT" for r in rows)
 
 
 def test_report_service_export_session_summary_csv(populated_db):
@@ -313,6 +370,11 @@ def test_report_service_export_session_summary_csv(populated_db):
     
     assert "SESSION ATTENDANCE REPORT" in csv_str
     assert "CS101 Intro Lecture" in csv_str
+    rows = list(csv.reader(io.StringIO(csv_str)))
+    assert ["Absences", "1"] in rows
+    # Every expected student is listed: present, late, and the absent one
+    statuses = {r[1]: r[4] for r in rows if len(r) == 8 and r[0].startswith("STU")}
+    assert statuses == {"Alice Smith": "PRESENT", "Bob Jones": "LATE", "Charlie Brown": "ABSENT"}
 
 
 def test_report_service_generate_student_report_pdf(populated_db):
@@ -356,3 +418,18 @@ def test_render_statistics_reports_page(mock_tabs):
          patch("src.ui.pages.statistics_reports.render_filterable_history_tab"):
         render_statistics_reports_page()
         mock_tabs.assert_called_once()
+
+
+def test_pdf_reports_handle_missing_course_department_and_non_latin_names(temp_db):
+    """'—' for a missing course / department, or an Arabic name, used to make the PDF fail."""
+    student = StudentService(temp_db).create_student("STU900", "Test Student")  # no department
+    session_id = SessionService(temp_db).create_session("No course", "2026-10-01 09:00:00",
+                                                        status=SessionStatus.CLOSED)
+    stats_svc = StatisticsService(temp_db)
+    report_svc = ReportService(statistics_service=stats_svc)
+
+    session_pdf = report_svc.generate_session_report_pdf(stats_svc.get_session_statistics(session_id))
+    student_stats = stats_svc.get_student_statistics(student)
+    student_pdf = report_svc.generate_student_report_pdf({**student_stats, 'name': "عبد الرحمن"})
+
+    assert session_pdf.startswith(b"%PDF") and student_pdf.startswith(b"%PDF")

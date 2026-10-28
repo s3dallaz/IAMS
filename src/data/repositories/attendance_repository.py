@@ -13,6 +13,9 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# marked_by / verified_by of attendance set or changed by hand
+MANUAL_MARKER = 'instructor'
+
 
 class AttendanceRepository:
     """
@@ -297,6 +300,23 @@ class AttendanceRepository:
             logger.error(f"Database error updating attendance: {e}")
             raise
     
+    def delete_attendance(self, attendance_id: int) -> int:
+        """
+        Delete an attendance record (the student then counts as absent).
+        
+        Returns:
+            Number of rows affected (0 if record not found, 1 if deleted)
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                cursor = conn.execute("DELETE FROM attendance_records WHERE id = ?", (attendance_id,))
+                if cursor.rowcount:
+                    logger.info(f"Deleted attendance record ID {attendance_id}")
+                return cursor.rowcount
+        except sqlite3.Error as e:
+            logger.error(f"Database error deleting attendance record {attendance_id}: {e}")
+            raise
+    
     def get_all(self) -> List[Dict[str, Any]]:
         """
         Get all attendance records.
@@ -344,13 +364,15 @@ class AttendanceRepository:
     
     # Students expected in a session: anyone with a record in it, plus every
     # active student registered before the session started (no class rosters
-    # exist yet, so the register is the roster). :registered_before is UTC,
-    # like the database-default enrolled_at, so the two compare directly.
+    # exist yet, so the register is the roster). The session's start time is
+    # local; datetime(..., 'utc') converts it to UTC like the database-default
+    # enrolled_at. AnalyticsRepository counts absences with the same rule.
     _ROSTER_FROM = """
         FROM students s
         LEFT JOIN attendance_records a ON a.student_id = s.id AND a.session_id = :session_id
         WHERE (a.id IS NOT NULL
-               OR (s.is_active = 1 AND (:registered_before IS NULL OR s.enrolled_at <= :registered_before)))
+               OR (s.is_active = 1
+                   AND s.enrolled_at <= (SELECT datetime(start_time, 'utc') FROM sessions WHERE id = :session_id)))
     """
     
     # Present -> Late -> Absent, then by name
@@ -360,14 +382,12 @@ class AttendanceRepository:
                  s.name COLLATE NOCASE, s.student_id
     """
     
-    def get_session_roster_counts(self, session_id: int, registered_before: Optional[str]) -> Dict[str, int]:
+    def get_session_roster_counts(self, session_id: int) -> Dict[str, int]:
         """
         Number of expected students per status for a session.
         
         Args:
             session_id: Session database ID
-            registered_before: UTC 'YYYY-MM-DD HH:MM:SS'; active students
-                registered later are not expected (None = no limit)
         
         Returns:
             {status: count}; students without a record count as 'absent'
@@ -376,8 +396,7 @@ class AttendanceRepository:
         
         try:
             with get_db_connection(self.database_path) as conn:
-                rows = conn.execute(query, {'session_id': session_id,
-                                            'registered_before': registered_before}).fetchall()
+                rows = conn.execute(query, {'session_id': session_id}).fetchall()
                 return {row['status']: row['n'] for row in rows}
         except sqlite3.Error as e:
             logger.error(f"Database error counting the roster of session {session_id}: {e}")
@@ -386,7 +405,6 @@ class AttendanceRepository:
     def get_session_roster(
         self,
         session_id: int,
-        registered_before: Optional[str],
         status: Optional[str] = None,
         search: Optional[str] = None,
         limit: Optional[int] = None
@@ -398,23 +416,22 @@ class AttendanceRepository:
         
         Args:
             session_id: Session database ID
-            registered_before: UTC 'YYYY-MM-DD HH:MM:SS'; active students
-                registered later are not expected (None = no limit)
             status: Only this status('absent' = no record or an absent record)
             search: Case-insensitive part of the name or student ID
             limit: Maximum number of rows
         
         Returns:
-            Rows with student_db_id, student_id, name, status, record_id,
-            marked_at, detection_confidence, liveness_score, marked_by, notes
+            Rows with student_db_id, student_id, name, department, status,
+            record_id, marked_at, detection_confidence, liveness_score,
+            marked_by, verified_by, notes
         """
         query = f"""
-            SELECT s.id AS student_db_id, s.student_id, s.name,
+            SELECT s.id AS student_db_id, s.student_id, s.name, s.department,
                    COALESCE(a.status, 'absent') AS status, a.id AS record_id, a.marked_at,
-                   a.detection_confidence, a.liveness_score, a.marked_by, a.notes
+                   a.detection_confidence, a.liveness_score, a.marked_by, a.verified_by, a.notes
             {self._ROSTER_FROM}
         """
-        params: Dict[str, Any] = {'session_id': session_id, 'registered_before': registered_before}
+        params: Dict[str, Any] = {'session_id': session_id}
         if status:
             query += " AND COALESCE(a.status, 'absent') = :status"
             params['status'] = status
@@ -472,7 +489,8 @@ class AttendanceRepository:
         """
         Re-decide present / late for every present or late record of a
         session: marked before `late_cutoff` = present, otherwise late.
-        Absent records are left alone.
+        Absent records, and statuses set or changed by hand (marked_by /
+        verified_by = MANUAL_MARKER), are left alone.
         
         Args:
             session_id: Session database ID
@@ -486,12 +504,14 @@ class AttendanceRepository:
             SET status = CASE WHEN datetime(marked_at) < datetime(:cutoff) THEN 'present' ELSE 'late' END
             WHERE session_id = :session_id
               AND status IN ('present', 'late')
+              AND verified_by IS NULL AND COALESCE(marked_by, '') != :manual
               AND status != CASE WHEN datetime(marked_at) < datetime(:cutoff) THEN 'present' ELSE 'late' END
         """
         
         try:
             with get_db_connection(self.database_path) as conn:
-                cursor = conn.execute(query, {'session_id': session_id, 'cutoff': late_cutoff})
+                cursor = conn.execute(query, {'session_id': session_id, 'cutoff': late_cutoff,
+                                              'manual': MANUAL_MARKER})
                 if cursor.rowcount:
                     logger.info(f"Re-graded {cursor.rowcount} record(s) of session {session_id}")
                 return cursor.rowcount

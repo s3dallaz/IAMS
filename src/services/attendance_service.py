@@ -8,9 +8,9 @@ status calculation, and business rule enforcement.
 import sqlite3
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-from src.data.repositories.attendance_repository import AttendanceRepository
+from src.data.repositories.attendance_repository import AttendanceRepository, MANUAL_MARKER
 from src.data.repositories.student_repository import StudentRepository
 from src.data.repositories.session_repository import SessionRepository
 from src.services.session_service import SessionService, SessionStatus
@@ -508,23 +508,12 @@ class AttendanceService:
         
         return self.attendance_repo.get_by_status(status)
 
-    def _roster_cutoff(self, session_id: int) -> Optional[str]:
-        """
-        UTC time before which active students must have been registered to
-        be expected in the session: its start time. Students registered
-        later (e.g. a bulk import after the class) are not listed absent.
-        """
+    def _check_roster_session(self, session_id: int) -> None:
+        """Validate the session a roster is asked for."""
         if not isinstance(session_id, int) or session_id <= 0:
             raise InvalidAttendanceDataError("session_id must be a positive integer")
-        session = self.session_repo.get_by_id(session_id)
-        if not session:
+        if not self.session_repo.exists(session_id):
             raise InvalidAttendanceDataError(f"Session with ID {session_id} does not exist")
-        try:
-            start = datetime.fromisoformat(session['start_time'].replace(' ', 'T'))
-        except (TypeError, ValueError):
-            return None
-        # Session times are local; enrolled_at is the database's UTC default
-        return start.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     
     def get_session_roster_counts(self, session_id: int) -> Dict[str, int]:
         """
@@ -532,12 +521,15 @@ class AttendanceService:
         
         Expected students are everyone with a record in the session plus
         every active student registered before the session started (there
-        are no class rosters yet). Students without a record are absent.
+        are no class rosters yet), so students registered later - e.g. a bulk
+        import after the class - are not listed absent. Students without a
+        record are absent.
         
         Returns:
             {'present': n, 'late': n, 'absent': n, 'expected': total}
         """
-        counts = self.attendance_repo.get_session_roster_counts(session_id, self._roster_cutoff(session_id))
+        self._check_roster_session(session_id)
+        counts = self.attendance_repo.get_session_roster_counts(session_id)
         result = {status: counts.get(status, 0) for status in
                   (AttendanceStatus.PRESENT, AttendanceStatus.LATE, AttendanceStatus.ABSENT)}
         result['expected'] = sum(counts.values())
@@ -564,7 +556,7 @@ class AttendanceService:
         Raises:
             InvalidAttendanceDataError: If an argument is invalid
         """
-        cutoff = self._roster_cutoff(session_id)
+        self._check_roster_session(session_id)
         if status is not None:
             status = status.strip().lower()
             if status not in VALID_STATUSES:
@@ -573,7 +565,7 @@ class AttendanceService:
                 )
         search = (search or "").strip() or None
         return self.attendance_repo.get_session_roster(
-            session_id, cutoff, status=status, search=search, limit=limit
+            session_id, status=status, search=search, limit=limit
         )
     
     def get_session_records_with_students(
@@ -597,3 +589,100 @@ class AttendanceService:
         if not isinstance(session_id, int) or session_id <= 0:
             raise InvalidAttendanceDataError("session_id must be a positive integer")
         return self.attendance_repo.get_session_status_counts(session_id)
+
+    def set_attendance_manually(
+        self,
+        session_id: int,
+        student_id: int,
+        status: str,
+        changed_by: str = MANUAL_MARKER
+    ) -> Optional[int]:
+        """
+        Set a student's attendance in a session by hand, e.g. when the camera
+        did not recognise a student who was there, or to excuse a late arrival.
+        
+        - present / late: creates the student's record (marked_by = changed_by)
+          or changes the status of the existing one (verified_by = changed_by)
+        - absent: removes the student's record (no record = absent)
+        
+        Works for active and closed sessions (not before a session starts).
+        A status set by hand is kept when the session's start time or late
+        threshold is edited later (it is not re-graded).
+        
+        Args:
+            session_id: Session database ID
+            student_id: Student database ID
+            status: 'present', 'late' or 'absent'
+            changed_by: Who made the change (stored on the record)
+        
+        Returns:
+            The attendance record ID, or None for 'absent'
+        
+        Raises:
+            InvalidAttendanceDataError: If an argument is invalid
+            SessionNotAcceptingAttendanceError: If the session has not started
+        """
+        if not isinstance(session_id, int) or session_id <= 0:
+            raise InvalidAttendanceDataError("session_id must be a positive integer")
+        if not isinstance(student_id, int) or student_id <= 0:
+            raise InvalidAttendanceDataError("student_id must be a positive integer")
+        status = (status or "").strip().lower()
+        if status not in VALID_STATUSES:
+            raise InvalidAttendanceDataError(
+                f"Invalid status '{status}'. Must be one of: {', '.join(VALID_STATUSES)}"
+            )
+        session = self.session_repo.get_by_id(session_id)
+        if not session:
+            raise InvalidAttendanceDataError(f"Session with ID {session_id} does not exist")
+        if session['status'] == SessionStatus.SCHEDULED:
+            raise SessionNotAcceptingAttendanceError(
+                "This session has not started yet; attendance can be set once it is active."
+            )
+        if not self.student_repo.get_by_id(student_id):
+            raise InvalidAttendanceDataError(f"Student with ID {student_id} does not exist")
+        
+        existing = self.attendance_repo.get_by_session_and_student(session_id, student_id)
+        try:
+            if status == AttendanceStatus.ABSENT:
+                if existing:
+                    self.attendance_repo.delete_attendance(existing['id'])
+                    logger.info(f"Session {session_id}: student {student_id} set to absent by {changed_by} "
+                                f"(was {existing['status']})")
+                return None
+            
+            if existing:
+                if existing['status'] != status:
+                    self.attendance_repo.update_attendance(
+                        existing['id'], status=status, verified_by=changed_by,
+                        notes=f"Changed by hand from {existing['status']} to {status}"
+                    )
+                    logger.info(f"Session {session_id}: student {student_id} changed to {status} by {changed_by}")
+                return existing['id']
+            
+            attendance_id = self.attendance_repo.create_attendance(
+                session_id=session_id,
+                student_id=student_id,
+                status=status,
+                marked_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                marked_by=changed_by,
+                notes="Marked by hand"
+            )
+            logger.info(f"Session {session_id}: student {student_id} marked {status} by {changed_by}")
+            return attendance_id
+        except sqlite3.IntegrityError:
+            # The camera marked the student a moment ago: change that record instead
+            return self.set_attendance_manually(session_id, student_id, status, changed_by)
+        except sqlite3.Error as e:
+            logger.error(f"Database error setting attendance by hand: {e}")
+            raise InvalidAttendanceDataError(f"Failed to set attendance: {e}")
+
+
+def marked_by_label(marked_by: Optional[str], verified_by: Optional[str] = None) -> str:
+    """Who marked a record, in plain words ('Camera', 'Instructor', 'Camera, changed by Instructor')."""
+    names = {'cv_realtime': 'Camera', MANUAL_MARKER: 'Instructor'}
+    if not marked_by:
+        return ""
+    label = names.get(marked_by, marked_by)
+    if verified_by:
+        label += f", changed by {names.get(verified_by, verified_by)}"
+    return label

@@ -150,6 +150,28 @@ class StudentRepository:
             logger.error(f"Database error getting all students: {e}")
             raise
     
+    def search(self, text: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Students whose name or student ID contains `text` (case-insensitive),
+        by name, at most `limit` of them.
+        """
+        # '!' escapes LIKE wildcards, so "%" or "_" typed by the user match literally
+        escaped = text.replace('!', '!!').replace('%', '!%').replace('_', '!_')
+        query = """
+            SELECT * FROM students
+            WHERE name LIKE :text ESCAPE '!' OR student_id LIKE :text ESCAPE '!'
+            ORDER BY name COLLATE NOCASE, student_id
+            LIMIT :limit
+        """
+        
+        try:
+            with get_db_connection(self.database_path) as conn:
+                rows = conn.execute(query, {'text': f"%{escaped}%", 'limit': int(limit)}).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Database error searching students: {e}")
+            raise
+    
     def update_student(
         self,
         student_db_id: int,

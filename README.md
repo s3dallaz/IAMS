@@ -19,12 +19,13 @@ This project is an AI-powered attendance system that automates student attendanc
 * Start a session by hand at any time. Started **after** its scheduled time, it starts fresh: lateness counts from the moment it was started
 * Edit any session at any time; changing its start time or late threshold re-checks who was present or late
 * Session details list **every** expected student — present, late and absent — with counts, a status filter and a search box
+* **Fix attendance by hand**: change any student's status (Present / Late / Absent) right in that list — e.g. a student the camera missed. Changes are labelled *Instructor* and are kept even if the session's times are edited later
 * The camera turns itself off when its session ends
 
 **Students & reports**
 * Student registry with face enrollment from the camera or from photos
 * Bulk import of students (Excel / CSV) and face photos (ZIP), with a duplicate-face check
-* Statistics, CSV export and PDF reports
+* Statistics with **absences and attendance rates** (per student, session and course), a "most absences" list, CSV export and PDF reports
 * AI Assistant: ask questions about attendance in plain language (needs an API key)
 
 ## 🧠 Technologies Used
@@ -127,9 +128,9 @@ The app opens on **Real-Time Attendance**. The sidebar has five pages:
 2. **Session Management** - three tabs:
    * **Sessions List** - every session with its status and present / late counts. Click a row to get its buttons: **Start Now**, **Close**, **View**, **Edit**, **Delete** (an active session must be closed before it can be deleted).
    * **Create New Session** - name, course, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*.
-   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast.
+   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed).
 3. **Student Registry** - add / edit students, manage their face photos, bulk import.
-4. **Statistics & Reports** - attendance analytics, CSV and PDF exports.
+4. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course, and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
 5. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
 
 ### How sessions behave

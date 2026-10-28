@@ -14,10 +14,18 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from fpdf import FPDF
 
+from src.services.attendance_service import marked_by_label
 from src.services.statistics_service import StatisticsService
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# A session PDF lists at most this many absent students (the CSV lists all)
+PDF_MAX_ABSENT_ROWS = 300
+
+
+def _rate(value: Optional[float]) -> str:
+    return f"{value}%" if value is not None else "—"
 
 
 class AttendancePDF(FPDF):
@@ -44,6 +52,14 @@ class AttendancePDF(FPDF):
         self.set_font('Helvetica', 'I', 8)
         self.set_text_color(148, 163, 184)
         self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align='C')
+
+    def normalize_text(self, text):
+        # The built-in Helvetica font covers Latin-1 only: print dashes as
+        # '-' and any other character it lacks (e.g. Arabic letters) as '?'
+        # instead of failing the whole report
+        text = text.replace('—', '-').replace('–', '-')
+        text = text.encode('latin-1', errors='replace').decode('latin-1')
+        return super().normalize_text(text)
 
 
 class ReportService:
@@ -135,11 +151,12 @@ class ReportService:
         writer.writerow(["Sessions With Attendance Records", student_stats.get('total_sessions', 0)])
         writer.writerow(["Present Count", student_stats.get('present_count', 0)])
         writer.writerow(["Late Count", student_stats.get('late_count', 0)])
-        writer.writerow(["Absences", "Not available: no session roster is recorded"])
-        writer.writerow(["Attendance Rate", "Not available: no session roster is recorded"])
+        writer.writerow(["Expected Sessions (closed)", student_stats.get('expected_sessions', 0)])
+        writer.writerow(["Absences (closed sessions)", student_stats.get('absent_count', 0)])
+        writer.writerow(["Attendance Rate", _rate(student_stats.get('attendance_percentage'))])
         writer.writerow([])
         
-        # History Table
+        # History Table: attended sessions, then the closed sessions missed
         writer.writerow(["Session Name", "Course", "Session Time", "Marked Time", "Status", "Confidence", "Marked By"])
         for r in student_stats.get('history', []):
             writer.writerow([
@@ -149,18 +166,29 @@ class ReportService:
                 r.get('marked_at', ''),
                 r.get('status', '').upper(),
                 f"{r.get('detection_confidence', 0):.2f}" if r.get('detection_confidence') is not None else '',
-                r.get('marked_by', '')
+                marked_by_label(r.get('marked_by'), r.get('verified_by'))
             ])
-            
+        for r in student_stats.get('missed_sessions', []):
+            writer.writerow([
+                r.get('session_name', ''),
+                r.get('course_code', '') or '',
+                r.get('session_start_time', ''),
+                '',
+                'ABSENT',
+                '',
+                ''
+            ])
+        
         return output.getvalue()
 
     def export_session_summary_csv(self, session_stats: Dict[str, Any]) -> str:
         """
-        Export a session's attendance statistics and student attendance records to CSV string.
+        Export a session's attendance statistics and every expected student
+        (present, late and absent) to CSV string.
         
         Args:
             session_stats: Dictionary from StatisticsService.get_session_statistics
-            
+        
         Returns:
             CSV content as string
         """
@@ -172,27 +200,30 @@ class ReportService:
         writer.writerow(["Course Code", session_stats.get('course_code', '')])
         writer.writerow(["Start Time", session_stats.get('start_time', '')])
         writer.writerow(["Status", session_stats.get('status', '').upper()])
-        writer.writerow(["Expected Students", "Not available: no session roster is recorded"])
+        started = session_stats.get('absence_supported', False)
+        not_started = "Session not started yet"
+        writer.writerow(["Expected Students", session_stats.get('expected_students') if started else not_started])
         writer.writerow(["Total Marked", session_stats.get('total_marked', 0)])
         writer.writerow(["Present Count", session_stats.get('present_count', 0)])
         writer.writerow(["Late Count", session_stats.get('late_count', 0)])
-        writer.writerow(["Absences", "Not available: no session roster is recorded"])
-        writer.writerow(["Attendance Rate", "Not available: no session roster is recorded"])
+        writer.writerow(["Absences", session_stats.get('absent_count') if started else not_started])
+        writer.writerow(["Attendance Rate", _rate(session_stats.get('attendance_percentage')) if started else not_started])
         writer.writerow([])
         
         writer.writerow(["Student ID", "Student Name", "Department", "Marked Time", "Status", "Confidence", "Liveness", "Marked By"])
-        for r in session_stats.get('records', []):
+        rows = self.statistics_service.get_session_roster(session_stats['session_id']) if started else []
+        for r in rows:
             writer.writerow([
                 r.get('student_id', ''),
-                r.get('student_name', ''),
-                r.get('student_department', '') or '',
-                r.get('marked_at', ''),
+                r.get('name', ''),
+                r.get('department', '') or '',
+                r.get('marked_at', '') or '',
                 r.get('status', '').upper(),
-                f"{r.get('detection_confidence', 0):.2f}" if r.get('detection_confidence') is not None else '',
-                f"{r.get('liveness_score', 0):.2f}" if r.get('liveness_score') is not None else '',
-                r.get('marked_by', '')
+                f"{r['detection_confidence']:.2f}" if r.get('detection_confidence') is not None else '',
+                f"{r['liveness_score']:.2f}" if r.get('liveness_score') is not None else '',
+                marked_by_label(r.get('marked_by'), r.get('verified_by'))
             ])
-            
+        
         return output.getvalue()
 
     # ========================================================================
@@ -248,13 +279,15 @@ class ReportService:
         pdf.set_text_color(30, 41, 59)
         pdf.cell(0, 7, "Attendance Performance Summary", new_x='LMARGIN', new_y='NEXT')
         
-        col_w = pdf.epw / 4
         metrics = [
-            ("Recorded Sessions", str(student_stats.get('total_sessions', 0))),
+            ("Expected (closed)", str(student_stats.get('expected_sessions', 0))),
             ("Present", str(student_stats.get('present_count', 0))),
             ("Late", str(student_stats.get('late_count', 0))),
+            ("Absent", str(student_stats.get('absent_count', 0))),
+            ("Attendance", _rate(student_stats.get('attendance_percentage'))),
             ("On-time Rate", f"{student_stats.get('punctuality_percentage', 0)}%")
         ]
+        col_w = pdf.epw / len(metrics)
         
         pdf.set_fill_color(241, 245, 249)
         pdf.set_font('Helvetica', 'B', 8)
@@ -292,7 +325,11 @@ class ReportService:
         pdf.set_font('Helvetica', '', 8)
         pdf.set_text_color(15, 23, 42)
         
-        history = student_stats.get('history', [])
+        # Attended sessions, then the closed sessions missed
+        history = list(student_stats.get('history', [])) + [
+            {**r, 'status': 'absent', 'marked_at': '—', 'marked_by': None}
+            for r in student_stats.get('missed_sessions', [])
+        ]
         if not history:
             pdf.cell(pdf.epw, 8, "No attendance records recorded for this student.", border=1, align='C')
             pdf.ln()
@@ -302,12 +339,13 @@ class ReportService:
                 pdf.set_fill_color(248, 250, 252) if fill_row else pdf.set_fill_color(255, 255, 255)
                 
                 pdf.cell(65, 6, str(r.get('session_name', '—'))[:35], border=1, fill=fill_row)
-                pdf.cell(30, 6, str(r.get('course_code', '—'))[:15], border=1, fill=fill_row)
+                pdf.cell(30, 6, str(r.get('course_code') or '—')[:15], border=1, fill=fill_row)
                 pdf.cell(45, 6, str(r.get('marked_at', '—'))[:19], border=1, align='C', fill=fill_row)
                 
                 status_val = str(r.get('status', '—')).upper()
                 pdf.cell(25, 6, status_val, border=1, align='C', fill=fill_row)
-                pdf.cell(25, 6, str(r.get('marked_by', 'system')), border=1, align='C', fill=fill_row)
+                pdf.cell(25, 6, marked_by_label(r.get('marked_by'), r.get('verified_by'))[:14] or '—',
+                         border=1, align='C', fill=fill_row)
                 pdf.ln()
                 
         return bytes(pdf.output())
@@ -360,13 +398,16 @@ class ReportService:
         pdf.set_text_color(30, 41, 59)
         pdf.cell(0, 7, "Session Attendance Metrics", new_x='LMARGIN', new_y='NEXT')
         
-        col_w = pdf.epw / 4
+        started = session_stats.get('absence_supported', False)
         metrics = [
-            ("Total Marked", str(session_stats.get('total_marked', 0))),
+            ("Expected", str(session_stats.get('expected_students')) if started else "—"),
             ("Present", str(session_stats.get('present_count', 0))),
             ("Late", str(session_stats.get('late_count', 0))),
+            ("Absent", str(session_stats.get('absent_count')) if started else "—"),
+            ("Attendance", _rate(session_stats.get('attendance_percentage'))),
             ("On-time Rate", f"{session_stats.get('punctuality_percentage', 0)}%")
         ]
+        col_w = pdf.epw / len(metrics)
         
         pdf.set_fill_color(241, 245, 249)
         pdf.set_font('Helvetica', 'B', 8)
@@ -421,5 +462,42 @@ class ReportService:
                 pdf.cell(25, 6, status_val, border=1, align='C', fill=fill_row)
                 pdf.cell(35, 6, str(r.get('marked_at', '—'))[:19], border=1, align='C', fill=fill_row)
                 pdf.ln()
-                
+        
+        if started:
+            self._add_absent_students_table(pdf, session_stats)
+        
         return bytes(pdf.output())
+    
+    def _add_absent_students_table(self, pdf: FPDF, session_stats: Dict[str, Any]) -> None:
+        """List the session's absent students (at most PDF_MAX_ABSENT_ROWS; the CSV has all)."""
+        absent = self.statistics_service.get_session_roster(session_stats['session_id'], status='absent')
+        pdf.ln(6)
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_text_color(30, 41, 59)
+        pdf.cell(0, 7, f"Absent Students ({len(absent)})", new_x='LMARGIN', new_y='NEXT')
+        if not absent:
+            pdf.set_font('Helvetica', '', 9)
+            pdf.cell(0, 6, "Nobody was absent.", new_x='LMARGIN', new_y='NEXT')
+            return
+        
+        table_headers = [("Student ID", 45), ("Student Name", 90), ("Department", 55)]
+        pdf.set_fill_color(30, 41, 59)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font('Helvetica', 'B', 8)
+        for title, width in table_headers:
+            pdf.cell(width, 7, title, border=1, align='C', fill=True)
+        pdf.ln()
+        
+        pdf.set_font('Helvetica', '', 8)
+        pdf.set_text_color(15, 23, 42)
+        for i, r in enumerate(absent[:PDF_MAX_ABSENT_ROWS]):
+            fill_row = (i % 2 == 1)
+            pdf.set_fill_color(248, 250, 252) if fill_row else pdf.set_fill_color(255, 255, 255)
+            pdf.cell(45, 6, str(r.get('student_id', '—'))[:20], border=1, fill=fill_row)
+            pdf.cell(90, 6, str(r.get('name', '—'))[:45], border=1, fill=fill_row)
+            pdf.cell(55, 6, str(r.get('department') or '—')[:28], border=1, fill=fill_row)
+            pdf.ln()
+        if len(absent) > PDF_MAX_ABSENT_ROWS:
+            pdf.set_font('Helvetica', 'I', 8)
+            pdf.cell(0, 6, f"... and {len(absent) - PDF_MAX_ABSENT_ROWS:,} more - the CSV report lists every student.",
+                     new_x='LMARGIN', new_y='NEXT')
