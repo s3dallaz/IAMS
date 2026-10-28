@@ -122,7 +122,7 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 
 ## 🎯 Using the System
 
-The app opens on **Home**. The sidebar has six pages:
+The app opens on **Home**. The sidebar has seven pages:
 
 1. **Home** - the start page, top to bottom:
    * **Getting started** - the setup steps (add students → add face photos → create a session → take attendance), ticked off automatically, with a **Go** button for the next one. It folds away once all are done.
@@ -135,8 +135,13 @@ The app opens on **Home**. The sidebar has six pages:
    * **Create New Session** - name, course, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*.
    * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed).
 4. **Student Registry** - add / edit students, manage their face photos, bulk import.
-5. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course, and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
-6. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
+5. **Courses & Sections** - three tabs:
+   * **Courses** - add, edit, deactivate or delete courses (e.g. TM103). Select a row for its buttons.
+   * **Sections & class lists** - pick a course, add its sections (e.g. A, B, Lab 1) with the instructor's name, and manage each section's **class list**: search and pick students, paste a list of student IDs, remove selected students, or download the list as CSV.
+   * **Import class lists** - an Excel / CSV file with the columns `course_code`, `section`, `student_id` (optional: `course_name`, `instructor`). Courses and sections that don't exist yet are created; you see a preview first. Importing the same file again is safe, and an import never removes anyone.
+   * A course or section that has sessions can't be deleted - deactivate it instead, so its history is kept.
+6. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course, and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
+7. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
 
 ### How sessions behave
 
@@ -295,7 +300,7 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 
 Planned, not built yet:
 
-* **Courses / sections and class lists** - sessions belong to a section; only its students are expected (and counted absent)
+* **Sessions linked to sections** - a session belongs to a section; only its class list is expected (and counted absent), and the camera only looks for those students. Courses, sections and class lists themselves are already built (see above)
 * **Instructor screen** - an instructor picks their course and session and starts it
 * **Login for instructors and admins** - each instructor sees and manages only their own sessions
 * **Use from several devices** - the app is already reachable on the local network; multi-device use will come together with the login

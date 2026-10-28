@@ -28,6 +28,15 @@ st.set_page_config(
 )
 
 
+@st.cache_resource(show_spinner="Preparing the database...")
+def prepare_database() -> bool:
+    """initialize_database() once per server process (it is safe to repeat)."""
+    ok = initialize_database()
+    if ok:
+        logger.info("Database ready")
+    return ok
+
+
 def main():
     """Main application entry point."""
     
@@ -37,15 +46,13 @@ def main():
         logger.error("Configuration validation failed")
         return
     
-    # Initialize database on first run
-    if not config.DATABASE_PATH.exists():
-        with st.spinner("Initializing database..."):
-            if initialize_database():
-                logger.info("Database initialized successfully")
-            else:
-                st.error("⚠️ Database initialization failed.")
-                logger.error("Database initialization failed")
-                return
+    # Create the database, or add what a newer version needs (new tables /
+    # columns) to an existing one - once per server start
+    if not prepare_database():
+        prepare_database.clear()  # try again on the next page load
+        st.error("⚠️ Database initialization failed.")
+        logger.error("Database initialization failed")
+        return
     
     # Start / close scheduled sessions on time (no-op when already running,
     # e.g. started by run_app.py before the server)
@@ -62,6 +69,7 @@ def main():
             "Real-Time Attendance",
             "Session Management",
             "Student Registry",
+            "Courses & Sections",
             "Statistics & Reports",
             "AI Assistant"
         ],
@@ -77,6 +85,8 @@ def main():
         render_session_management_page()
     elif page == "Student Registry":
         render_student_registry_page()
+    elif page == "Courses & Sections":
+        render_courses_sections_page()
     elif page == "Statistics & Reports":
         render_statistics_reports_page()
     elif page == "AI Assistant":
@@ -93,6 +103,12 @@ def render_student_registry_page():
     """Render the Student Registry page."""
     from src.ui.pages.student_registry import render_student_registry
     render_student_registry()
+
+
+def render_courses_sections_page():
+    """Render the Courses & Sections page."""
+    from src.ui.pages.courses_sections import render_courses_sections
+    render_courses_sections()
 
 
 def render_session_management_page():

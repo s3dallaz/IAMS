@@ -53,6 +53,47 @@ CREATE TABLE IF NOT EXISTS enrollments (
 )
 """
 
+CREATE_COURSES_TABLE = """
+CREATE TABLE IF NOT EXISTS courses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_code TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    name TEXT NOT NULL,
+    department TEXT,
+    is_active BOOLEAN DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT
+)
+"""
+
+# A course's group of students (e.g. "A", "Lab 1"), with its instructor
+CREATE_SECTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS sections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE,
+    instructor_name TEXT,
+    is_active BOOLEAN DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT,
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
+    UNIQUE(course_id, name)
+)
+"""
+
+# The class list of a section. added_at is UTC, like students.enrolled_at
+CREATE_SECTION_STUDENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS section_students (
+    section_id INTEGER NOT NULL,
+    student_id INTEGER NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (section_id, student_id),
+    FOREIGN KEY (section_id) REFERENCES sections(id) ON DELETE CASCADE,
+    FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
+)
+"""
+
+# section_id: the section whose class list is expected (NULL = no section).
+# Databases made before sections existed get it from migrate_schema().
 CREATE_SESSIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +106,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_by TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     closed_at TIMESTAMP,
-    notes TEXT
+    notes TEXT,
+    section_id INTEGER REFERENCES sections(id)
 )
 """
 
@@ -134,7 +176,12 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_course ON sessions(course_code)",
-    
+    "CREATE INDEX IF NOT EXISTS idx_sessions_section ON sessions(section_id)",
+
+    # Courses / sections / class lists indexes
+    "CREATE INDEX IF NOT EXISTS idx_sections_course ON sections(course_id)",
+    "CREATE INDEX IF NOT EXISTS idx_section_students_student ON section_students(student_id)",
+
     # Attendance records indexes
     "CREATE INDEX IF NOT EXISTS idx_attendance_session ON attendance_records(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance_records(student_id)",
@@ -180,6 +227,9 @@ def create_tables(conn: sqlite3.Connection) -> None:
     tables = [
         ("students", CREATE_STUDENTS_TABLE),
         ("enrollments", CREATE_ENROLLMENTS_TABLE),
+        ("courses", CREATE_COURSES_TABLE),
+        ("sections", CREATE_SECTIONS_TABLE),
+        ("section_students", CREATE_SECTION_STUDENTS_TABLE),
         ("sessions", CREATE_SESSIONS_TABLE),
         ("attendance_records", CREATE_ATTENDANCE_RECORDS_TABLE),
         ("unknown_faces", CREATE_UNKNOWN_FACES_TABLE),
@@ -190,6 +240,21 @@ def create_tables(conn: sqlite3.Connection) -> None:
         cursor.execute(create_sql)
         logger.debug(f"Table '{table_name}' created or verified")
     
+    conn.commit()
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """
+    Bring a database made by an older version up to date. Only adds what
+    is missing; existing data is kept. Safe to run multiple times.
+
+    Args:
+        conn: Database connection
+    """
+    session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if 'section_id' not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN section_id INTEGER REFERENCES sections(id)")
+        logger.info("Added sessions.section_id (existing sessions have no section)")
     conn.commit()
 
 
@@ -266,7 +331,10 @@ def initialize_database(database_path: Optional[Path] = None) -> bool:
             # Create tables
             create_tables(conn)
             logger.info("Database tables created")
-            
+
+            # Add columns that older databases lack (before their indexes)
+            migrate_schema(conn)
+
             # Create indexes
             create_indexes(conn)
             logger.info("Database indexes created")
@@ -329,6 +397,9 @@ def verify_schema(database_path: Optional[Path] = None) -> bool:
     required_tables = [
         'students',
         'enrollments',
+        'courses',
+        'sections',
+        'section_students',
         'sessions',
         'attendance_records',
         'unknown_faces',

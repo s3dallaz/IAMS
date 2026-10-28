@@ -72,21 +72,24 @@ def test_context_manager(temp_db):
 
 
 def test_create_all_tables(temp_db):
-    """Test that all six tables are created."""
+    """Test that all nine tables are created."""
     with get_db_connection(temp_db) as conn:
         create_tables(conn)
         tables = get_all_tables(conn)
-    
+
     required_tables = [
         'students',
         'enrollments',
+        'courses',
+        'sections',
+        'section_students',
         'sessions',
         'attendance_records',
         'unknown_faces',
         'settings',
     ]
-    
-    assert len(tables) == 6
+
+    assert len(tables) == 9
     for table in required_tables:
         assert table in tables
 

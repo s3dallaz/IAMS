@@ -110,6 +110,24 @@ def read_student_table(data: bytes, filename: str) -> Tuple[pd.DataFrame, List[s
     Raises:
         BulkImportError: unreadable file, missing required columns, too many rows
     """
+    return read_table(data, filename, STUDENT_COLUMNS, REQUIRED_COLUMNS, normalize_column,
+                      MAX_STUDENT_ROWS, "student_id, name (and optionally email, department, notes)")
+
+
+def read_table(data: bytes, filename: str, columns: Tuple[str, ...], required: Tuple[str, ...],
+               normalize: Callable[[Any], str], max_rows: int,
+               headers_hint: str) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Read an uploaded .csv or .xlsx file with one record per row: headers
+    renamed by `normalize`, only `columns` kept, blank rows dropped, every
+    cell text. Shared by the student and class-list imports.
+
+    Returns:
+        (table, ignored_columns)
+
+    Raises:
+        BulkImportError: unreadable file, missing required columns, too many rows
+    """
     suffix = PurePosixPath(filename.lower()).suffix
     if suffix in (".csv", ".txt"):
         table = _read_csv(data)
@@ -127,27 +145,27 @@ def read_student_table(data: bytes, filename: str) -> Tuple[pd.DataFrame, List[s
     else:
         raise BulkImportError("Upload a .xlsx or .csv file.")
 
-    renamed = [normalize_column(column) for column in table.columns]
-    duplicated = sorted({column for column in renamed if renamed.count(column) > 1 and column in STUDENT_COLUMNS})
+    renamed = [normalize(column) for column in table.columns]
+    duplicated = sorted({column for column in renamed if renamed.count(column) > 1 and column in columns})
     if duplicated:
         raise BulkImportError(f"These columns appear more than once: {', '.join(duplicated)}")
     original = dict(zip(renamed, table.columns))
     table.columns = renamed
 
-    missing = [column for column in REQUIRED_COLUMNS if column not in table.columns]
+    missing = [column for column in required if column not in table.columns]
     if missing:
         raise BulkImportError(
             f"Missing required column(s): {', '.join(missing)}. The first row must be the headers "
-            f"student_id, name (and optionally email, department, notes). Download the template to see the format.")
+            f"{headers_hint}. Download the template to see the format.")
 
-    ignored = [str(original[column]) for column in table.columns if column not in STUDENT_COLUMNS]
-    table = table[[column for column in STUDENT_COLUMNS if column in table.columns]]
+    ignored = [str(original[column]) for column in table.columns if column not in columns]
+    table = table[[column for column in columns if column in table.columns]]
     # Drop rows that are completely empty (blank lines at the end of a sheet)
     if len(table):
         blank = table.apply(lambda row: all(not str(value).strip() for value in row), axis=1)
         table = table[~blank]
-    if len(table) > MAX_STUDENT_ROWS:
-        raise BulkImportError(f"The file has {len(table)} rows; the limit is {MAX_STUDENT_ROWS} per import.")
+    if len(table) > max_rows:
+        raise BulkImportError(f"The file has {len(table)} rows; the limit is {max_rows} per import.")
     return table, ignored
 
 
