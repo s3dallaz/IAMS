@@ -122,16 +122,21 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 
 ## 🎯 Using the System
 
-The app opens on **Real-Time Attendance**. The sidebar has five pages:
+The app opens on **Home**. The sidebar has six pages:
 
-1. **Real-Time Attendance** - pick an **active** session, press **Start Attendance Stream**, and students in front of the camera are recognized, liveness-checked and marked. A scheduled session can be started early here with **Activate Session**.
-2. **Session Management** - three tabs:
+1. **Home** - the start page, top to bottom:
+   * **Getting started** - the setup steps (add students → add face photos → create a session → take attendance), ticked off automatically, with a **Go** button for the next one. It folds away once all are done.
+   * **Today** - quick buttons (new session, add students, reports, AI Assistant), a card for every running session with live counts (expected / present / late / absent / attendance %) and **Open camera** / **Details** buttons, today's sessions and the next scheduled one. It refreshes itself every 10 seconds.
+   * **Overview** - active students, students without face data, attendance rate, sessions in the last 7 days, and a 14-day chart.
+   * **System check** - face models, the session timer, recognition data, face data, camera on/off and the AI Assistant key. It never turns the camera on.
+2. **Real-Time Attendance** - pick an **active** session, press **Start Attendance Stream**, and students in front of the camera are recognized, liveness-checked and marked. A scheduled session can be started early here with **Activate Session**.
+3. **Session Management** - three tabs:
    * **Sessions List** - every session with its status and present / late counts. Click a row to get its buttons: **Start Now**, **Close**, **View**, **Edit**, **Delete** (an active session must be closed before it can be deleted).
    * **Create New Session** - name, course, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*.
    * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed).
-3. **Student Registry** - add / edit students, manage their face photos, bulk import.
-4. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course, and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
-5. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
+4. **Student Registry** - add / edit students, manage their face photos, bulk import.
+5. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course, and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
+6. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
 
 ### How sessions behave
 
@@ -294,7 +299,6 @@ Planned, not built yet:
 * **Instructor screen** - an instructor picks their course and session and starts it
 * **Login for instructors and admins** - each instructor sees and manages only their own sessions
 * **Use from several devices** - the app is already reachable on the local network; multi-device use will come together with the login
-* **New Home page** - a useful start page (the old one was removed)
 * **AI Assistant updates** - e.g. answering questions about absent students
 * **New design** - a visual redesign of the whole app
 

@@ -2,7 +2,7 @@
 Intelligent Attendance Monitoring System
 Main Streamlit application entry point
 
-The old Home page was removed; a new one is planned for a later phase.
+The app opens on the Home dashboard (src/ui/pages/home.py).
 """
 
 import streamlit as st
@@ -58,6 +58,7 @@ def main():
     page = st.sidebar.radio(
         "Go to",
         [
+            "Home",
             "Real-Time Attendance",
             "Session Management",
             "Student Registry",
@@ -68,7 +69,9 @@ def main():
     )
     
     # Render selected page
-    if page == "Real-Time Attendance":
+    if page == "Home":
+        render_home_page()
+    elif page == "Real-Time Attendance":
         render_realtime_attendance_page()
     elif page == "Session Management":
         render_session_management_page()
@@ -78,6 +81,12 @@ def main():
         render_statistics_reports_page()
     elif page == "AI Assistant":
         render_ai_assistant_page()
+
+
+def render_home_page():
+    """Render the Home page."""
+    from src.ui.pages.home import render_home
+    render_home()
 
 
 def render_student_registry_page():
