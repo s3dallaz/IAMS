@@ -104,6 +104,10 @@ def _env_int(name: str, default: int) -> int:
 # development laptop's Logitech Brio 100 sends 1920x1080 whatever OpenCV asks
 # for, and at 720p every later step (liveness, detection, the preview JPEG)
 # handles 2.25x fewer pixels. Set both to 0 in .env for the camera's own size.
+# Which camera to use: part of its name, ignoring case and spaces (e.g. "Brio 100").
+# Empty: the first camera that is not a phone / virtual one. By name because
+# Windows' camera numbers change, and a linked phone can take number 0.
+CAMERA_NAME: str = os.getenv("CAMERA_NAME", "").strip()
 CAMERA_WIDTH: int = _env_int("CAMERA_WIDTH", 1280)
 CAMERA_HEIGHT: int = _env_int("CAMERA_HEIGHT", 720)
 

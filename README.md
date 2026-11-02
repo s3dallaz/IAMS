@@ -126,21 +126,21 @@ The app opens on **Home**. The sidebar has seven pages:
 
 1. **Home** - the start page, top to bottom:
    * **Getting started** - the setup steps (add students → add face photos → create a session → take attendance), ticked off automatically, with a **Go** button for the next one. It folds away once all are done.
-   * **Today** - quick buttons (new session, add students, reports, AI Assistant), a card for every running session with live counts (expected / present / late / absent / attendance %) and **Open camera** / **Details** buttons, today's sessions and the next scheduled one. It refreshes itself every 10 seconds.
+   * **Today** - quick buttons (**▶️ Start a class**, new session, add students, reports, AI Assistant), a card for every running session with live counts (expected / present / late / absent / attendance %) and **Open camera** / **Details** buttons, today's sessions and the next scheduled one. It refreshes itself every 10 seconds.
    * **Overview** - active students, students without face data, attendance rate, sessions in the last 7 days, and a 14-day chart.
    * **System check** - face models, the session timer, recognition data, face data, camera on/off and the AI Assistant key. It never turns the camera on.
-2. **Real-Time Attendance** - pick an **active** session, press **Start Attendance Stream**, and students in front of the camera are recognized, liveness-checked and marked. A scheduled session can be started early here with **Activate Session**.
+2. **Real-Time Attendance** - pick an **active** session, press **Start Attendance Stream**, and students in front of the camera are recognized, liveness-checked and marked. A scheduled session can be started early here with **Activate Session**. In a session that belongs to a **section**, only students on its class list are marked; anyone else is shown as **Not in this class**.
 3. **Session Management** - three tabs:
    * **Sessions List** - every session with its status and present / late counts. Click a row to get its buttons: **Start Now**, **Close**, **View**, **Edit**, **Delete** (an active session must be closed before it can be deleted).
-   * **Create New Session** - name, course, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*.
-   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed).
+   * **Create New Session** - first pick **Course → Section** (or *No section*), then name, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*. The section can also be changed later with **Edit**.
+   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed). In a section session, **Mark a student who is not on the class list** adds someone who attended but isn't on the list.
 4. **Student Registry** - add / edit students, manage their face photos, bulk import.
 5. **Courses & Sections** - three tabs:
    * **Courses** - add, edit, deactivate or delete courses (e.g. TM103). Select a row for its buttons.
-   * **Sections & class lists** - pick a course, add its sections (e.g. A, B, Lab 1) with the instructor's name, and manage each section's **class list**: search and pick students, paste a list of student IDs, remove selected students, or download the list as CSV.
+   * **Sections & class lists** - pick a course, add its sections (e.g. A, B, Lab 1) with the instructor's name, and manage each section's **class list**: search and pick students, paste a list of student IDs, remove selected students, or download the list as CSV. **▶️ Start session now** starts a session for the section at once and opens the camera page (the camera itself still starts only when you press *Start Attendance Stream*).
    * **Import class lists** - an Excel / CSV file with the columns `course_code`, `section`, `student_id` (optional: `course_name`, `instructor`). Courses and sections that don't exist yet are created; you see a preview first. Importing the same file again is safe, and an import never removes anyone.
    * A course or section that has sessions can't be deleted - deactivate it instead, so its history is kept.
-6. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course, and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
+6. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course (filter by course / section; session reports show the section and instructor; a **section summary** table), and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
 7. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
 
 ### How sessions behave
@@ -154,6 +154,8 @@ The app opens on **Home**. The sidebar has seven pages:
 | A session is started by hand **before** its scheduled time | It keeps its scheduled start time |
 | The start time or late threshold of a session is edited | Every mark in it is re-checked as present or late against the new values |
 | A session has no end time | It stays active until someone closes it |
+| A session belongs to a **section** | Only the section's class list is expected and counted absent (students added to the list before the session started), plus anyone marked by hand. The camera marks only class-list students; it still recognises everyone, so a visitor is never mistaken for a look-alike on the list |
+| A session has **no section** (e.g. all sessions made before sections existed) | Every active student registered before it started is expected, as before |
 
 **Who counts as "expected" (and so as absent if not marked)?** Every active student who was registered before the session started, plus anyone who was marked in it. Courses / class lists are planned for a later phase; then only that class's students will be expected.
 
@@ -300,7 +302,6 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 
 Planned, not built yet:
 
-* **Sessions linked to sections** - a session belongs to a section; only its class list is expected (and counted absent), and the camera only looks for those students. Courses, sections and class lists themselves are already built (see above)
 * **Instructor screen** - an instructor picks their course and session and starts it
 * **Login for instructors and admins** - each instructor sees and manages only their own sessions
 * **Use from several devices** - the app is already reachable on the local network; multi-device use will come together with the login

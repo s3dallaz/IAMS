@@ -29,6 +29,8 @@ from src.services.attendance_service import (
     AttendanceStatus,
     marked_by_label
 )
+from src.services.course_service import CourseService
+from src.services.student_service import StudentService
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +45,8 @@ ROSTER_EDIT_VERSION_KEY = "roster_edit_version"
 TABLE_VERSION_KEY = "sessions_table_version"
 CREATE_FORM_VERSION_KEY = "create_session_form_version"
 
+NO_SECTION = 0              # course picker option: no course / section, every student is expected
+ADD_SEARCH_RESULTS = 30     # students offered when adding someone who is not on the class list
 ROSTER_MAX_ROWS = 500       # students sent to the browser at most; filter / search find the rest
 STATUS_CHECK_SECONDS = 10   # an open page notices a scheduled start / automatic close this fast
 
@@ -116,7 +120,7 @@ def render_sessions_list_tab(session_service: SessionService):
     with col_search:
         search = st.text_input(
             "Search",
-            placeholder="Session name or course code",
+            placeholder="Session name, course code or section",
             key="session_list_search"
         ).strip().lower()
 
@@ -131,7 +135,8 @@ def render_sessions_list_tab(session_service: SessionService):
 
     if search:
         sessions = [s for s in sessions
-                    if search in s['session_name'].lower() or search in (s['course_code'] or '').lower()]
+                    if search in s['session_name'].lower() or search in (s['course_code'] or '').lower()
+                    or search in (s.get('section_name') or '').lower()]
 
     if not sessions:
         st.info("No sessions match." if search or status_filter != "All"
@@ -144,6 +149,7 @@ def render_sessions_list_tab(session_service: SessionService):
         'ID': s['id'],
         'Session Name': s['session_name'],
         'Course': s['course_code'] or "—",
+        'Section': s.get('section_name') or "—",
         'Start Time': format_datetime(s['start_time']),
         'End Time': format_datetime(s.get('end_time')),
         'Status': STATUS_BADGES.get(s['status'], s['status']),
@@ -181,6 +187,11 @@ def render_create_session_tab(session_service: SessionService):
     st.caption("Times are the attendance computer's local time. A scheduled session starts by itself "
                "at its start time (no one needs to be here) and closes by itself at its end time.")
 
+    # Outside the form, so the section list follows the chosen course
+    st.markdown("**Who is this session for?**")
+    section = _section_picker("create")
+    _section_caption(section)
+
     # A new form key after each successful create gives an empty form,
     # while a rejected submission keeps what was typed
     form_version = st.session_state.get(CREATE_FORM_VERSION_KEY, 0)
@@ -190,14 +201,20 @@ def render_create_session_tab(session_service: SessionService):
         with col1:
             session_name = st.text_input(
                 "Session Name *",
-                placeholder="e.g., CS101 Lecture 1",
+                placeholder=(f"e.g., {section['course_code']} {section['name']} Lecture 1" if section
+                             else "e.g., CS101 Lecture 1"),
                 help="Name or title for the session"
             )
-            course_code = st.text_input(
-                "Course Code",
-                placeholder="e.g., CS101",
-                help="Course code or identifier (optional)"
-            )
+            if section:
+                course_code = section['course_code']
+                st.text_input("Course Code", value=course_code, disabled=True,
+                              help="Comes from the chosen course")
+            else:
+                course_code = st.text_input(
+                    "Course Code",
+                    placeholder="e.g., CS101",
+                    help="Course code or identifier (optional)"
+                )
             created_by = st.text_input(
                 "Created By",
                 value="Admin",
@@ -262,7 +279,8 @@ def render_create_session_tab(session_service: SessionService):
             late_threshold_minutes=int(late_threshold_minutes),
             status=initial_status,
             created_by=created_by,
-            notes=notes
+            notes=notes,
+            section_id=section['id'] if section else None
         )
 
 
@@ -312,6 +330,9 @@ def render_session_details_tab(
     with col_info1:
         st.markdown(f"**Session:** {session['session_name']}")
         st.markdown(f"**Course:** {session['course_code'] or '—'}")
+        if session.get('section_name'):
+            st.markdown(f"**Section:** {session['section_name']}"
+                        + (f" · {session['instructor_name']}" if session.get('instructor_name') else ""))
         status_color = {
             SessionStatus.ACTIVE: "green",
             SessionStatus.SCHEDULED: "orange",
@@ -356,8 +377,12 @@ def render_session_details_tab(
     metric_cols[3].metric("Absent", counts[AttendanceStatus.ABSENT])
     metric_cols[4].metric("Attendance", rate)
 
-    roster_note = ("Expected students: every active student registered before the session started, "
-                   "plus anyone marked in it.")
+    if session.get('section_id'):
+        roster_note = (f"Expected students: the class list of section **{session['section_name']}** "
+                       f"(students added before the session started), plus anyone marked in it.")
+    else:
+        roster_note = ("Expected students: every active student registered before the session started, "
+                       "plus anyone marked in it. (This session has no section.)")
     if session['status'] != SessionStatus.CLOSED:
         roster_note += " Until the session closes, **Absent** means *not marked yet*."
     st.caption(roster_note)
@@ -367,11 +392,46 @@ def render_session_details_tab(
     # Attendance Records Table
     st.markdown("### 👥 Students")
 
+    if session.get('section_id') and session['status'] != SessionStatus.SCHEDULED:
+        _render_add_unlisted_student(attendance_service, session)
+
     if not counts['expected']:
-        st.info("No students are registered yet, so nobody is expected in this session.")
+        st.info("This section's class list is empty, so nobody is expected in this session. Add students in "
+                "**Courses & Sections**." if session.get('section_id')
+                else "No students are registered yet, so nobody is expected in this session.")
         return
 
     _render_roster(attendance_service, selected_id, session['status'], counts)
+
+
+def _render_add_unlisted_student(attendance_service: AttendanceService, session: Dict[str, Any]):
+    """Mark by hand a student who came but is not on the section's class list (the camera refuses them)."""
+    with st.expander("➕ Mark a student who is not on the class list", key=f"add_unlisted_open_{session['id']}"):
+        st.caption("For a student who attended but isn't on this section's class list. They are added to this "
+                   "session only. To add them to the class list for good, use **Courses & Sections**.")
+        query = st.text_input("Find student", placeholder="Name or student ID",
+                              key=f"add_unlisted_search_{session['id']}").strip()
+        if not query:
+            return
+        found = StudentService().search_students(query, limit=ADD_SEARCH_RESULTS)
+        if not found:
+            st.caption("No student found.")
+            return
+        labels = {s['id']: f"{s['student_id']} - {s['name']}" for s in found}
+        col_student, col_status, col_button = st.columns([3, 1, 1], vertical_alignment="bottom")
+        student_db_id = col_student.selectbox("Student", list(labels), format_func=labels.get,
+                                              key=f"add_unlisted_pick_{session['id']}")
+        status = col_status.selectbox("Status", [AttendanceStatus.PRESENT, AttendanceStatus.LATE],
+                                      format_func=ATTENDANCE_LABELS.get, key=f"add_unlisted_status_{session['id']}")
+        if col_button.button("Mark", key=f"add_unlisted_btn_{session['id']}", type="primary", width="stretch"):
+            try:
+                attendance_service.set_attendance_manually(session['id'], student_db_id, status)
+            except Exception as e:
+                st.error(f"❌ {e}")
+                return
+            _flash(f"✅ {labels[student_db_id]} marked {ATTENDANCE_LABELS[status]} by hand.")
+            st.session_state[ROSTER_EDIT_VERSION_KEY] = st.session_state.get(ROSTER_EDIT_VERSION_KEY, 0) + 1
+            st.rerun()
 
 
 @st.fragment
@@ -572,9 +632,18 @@ def _edit_session_dialog(session_service: SessionService, session: Dict[str, Any
         st.caption("Changing the start time or late threshold re-checks who was present or late. "
                    + ("The session stays closed." if status == SessionStatus.CLOSED else ""))
 
+    section = _section_picker(f"edit_{session['id']}", session)
+    section_id = section['id'] if section else None
+    if section_id != session.get('section_id') and status != SessionStatus.SCHEDULED:
+        st.warning("Changing the section changes who is expected - and counted absent - in this session.")
+
     with st.form(f"edit_session_form_{session['id']}"):
         session_name = st.text_input("Session Name *", value=session['session_name'])
-        course_code = st.text_input("Course Code", value=session['course_code'] or "")
+        if section:
+            course_code = section['course_code']
+            st.text_input("Course Code", value=course_code, disabled=True, help="Comes from the chosen course")
+        else:
+            course_code = st.text_input("Course Code", value=session['course_code'] or "")
         start_date = st.date_input("Start Date", value=start_dt.date())
         col_start, col_end = st.columns(2)
         with col_start:
@@ -595,6 +664,10 @@ def _edit_session_dialog(session_service: SessionService, session: Dict[str, Any
         'course_code': course_code,
         'notes': notes,
     }
+    if section_id is None and session.get('section_id'):
+        changes['clear_section'] = True
+    elif section_id is not None:
+        changes['section_id'] = section_id
     if start_time_val is None:
         st.error("❌ Start Time is required.")
         return
@@ -631,7 +704,7 @@ def _edit_session_dialog(session_service: SessionService, session: Dict[str, Any
     _flash(f"✅ Session #{session['id']} saved." + _overlap_note(
         session_service, changes.get('start_time', session['start_time']),
         changes.get('end_time', None if changes.get('clear_end_time') else session.get('end_time')),
-        course_code, session['id']))
+        course_code, session['id'], section_id))
     st.rerun()
 
 
@@ -648,7 +721,8 @@ def handle_create_session(
     late_threshold_minutes: int,
     status: str,
     created_by: Optional[str],
-    notes: Optional[str]
+    notes: Optional[str],
+    section_id: Optional[int] = None
 ):
     """Handle creating a new session through SessionService."""
     try:
@@ -672,7 +746,8 @@ def handle_create_session(
             late_threshold_minutes=late_threshold_minutes,
             status=status,
             created_by=created_by if created_by else None,
-            notes=notes if notes else None
+            notes=notes if notes else None,
+            section_id=section_id
         )
 
         logger.info(f"Session created via UI: ID {session_id}")
@@ -683,7 +758,7 @@ def handle_create_session(
                 message += " Its start time has passed, so it started right away."
             else:
                 message += f" It starts automatically {format_datetime(start_time)} ({_relative(start_dt)})."
-        message += _overlap_note(session_service, start_time, end_time, course_code, session_id)
+        message += _overlap_note(session_service, start_time, end_time, course_code, session_id, section_id)
         _flash(message)
         st.session_state['selected_session_id'] = session_id
         st.session_state[CREATE_FORM_VERSION_KEY] = st.session_state.get(CREATE_FORM_VERSION_KEY, 0) + 1
@@ -741,6 +816,63 @@ def handle_delete_session(session_service: SessionService, session_id: int):
 # Helpers
 # ============================================================================
 
+def _section_picker(key: str, session: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Course -> Section pickers. Returns the chosen section (with course_code and
+    student_count), or None for "no section": every active student is expected.
+    Outside a form, so the section list follows the course. When editing,
+    the session's own section stays selectable even if it was deactivated.
+    """
+    course_service = CourseService()
+    sections = course_service.list_sections(active_only=True)
+    current_id = session.get('section_id') if session else None
+    if current_id and all(s['id'] != current_id for s in sections):
+        current = course_service.get_section(current_id)
+        if current:
+            sections.append(current)
+    if not sections:
+        st.caption("No sections yet: every student is expected. To take attendance for one class only, "
+                   "create its course, section and class list in **Courses & Sections**.")
+        return None
+
+    courses = {}
+    for s in sections:
+        courses.setdefault(s['course_id'], f"{s['course_code']} - {s['course_name']}")
+    course_options = [NO_SECTION] + sorted(courses, key=lambda c: courses[c].lower())
+    current_course = next((s['course_id'] for s in sections if s['id'] == current_id), NO_SECTION)
+    col_course, col_section = st.columns(2)
+    course_id = col_course.selectbox(
+        "Course", course_options, index=course_options.index(current_course),
+        format_func=lambda c: "— No section (every student) —" if c == NO_SECTION else courses[c],
+        key=f"{key}_course",
+    )
+    if course_id == NO_SECTION:
+        col_section.selectbox("Section", ["—"], disabled=True, key=f"{key}_no_section")
+        return None
+    by_id = {s['id']: s for s in sections if s['course_id'] == course_id}
+    ids = sorted(by_id, key=lambda i: by_id[i]['name'].lower())
+    section_id = col_section.selectbox(
+        "Section", ids, index=ids.index(current_id) if current_id in ids else 0,
+        format_func=lambda i: (f"{by_id[i]['name']} · {by_id[i]['instructor_name'] or 'no instructor'} · "
+                               f"{by_id[i]['student_count']:,} students"
+                               + ("" if by_id[i]['is_active'] else " (inactive)")),
+        key=f"{key}_section_{course_id}",
+    )
+    return by_id[section_id]
+
+
+def _section_caption(section: Optional[Dict[str, Any]]):
+    if section is None:
+        st.caption("👥 No section: every active student is expected, and the camera can mark anyone.")
+    elif not section['student_count']:
+        st.warning(f"⚠️ The class list of {section['course_code']} / {section['name']} is empty: nobody would "
+                   f"be expected. Add its students in **Courses & Sections** first.")
+    else:
+        st.caption(f"👥 Only the **{section['student_count']:,}** students on the class list of "
+                   f"{section['course_code']} / {section['name']} are expected, and only they are marked "
+                   f"by the camera.")
+
+
 def _apply_schedule(session_service: SessionService):
     """Apply due scheduled starts / automatic closes now (cheap when nothing is due)."""
     try:
@@ -776,20 +908,26 @@ def _overlap_note(
     start_time: str,
     end_time: Optional[str],
     course_code: Optional[str],
-    session_id: int
+    session_id: int,
+    section_id: Optional[int] = None
 ) -> str:
-    """A warning sentence when open sessions of the same course overlap this one ('' otherwise)."""
-    if not (course_code or "").strip():
+    """
+    A warning sentence when open sessions of the same section (without a
+    section: of the same course) overlap this one ('' otherwise).
+    """
+    if not (course_code or "").strip() and section_id is None:
         return ""
     try:
-        overlapping = session_service.find_overlapping_sessions(start_time, end_time, course_code, session_id)
+        overlapping = session_service.find_overlapping_sessions(start_time, end_time, course_code, session_id,
+                                                                section_id=section_id)
     except Exception as e:
         logger.warning(f"Overlap check failed: {e}")
         return ""
     if not overlapping:
         return ""
     others = ", ".join(f"#{s['id']} {s['session_name']}" for s in overlapping[:3])
-    return f" ⚠️ Overlaps another open {course_code.strip()} session: {others}."
+    what = "session of this section" if section_id is not None else f"{course_code.strip()} session"
+    return f" ⚠️ Overlaps another open {what}: {others}."
 
 
 def _schedule_text(session: Dict[str, Any]) -> str:

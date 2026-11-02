@@ -198,6 +198,9 @@ class ReportService:
         writer.writerow(["SESSION ATTENDANCE REPORT"])
         writer.writerow(["Session Name", session_stats.get('session_name', '')])
         writer.writerow(["Course Code", session_stats.get('course_code', '')])
+        if session_stats.get('section_name'):
+            writer.writerow(["Section", session_stats['section_name']])
+            writer.writerow(["Instructor", session_stats.get('instructor_name') or ''])
         writer.writerow(["Start Time", session_stats.get('start_time', '')])
         writer.writerow(["Status", session_stats.get('status', '').upper()])
         started = session_stats.get('absence_supported', False)
@@ -390,6 +393,17 @@ class ReportService:
         pdf.cell(30, 6, "Status:", new_x='RIGHT', new_y='TOP')
         pdf.set_font('Helvetica', '', 10)
         pdf.cell(0, 6, str(session_stats.get('status', '—')).upper(), new_x='LMARGIN', new_y='NEXT')
+
+        if session_stats.get('section_name'):
+            pdf.set_x(pdf.l_margin + 4)
+            pdf.set_font('Helvetica', 'B', 10)
+            pdf.cell(35, 6, "Section:", new_x='RIGHT', new_y='TOP')
+            pdf.set_font('Helvetica', '', 10)
+            pdf.cell(60, 6, str(session_stats['section_name']), new_x='RIGHT', new_y='TOP')
+            pdf.set_font('Helvetica', 'B', 10)
+            pdf.cell(30, 6, "Instructor:", new_x='RIGHT', new_y='TOP')
+            pdf.set_font('Helvetica', '', 10)
+            pdf.cell(0, 6, str(session_stats.get('instructor_name') or '—'), new_x='LMARGIN', new_y='NEXT')
         
         pdf.ln(10)
         

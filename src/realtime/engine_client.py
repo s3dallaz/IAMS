@@ -44,7 +44,8 @@ class EngineController:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def start(self, session_id: int, settings: Dict[str, Any], camera_index: int = 0) -> Tuple[bool, str]:
+    def start(self, session_id: int, settings: Dict[str, Any],
+              camera_index: Optional[int] = None) -> Tuple[bool, str]:
         """Start the engine for `session_id`; waits until the camera runs. Returns (ok, error)."""
         with self._lock:
             if self.is_running():
@@ -57,9 +58,11 @@ class EngineController:
             command = [
                 sys.executable, "-m", "src.realtime.engine",
                 "--port", str(self._port), "--session", str(session_id),
-                "--token", self._token, "--camera", str(camera_index),
+                "--token", self._token,
                 "--settings", json.dumps(settings),
             ]
+            if camera_index is not None:  # otherwise the engine chooses by name (camera_devices)
+                command += ["--camera", str(camera_index)]
             logger.info(f"Starting vision engine on port {self._port} for session #{session_id}")
             # stdin stays open: the engine stops when this process exits.
             # stdout/stderr go to this console, like the app's own logs.

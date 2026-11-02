@@ -54,6 +54,9 @@ logger = get_logger(__name__)
 # (the UI shows it as a recheck, not a final rejection)
 SPOOF_RECHECK_PREFIX = "Spoof suspected - rechecking"
 
+# Reason for a recognised student who is not on the session's class list
+NOT_IN_CLASS_REASON = "Not in this class - not on the section's class list"
+
 
 # ============================================================================
 # Data Classes & Exceptions
@@ -137,6 +140,7 @@ class FaceProcessingResult:
         # Filled in by the manager for the face in view (None = not available)
         self.spoof_score: Optional[float] = None             # mean real-face probability
         self.challenge_seconds_left: Optional[float] = None  # time left for the challenge
+        self.not_in_class: bool = False                      # recognised, but not on the session's class list
 
     def __repr__(self) -> str:
         return (
@@ -297,6 +301,10 @@ class RealTimeAttendanceManager:
         self._session_id: Optional[int] = None
         self._marked_students: Set[int] = set()  # Set of student_db_id already marked for current session
         self._cooldown_tracker: Dict[int, float] = {}  # student_db_id -> last_processed_timestamp
+        # Students the session may mark (its section's class list); None = everyone.
+        # Recognition still uses the whole gallery: an outsider is recognised as
+        # themselves (and refused) instead of matching a look-alike on the list.
+        self._class_list: Optional[frozenset] = None
 
         # Per-session student-record cache: identity_string -> student dict (or None if not found).
         # Avoids a SQLite round-trip on every CV frame for the same recognized identity.
@@ -454,6 +462,14 @@ class RealTimeAttendanceManager:
             )
         except Exception as e:
             logger.warning(f"Could not pre-load attendance for session {session_id}: {e}")
+
+    def set_class_list(self, student_db_ids: Optional[Set[int]]) -> None:
+        """
+        Only these students (database IDs) may be marked - the session's
+        class list; None marks every recognised student. Safe to call from
+        another thread (one assignment).
+        """
+        self._class_list = None if student_db_ids is None else frozenset(student_db_ids)
 
     @property
     def current_session_id(self) -> Optional[int]:
@@ -707,7 +723,8 @@ class RealTimeAttendanceManager:
         if not self.fast_liveness or result.multiple_faces or len(result.processed_faces) != 1:
             return
         face = result.processed_faces[0]
-        if face.already_marked or face.attendance_marked or self.liveness_detector is None:
+        if (face.already_marked or face.attendance_marked or face.not_in_class
+                or self.liveness_detector is None):
             return
         with self._liveness_lock:
             detector = self.liveness_detector
@@ -1391,6 +1408,32 @@ class RealTimeAttendanceManager:
                 already_marked=True,
                 reason="Attendance already recorded for this session"
             )
+
+        # Step D2: Only students on the session's class list are marked. Told
+        # before liveness, so they are not asked to blink for nothing.
+        class_list = self._class_list
+        if class_list is not None and student_db_id not in class_list:
+            not_listed = FaceProcessingResult(
+                bbox=bbox,
+                detection_confidence=det_conf,
+                identity=identity,
+                is_recognized=True,
+                recognition_distance=distance,
+                student_id=student_id_str,
+                student_db_id=student_db_id,
+                student_name=student_name,
+                liveness_state=liveness_state,
+                liveness_confidence=liveness_confidence,
+                blink_count=blinks_detected,
+                min_blinks_required=min_blinks,
+                challenge_type=challenge_progress['challenge_type'],
+                challenge_state=challenge_progress['challenge_state'],
+                challenge_progress=challenge_progress['progress_percent'],
+                attendance_marked=False,
+                reason=NOT_IN_CLASS_REASON
+            )
+            not_listed.not_in_class = True
+            return not_listed
 
         # Step E: Verify Liveness Requirement: spoof checks, blinks + challenge
         liveness_reason = None

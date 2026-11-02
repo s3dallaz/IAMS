@@ -14,6 +14,14 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+# Session columns plus its section's name and instructor (None without a section)
+_SESSION_SELECT = """
+    SELECT sess.*, sec.name AS section_name, sec.instructor_name AS instructor_name
+    FROM sessions sess
+    LEFT JOIN sections sec ON sec.id = sess.section_id
+"""
+
+
 class SessionRepository:
     """
     Repository for session persistence operations.
@@ -40,7 +48,8 @@ class SessionRepository:
         late_threshold_minutes: Optional[int] = None,
         status: str = 'scheduled',
         created_by: Optional[str] = None,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        section_id: Optional[int] = None
     ) -> int:
         """
         Create a new session in the database.
@@ -54,6 +63,7 @@ class SessionRepository:
             status: Session status (default: 'scheduled')
             created_by: User who created the session (optional)
             notes: Additional notes (optional)
+            section_id: Section whose class list is expected (optional)
         
         Returns:
             Database ID of the newly created session
@@ -64,9 +74,9 @@ class SessionRepository:
         query = """
             INSERT INTO sessions (
                 session_name, course_code, start_time, end_time,
-                late_threshold_minutes, status, created_by, notes
+                late_threshold_minutes, status, created_by, notes, section_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         
         try:
@@ -75,7 +85,7 @@ class SessionRepository:
                 cursor.execute(
                     query,
                     (session_name, course_code, start_time, end_time,
-                     late_threshold_minutes, status, created_by, notes)
+                     late_threshold_minutes, status, created_by, notes, section_id)
                 )
                 session_id = cursor.lastrowid
                 logger.info(f"Created session: {session_name} (ID: {session_id})")
@@ -94,7 +104,7 @@ class SessionRepository:
         Returns:
             Session record as dictionary, or None if not found
         """
-        query = "SELECT * FROM sessions WHERE id = ?"
+        query = f"{_SESSION_SELECT} WHERE sess.id = ?"
         
         try:
             with get_db_connection(self.database_path) as conn:
@@ -120,10 +130,10 @@ class SessionRepository:
             List of session records as dictionaries
         """
         if status:
-            query = "SELECT * FROM sessions WHERE status = ? ORDER BY start_time DESC"
+            query = f"{_SESSION_SELECT} WHERE sess.status = ? ORDER BY sess.start_time DESC"
             params = (status,)
         else:
-            query = "SELECT * FROM sessions ORDER BY start_time DESC"
+            query = f"{_SESSION_SELECT} ORDER BY sess.start_time DESC"
             params = ()
         
         try:
@@ -168,7 +178,9 @@ class SessionRepository:
         late_threshold_minutes: Optional[int] = None,
         status: Optional[str] = None,
         notes: Optional[str] = None,
-        clear_end_time: bool = False
+        clear_end_time: bool = False,
+        section_id: Optional[int] = None,
+        clear_section: bool = False
     ) -> int:
         """
         Update a session's information.
@@ -183,6 +195,8 @@ class SessionRepository:
             status: New status (optional)
             notes: New notes (optional)
             clear_end_time: Remove the end time (end_time=None means "unchanged")
+            section_id: New section (optional)
+            clear_section: Remove the section (section_id=None means "unchanged")
 
         Returns:
             Number of rows affected (0 if session not found, 1 if updated)
@@ -223,6 +237,12 @@ class SessionRepository:
         if notes is not None:
             updates.append("notes = ?")
             params.append(notes)
+        
+        if clear_section:
+            updates.append("section_id = NULL")
+        elif section_id is not None:
+            updates.append("section_id = ?")
+            params.append(section_id)
         
         if not updates:
             # No fields to update
@@ -395,11 +415,12 @@ class SessionRepository:
         """
         where = "WHERE sess.status = ?" if status else ""
         query = f"""
-            SELECT sess.*,
+            SELECT sess.*, sec.name AS section_name, sec.instructor_name AS instructor_name,
                    COUNT(a.id) AS marked_count,
                    COALESCE(SUM(a.status = 'present'), 0) AS present_count,
                    COALESCE(SUM(a.status = 'late'), 0) AS late_count
             FROM sessions sess
+            LEFT JOIN sections sec ON sec.id = sess.section_id
             LEFT JOIN attendance_records a ON a.session_id = sess.id
             {where}
             GROUP BY sess.id
@@ -436,12 +457,29 @@ class SessionRepository:
             logger.error(f"Database error reading session status signature: {e}")
             raise
 
+    def get_sections_with_sessions(self) -> List[Dict[str, Any]]:
+        """Sections that have at least one session, with course_code and student_count (class list size)."""
+        query = """
+            SELECT sec.*, c.course_code,
+                   (SELECT COUNT(*) FROM section_students ss WHERE ss.section_id = sec.id) AS student_count
+            FROM sections sec
+            JOIN courses c ON c.id = sec.course_id
+            WHERE EXISTS (SELECT 1 FROM sessions sess WHERE sess.section_id = sec.id)
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return [dict(row) for row in conn.execute(query).fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting sections with sessions: {e}")
+            raise
+
     def find_overlapping(
         self,
         start_time: str,
         end_time: Optional[str],
         course_code: Optional[str] = None,
-        exclude_id: Optional[int] = None
+        exclude_id: Optional[int] = None,
+        section_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Non-closed sessions whose time window overlaps [start_time, end_time).
@@ -449,7 +487,8 @@ class SessionRepository:
         A session without an end time is treated as a single instant at its
         start; sessions starting at the same time always overlap, while
         back-to-back sessions (one ends when the next starts) do not.
-        Optionally limited to one course code.
+        Optionally limited to one section, or else to one course code
+        (different sections of a course may meet at the same time).
         """
         query = """
             SELECT * FROM sessions
@@ -459,7 +498,10 @@ class SessionRepository:
                    OR datetime(start_time) = datetime(?))
         """
         params: List[Any] = [end_time or start_time, start_time, start_time]
-        if course_code:
+        if section_id is not None:
+            query += " AND section_id = ?"
+            params.append(section_id)
+        elif course_code:
             query += " AND course_code = ?"
             params.append(course_code)
         if exclude_id is not None:

@@ -25,6 +25,7 @@ from src.services.session_scheduler import is_session_scheduler_running
 from src.services.session_service import SessionService, SessionStatus
 from src.services.statistics_service import StatisticsService
 from src.services.student_service import StudentService
+from src.ui.pages.courses_sections import TAB_SECTIONS as COURSES_TAB_SECTIONS, TABS_KEY as COURSES_TABS_KEY
 from src.ui.pages.session_management import (
     DETAIL_SELECTOR_KEY, TAB_CREATE, TAB_DETAILS, TABS_KEY,
 )
@@ -40,6 +41,7 @@ PAGE_SESSIONS = "Session Management"
 PAGE_STUDENTS = "Student Registry"
 PAGE_REPORTS = "Statistics & Reports"
 PAGE_ASSISTANT = "AI Assistant"
+PAGE_COURSES = "Courses & Sections"
 
 CAMERA_SELECTOR_KEY = "realtime_session_selector"  # session picker of the camera page
 REALTIME_PAGE_MODULE = "src.ui.pages.realtime_attendance"
@@ -77,6 +79,11 @@ def _go(page: str, **state: Any) -> None:
 
 def _go_create_session() -> None:
     _go(PAGE_SESSIONS, **{TABS_KEY: TAB_CREATE})
+
+
+def _go_start_class() -> None:
+    """Courses & Sections, on the tab with each section's "Start session now" button."""
+    _go(PAGE_COURSES, **{COURSES_TABS_KEY: COURSES_TAB_SECTIONS})
 
 
 def _go_session_details(session_id: int) -> None:
@@ -266,6 +273,8 @@ def _render_today() -> None:
 
     # Horizontal rows wrap on narrow screens instead of cutting text off
     quick = st.container(horizontal=True)
+    quick.button("▶️ Start a class", key="home_start_class", on_click=_go_start_class, type="primary",
+                 help="Pick a course and section, then start its session now")
     quick.button("➕ New session", key="home_new_session", on_click=_go_create_session)
     quick.button("👤 Add students", key="home_students", on_click=_go, args=(PAGE_STUDENTS,))
     quick.button("📊 Reports", key="home_reports", on_click=_go, args=(PAGE_REPORTS,))
@@ -281,6 +290,7 @@ def _render_today() -> None:
             'Time': _time_range(s),
             'Session': f"#{s['id']} {s['session_name']}",
             'Course': s.get('course_code') or '—',
+            'Section': s.get('section_name') or '—',
             'Status': STATUS_LABELS.get(s['status'], s['status']),
             'Present': s.get('present_count', 0),
             'Late': s.get('late_count', 0),
@@ -305,8 +315,11 @@ def _render_today() -> None:
 def _render_active_session(stats_service: StatisticsService, session: Dict[str, Any]) -> None:
     stats = stats_service.get_session_statistics(session['id']) or {}
     with st.container(border=True):
+        section = (f" / {session['section_name']}" + (f" ({session['instructor_name']})"
+                                                      if session.get('instructor_name') else "")
+                   if session.get('section_name') else "")
         st.markdown(f"🟢 **Running now: #{session['id']} {session['session_name']}** · "
-                    f"{session.get('course_code') or '—'} · {_time_range(session)}")
+                    f"{session.get('course_code') or '—'}{section} · {_time_range(session)}")
         numbers = st.container(horizontal=True, gap="medium")
         numbers.metric("Expected", _number(stats.get('expected_students')), width="content")
         numbers.metric("Present", _number(stats.get('present_count')), width="content")

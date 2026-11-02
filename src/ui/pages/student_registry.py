@@ -34,6 +34,7 @@ from src.services.enrollment_service import (
     FaceNeedsConfirmationError,
     InvalidFaceImageError
 )
+from src.computer_vision.camera_devices import CameraNotFoundError, create_camera
 from src.computer_vision.camera_manager import CameraManager
 from src.ui.pages.bulk_import import recognition_data_progress_text, render_bulk_import_view
 from src.utils.logger import get_logger
@@ -727,9 +728,15 @@ def render_manage_face_view(
                 st.info("💡 Click **Take Photo** to start live preview, position face, and capture.")
             
             if st.button("📸 Take Photo", type="primary", width="stretch", key="btn_start_enroll_camera"):
-                cam = CameraManager(camera_index=0, width=config.CAMERA_WIDTH or None,
-                                    height=config.CAMERA_HEIGHT or None)
-                if cam.open():
+                cam = None
+                try:
+                    cam = create_camera(width=config.CAMERA_WIDTH or None, height=config.CAMERA_HEIGHT or None)
+                except CameraNotFoundError as e:
+                    st.error(f"❌ {e}")
+                if cam is None:
+                    st.session_state['reg_cam_manager'] = None
+                    st.session_state['reg_cam_active'] = False
+                elif cam.open():
                     st.session_state['reg_cam_manager'] = cam
                     st.session_state['reg_cam_active'] = True
                     st.session_state['captured_photo_preview'] = None

@@ -29,9 +29,9 @@ logger = get_logger(__name__)
 
 TOP_ABSENT_STUDENTS = 20      # rows of the "most absences" table
 STUDENT_SEARCH_RESULTS = 50   # students offered in the picker for a search
-ABSENCE_NOTE = ("Absent = expected but not marked. Expected students of a session are the active "
-                "students registered before it started, plus anyone marked in it. Totals count "
-                "closed sessions only.")
+ABSENCE_NOTE = ("Absent = expected but not marked. Expected students of a session are its section's class "
+                "list (or, for a session without a section, every active student registered before it "
+                "started), plus anyone marked in it. Totals count closed sessions only.")
 STATUS_LABELS = {'present': "✅ Present", 'late': "⏰ Late", 'absent': "❌ Absent"}
 
 
@@ -293,7 +293,29 @@ def render_session_course_tab(
         st.info("No sessions created in system.")
         return
     
-    session_options = {s['id']: f"#{s['id']} - {s['session_name']} ({s.get('course_code') or 'General'})" for s in sessions}
+    # Narrow the session list to one section (sessions without one: "No section")
+    section_labels = {}
+    for s in sessions:
+        if s.get('section_id'):
+            section_labels[s['section_id']] = f"{s.get('course_code') or '—'} / {s['section_name']}"
+    if section_labels:
+        filter_options = ["all"] + sorted(section_labels, key=lambda i: section_labels[i].lower()) + ["none"]
+        section_filter = st.selectbox(
+            "Course / section", filter_options,
+            format_func=lambda o: {"all": "All sessions", "none": "No section"}.get(o) or section_labels[o],
+            key="stats_section_filter",
+        )
+        if section_filter == "none":
+            sessions = [s for s in sessions if not s.get('section_id')]
+        elif section_filter != "all":
+            sessions = [s for s in sessions if s.get('section_id') == section_filter]
+        if not sessions:
+            st.info("No sessions match.")
+            return
+
+    session_options = {s['id']: f"#{s['id']} - {s['session_name']} ({s.get('course_code') or 'General'}"
+                                + (f" / {s['section_name']})" if s.get('section_name') else ")")
+                       for s in sessions}
     
     selected_sess_id = st.selectbox(
         "Select Session to Inspect",
@@ -312,6 +334,10 @@ def render_session_course_tab(
     
     # Session Header
     st.markdown(f"### **{sess_stats['session_name']}** (`{sess_stats['course_code']}`)")
+    if sess_stats.get('section_name'):
+        st.caption(f"Section **{sess_stats['section_name']}**"
+                   + (f" · {sess_stats['instructor_name']}" if sess_stats.get('instructor_name') else "")
+                   + " · only its class list is expected")
     st.caption(f"Start Time: {format_datetime(sess_stats['start_time'])} | Status: {sess_stats['status'].upper()} | Late Cutoff: {sess_stats['late_threshold_minutes']} min")
     
     # Metrics: the same numbers as Session Management -> Session Details
@@ -394,6 +420,21 @@ def render_session_course_tab(
         st.caption(ABSENCE_NOTE)
     else:
         st.info("No course data available.")
+
+    section_stats = stats_service.get_section_statistics()
+    if section_stats:
+        st.markdown("#### Section summary")
+        st.dataframe([{
+            'Course': r['course_code'],
+            'Section': r['section_name'],
+            'Instructor': r['instructor_name'] or '—',
+            'Class list': r['class_list_size'],
+            'Sessions': r['total_sessions'],
+            'Present': r['present_count'],
+            'Late': r['late_count'],
+            'Absent': r['absent_count'],
+            'Attendance %': r['attendance_rate'],
+        } for r in section_stats], hide_index=True)
 
 
 # ============================================================================

@@ -33,7 +33,8 @@ class CameraManager:
         height: Optional[int] = None,
         buffer_size: int = 1,
         background_reader: bool = False,
-        read_timeout: float = 1.0
+        read_timeout: float = 1.0,
+        api_preference: Optional[int] = None
     ):
         """
         Initialize the CameraManager.
@@ -53,12 +54,15 @@ class CameraManager:
                 (blink detection). Used by the Real-Time Attendance page.
             read_timeout: With background_reader, the longest read_frame()
                 waits for a new frame (seconds) before reporting a failure
+            api_preference: OpenCV backend to open the camera with (e.g.
+                cv2.CAP_MSMF); None lets OpenCV choose. Camera numbers differ per backend.
         """
         self.camera_index = camera_index
         self.width = width
         self.height = height
         self._size_logged = False
         self.buffer_size = buffer_size
+        self.api_preference = api_preference
         self._capture: Optional[cv2.VideoCapture] = None
         self._is_open = False
         self.logger = get_logger(__name__)
@@ -88,7 +92,10 @@ class CameraManager:
             self.logger.info(f"Opening camera {self.camera_index}")
 
             with time_operation("camera_constructor"):
-                self._capture = cv2.VideoCapture(self.camera_index)
+                if self.api_preference is None:
+                    self._capture = cv2.VideoCapture(self.camera_index)
+                else:
+                    self._capture = cv2.VideoCapture(self.camera_index, self.api_preference)
 
             with time_operation("camera_isOpened_check"):
                 is_opened = self._capture.isOpened()

@@ -8,6 +8,7 @@ import sqlite3
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
+from src.data.repositories.expected_students import expected_condition
 from src.database.connection import get_db_connection
 from src.utils.logger import get_logger
 
@@ -362,17 +363,15 @@ class AttendanceRepository:
     # Session roster: every expected student with their status
     # ------------------------------------------------------------------
     
-    # Students expected in a session: anyone with a record in it, plus every
-    # active student registered before the session started (no class rosters
-    # exist yet, so the register is the roster). The session's start time is
-    # local; datetime(..., 'utc') converts it to UTC like the database-default
-    # enrolled_at. AnalyticsRepository counts absences with the same rule.
-    _ROSTER_FROM = """
+    # Students expected in a session: anyone with a record in it, plus the
+    # students expected_condition() expects (the section's class list, or
+    # everyone registered before the start for a session without a section).
+    # AnalyticsRepository counts absences with the same rule.
+    _ROSTER_FROM = f"""
         FROM students s
+        JOIN sessions sess ON sess.id = :session_id
         LEFT JOIN attendance_records a ON a.student_id = s.id AND a.session_id = :session_id
-        WHERE (a.id IS NOT NULL
-               OR (s.is_active = 1
-                   AND s.enrolled_at <= (SELECT datetime(start_time, 'utc') FROM sessions WHERE id = :session_id)))
+        WHERE (a.id IS NOT NULL OR {expected_condition('s', 'sess')})
     """
     
     # Present -> Late -> Absent, then by name

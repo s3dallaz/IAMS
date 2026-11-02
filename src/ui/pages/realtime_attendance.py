@@ -210,12 +210,20 @@ def render_realtime_attendance():
     # Display selected session banner
     if selected_session:
         status_color = "green" if is_active else ("orange" if selected_session['status'] == SessionStatus.SCHEDULED else "red")
+        section_text = (f"Section: `{selected_session['section_name']}`"
+                        + (f" ({selected_session['instructor_name']})" if selected_session.get('instructor_name') else "")
+                        + " | ") if selected_session.get('section_name') else ""
         st.info(
             f"**Selected Session:** #{selected_session['id']} — **{selected_session['session_name']}** | "
-            f"Course: `{selected_session['course_code'] or '—'}` | "
+            f"Course: `{selected_session['course_code'] or '—'}` | {section_text}"
             f"Status: :{status_color}[**{selected_session['status'].upper()}**] | "
             f"Late Cutoff: `{selected_session.get('late_threshold_minutes', 15)} min`"
         )
+        if selected_session.get('section_id'):
+            st.caption("👥 Only students on this section's class list are marked. Anyone else is shown "
+                       "as **Not in this class**.")
+        else:
+            st.caption("👥 No section: every registered student can be marked.")
         if is_scheduled:
             st.caption(f"⏰ Starts automatically at {selected_session['start_time']}. "
                        f"The camera can be started once the session is active.")
@@ -462,6 +470,15 @@ def _build_person_info_markdown(result: RealTimeAttendanceResult) -> str:
             f"🔴 **{face_info.reason}**\n\n"
             f"**Face:** {who}\n\n"
             f"_Nobody is marked from a photo or screen._"
+        )
+
+    if face_info.is_recognized and getattr(face_info, "not_in_class", False):
+        return (
+            f"🟠 **Not in this class**\n\n"
+            f"**Name:** {face_info.student_name or '—'}\n\n"
+            f"**ID:** `{face_info.student_id or '—'}`\n\n"
+            f"_Not on this section's class list, so not marked. If they belong here, add them by hand "
+            f"in Session Management → Session Details, or to the class list in Courses & Sections._"
         )
 
     if face_info.is_recognized:

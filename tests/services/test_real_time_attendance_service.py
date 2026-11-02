@@ -1843,3 +1843,75 @@ def test_a_face_on_a_phone_is_never_rechecked(
     faces = [manager.process_frame(sample_frame).processed_faces[0] for _ in range(10)]
     assert not any(face.attendance_marked for face in faces)
     assert "cell phone" in faces[-1].reason
+
+
+# ============================================================================
+# Class lists: a section session marks only the students on its class list
+# ============================================================================
+
+def _recognised_manager(temp_db, session_id, mock_cv_components, identity="2021001"):
+    detector = mock_cv_components['detector']
+    embedder = mock_cv_components['embedder']
+    recognizer = mock_cv_components['recognizer']
+    detector.detect_faces.return_value = [DetectedFace(bbox=(10, 10, 50, 50), confidence=0.95)]
+    encoding = np.random.rand(128)
+    embedder.generate_embedding.return_value = FaceEmbedding(encoding)
+    recognizer.recognize.return_value = RecognitionResult(identity=identity, distance=0.32, is_match=True)
+    manager = RealTimeAttendanceManager(
+        session_id=session_id, database_path=temp_db, face_detector=detector, face_embedder=embedder,
+        face_recognizer=recognizer, liveness_detector=mock_cv_components['liveness'], require_liveness=True
+    )
+    manager.set_gallery([(identity, FaceEmbedding(encoding))])
+    return manager
+
+
+def test_student_not_on_class_list_is_not_marked(
+    temp_db, active_session, sample_student, second_student, sample_frame, mock_cv_components
+):
+    manager = _recognised_manager(temp_db, active_session, mock_cv_components)
+    manager.set_class_list({second_student})   # Alice (sample_student) is not on it
+
+    result = manager.process_frame(sample_frame, marked_at="2026-10-04 10:05:00")
+
+    face = result.processed_faces[0]
+    assert face.is_recognized is True and face.student_name == "Alice Smith"
+    assert face.not_in_class is True
+    assert face.attendance_marked is False
+    assert face.reason.startswith("Not in this class")
+    assert result.marked_count == 0
+    assert AttendanceService(temp_db).get_session_attendance(active_session) == []
+
+
+def test_student_on_class_list_is_marked(
+    temp_db, active_session, sample_student, sample_frame, mock_cv_components
+):
+    manager = _recognised_manager(temp_db, active_session, mock_cv_components)
+    manager.set_class_list({sample_student})
+
+    face = manager.process_frame(sample_frame, marked_at="2026-10-04 10:05:00").processed_faces[0]
+
+    assert face.not_in_class is False
+    assert face.attendance_marked is True
+
+
+def test_no_class_list_marks_anyone(temp_db, active_session, sample_student, sample_frame, mock_cv_components):
+    manager = _recognised_manager(temp_db, active_session, mock_cv_components)
+    manager.set_class_list({999})
+    manager.set_class_list(None)   # a session without a section
+
+    assert manager.process_frame(sample_frame, marked_at="2026-10-04 10:05:00").processed_faces[0].attendance_marked
+
+
+def test_not_in_class_survives_the_engine_protocol_and_shows_in_the_bar():
+    from src.realtime.engine import instruction_bar
+    from src.realtime.protocol import face_from_dict, face_to_dict
+
+    face = FaceProcessingResult(bbox=(1, 2, 3, 4), detection_confidence=0.9, identity="2021001",
+                                is_recognized=True, student_name="Alice Smith", reason="Not in this class")
+    face.not_in_class = True
+    copy = face_from_dict(face_to_dict(face))
+    assert copy.not_in_class is True
+
+    result = RealTimeAttendanceResult(session_id=1, faces_detected=1, session_active=True, processed_faces=[copy])
+    text, _ = instruction_bar(result, None, time.time())
+    assert "NOT IN THIS CLASS" in text and "Alice Smith" in text

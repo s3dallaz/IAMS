@@ -11,6 +11,7 @@ import numpy as np
 import time
 from typing import Optional
 
+from src.computer_vision.camera_devices import CameraNotFoundError, create_camera
 from src.computer_vision.camera_manager import CameraManager
 from src.computer_vision.face_detector import FaceDetector, DetectedFace
 from src.computer_vision.liveness_detector import (
@@ -155,7 +156,11 @@ def render_liveness_test():
                 
                 # Initialize camera once
                 if st.session_state.camera_manager is None:
-                    st.session_state.camera_manager = CameraManager(camera_index=0)
+                    try:
+                        st.session_state.camera_manager = create_camera()
+                    except CameraNotFoundError as e:
+                        st.error(f"❌ {e}")
+                        return
                 
                 # Try to open camera - should be fast
                 start_camera = time.perf_counter()

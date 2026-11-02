@@ -45,9 +45,11 @@ import config  # noqa: F401 - sets the camera flags before cv2 is imported
 import cv2
 import numpy as np
 
+from src.computer_vision.camera_devices import CameraNotFoundError, create_camera
 from src.computer_vision.camera_manager import CameraManager
 from src.computer_vision.liveness_detector import LivenessState
 from src.realtime.protocol import result_to_dict
+from src.services.course_service import CourseService
 from src.services.enrollment_service import EnrollmentService
 from src.services.session_service import SessionService, SessionStatus
 from src.services.real_time_attendance_service import (
@@ -90,6 +92,8 @@ def instruction_bar(result: RealTimeAttendanceResult, last_mark: Optional[Dict[s
     name = face.student_name or face.identity
     if face.already_marked:
         return f"{name} - already marked", BLUE
+    if face.not_in_class:
+        return f"{name} - NOT IN THIS CLASS (not marked)", ORANGE
     if face.liveness_state == LivenessState.LIVE:
         return f"{name} - verifying...", YELLOW
     parts = []
@@ -137,7 +141,7 @@ def draw_preview(frame: np.ndarray, text: Optional[str], color) -> np.ndarray:
 class VisionEngine:
     """Camera + attendance pipeline; publishes JPEG frames and a status dict."""
 
-    def __init__(self, session_id: int, settings: Dict[str, Any], camera_index: int = 0):
+    def __init__(self, session_id: int, settings: Dict[str, Any], camera_index: Optional[int] = None):
         self.session_id = session_id
         self.camera_index = camera_index
         self.settings = dict(settings)
@@ -214,12 +218,24 @@ class VisionEngine:
         failure. The gallery loads in the background, so a large one cannot
         delay the start (the app gives the engine START_TIMEOUT_SECONDS).
         """
-        self.camera = CameraManager(self.camera_index, width=config.CAMERA_WIDTH or None,
-                                    height=config.CAMERA_HEIGHT or None, background_reader=True)
+        camera_options = dict(width=config.CAMERA_WIDTH or None, height=config.CAMERA_HEIGHT or None,
+                              background_reader=True)
+        try:
+            self.camera = (create_camera(**camera_options) if self.camera_index is None
+                           else CameraManager(self.camera_index, **camera_options))
+        except CameraNotFoundError as e:
+            self._set_status(state="error", error=str(e))
+            return False
         if not self.camera.open():
             self._set_status(state="error", error="Could not open the camera. Is another app using it?")
             return False
         self.manager = RealTimeAttendanceManager(session_id=self.session_id, marked_by="cv_realtime")
+        # Before the first frame: never a moment where anyone could be marked
+        try:
+            self._apply_class_list(SessionService().get_session(self.session_id))
+        except Exception as e:
+            self._set_status(state="error", error=f"Could not load the session's class list: {e}")
+            return False
         self._apply_settings()
         self.manager.fast_liveness = True
         self.manager.min_processing_interval = config.RECOGNITION_INTERVAL
@@ -329,6 +345,17 @@ class VisionEngine:
                 self._set_status(session_ended=reason)
                 self.stop()
                 return
+            try:
+                self._apply_class_list(session)  # picks up class list / section edits
+            except Exception as e:
+                logger.warning(f"Could not refresh the class list of session #{self.session_id}: {e}")
+
+    def _apply_class_list(self, session: Optional[Dict[str, Any]]) -> None:
+        """Let the manager mark only the section's class list (everyone when the session has no section)."""
+        section_id = session.get('section_id') if session else None
+        allowed = CourseService().get_class_list_student_ids(section_id) if section_id else None
+        self.manager.set_class_list(allowed)
+        self._set_status(class_list_size=None if allowed is None else len(allowed))
 
     def _on_gallery_progress(self, done: int, total: int) -> None:
         if not self._gallery_ready.is_set():  # reloads during the session run silently
@@ -451,7 +478,7 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--session", type=int, required=True)
     parser.add_argument("--token", required=True)
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=None, help="Camera number (default: chosen by name)")
     parser.add_argument("--settings", default="{}", help="JSON settings")
     parser.add_argument("--no-parent-watch", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)

@@ -8,6 +8,7 @@ pasting IDs, remove them). Tab 3 imports class lists from Excel / CSV
 """
 
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -19,6 +20,7 @@ from src.services.class_list_import_service import (
     class_list_template_csv, plan_class_list_import, read_class_list_table,
 )
 from src.services.course_service import CourseService, CourseServiceError
+from src.services.session_service import DB_DATETIME_FORMAT, SessionService, SessionStatus
 from src.services.student_service import StudentService
 from src.utils.logger import get_logger
 
@@ -32,6 +34,9 @@ COURSE_SELECTOR_KEY = "courses_section_course"
 SECTION_SELECTOR_KEY = "courses_section_section"
 FLASH_KEY = "courses_flash"
 TABLE_VERSION_KEY = "courses_table_version"
+NAV_KEY = "navigation"                              # sidebar page (app.py)
+PAGE_ATTENDANCE = "Real-Time Attendance"
+CAMERA_SELECTOR_KEY = "realtime_session_selector"   # session picker of the camera page
 
 CLASS_LIST_ROWS = 500     # rows of a class list shown at once (search finds the rest)
 SEARCH_RESULTS = 50       # students offered when searching to add
@@ -169,7 +174,9 @@ def _render_sections_tab(course_service: CourseService, student_service: Student
     course_labels = {c['id']: f"{c['course_code']} - {c['name']}" + ("" if c['is_active'] else " (inactive)")
                      for c in courses}
     if st.session_state.get(COURSE_SELECTOR_KEY) not in course_labels:
-        st.session_state[COURSE_SELECTOR_KEY] = courses[0]['id']
+        # Open on the first active course that has sections (that is where "Start session now" is)
+        st.session_state[COURSE_SELECTOR_KEY] = next(
+            (c['id'] for c in courses if c['is_active'] and c['section_count']), courses[0]['id'])
     course_id = st.selectbox("Course", options=list(course_labels), format_func=course_labels.get,
                              key=COURSE_SELECTOR_KEY)
 
@@ -203,9 +210,75 @@ def _render_sections_tab(course_service: CourseService, student_service: Student
                               key=SECTION_SELECTOR_KEY)
     section = next(s for s in sections if s['id'] == section_id)
 
+    _render_start_now(section)
     _render_section_settings(course_service, section)
     st.markdown("---")
     _render_class_list(course_service, student_service, section)
+
+
+def _render_start_now(section: Dict[str, Any]):
+    """The instructor's quick start: a session for this section that starts now, then the camera page."""
+    if not (section['is_active'] and section['course_is_active']):
+        st.caption("⏸️ This section (or its course) is inactive, so no sessions can be started for it.")
+        return
+    running = [s for s in SessionService().get_all_sessions(status=SessionStatus.ACTIVE)
+               if s.get('section_id') == section['id']]
+    if running:
+        session = running[0]
+        col_text, col_button = st.columns([3, 1], vertical_alignment="center")
+        col_text.success(f"🟢 Running now: #{session['id']} {session['session_name']}")
+        col_button.button("📷 Open camera", key=f"open_camera_{section['id']}", type="primary", width="stretch",
+                          on_click=_open_camera, args=(session['id'],))
+        return
+
+    with st.popover("▶️ Start session now", width="stretch"):
+        if not section['student_count']:
+            st.warning("The class list is empty, so nobody would be expected. Add students first.")
+        st.caption(f"Starts a session for **{section['course_code']} / {section['name']}** right now. Only its "
+                   f"{section['student_count']:,} student(s) are expected and marked by the camera.")
+        st.text_input("Session name", key=f"start_now_name_{section['id']}",
+                      placeholder=f"{section['course_code']} {section['name']} - {datetime.now():%d %b %H:%M}")
+        col_end, col_late = st.columns(2)
+        col_end.time_input("Ends at (optional)", value=None, step=300, key=f"start_now_end_{section['id']}",
+                           help="The session closes by itself at this time today. Empty: close it by hand.")
+        col_late.number_input("Late after (minutes)", min_value=0, max_value=120, value=15,
+                              key=f"start_now_late_{section['id']}")
+        st.button("▶️ Start and open the camera page", key=f"start_now_btn_{section['id']}", type="primary",
+                  width="stretch", disabled=not section['student_count'],
+                  on_click=_start_section_now, args=(section['id'],))
+
+
+def _start_section_now(section_id: int):
+    """'Start session now' callback: runs before the rerun, so it can switch to the camera page."""
+    end = st.session_state.get(f"start_now_end_{section_id}")
+    now = datetime.now()
+    end_time = None
+    if end is not None:
+        end_dt = datetime.combine(now.date(), end)
+        if end_dt <= now:
+            _flash("❌ Not started: the end time has already passed.", "error")
+            return
+        end_time = end_dt.strftime(DB_DATETIME_FORMAT)
+    try:
+        session_id = SessionService().start_section_session(
+            section_id,
+            session_name=st.session_state.get(f"start_now_name_{section_id}"),
+            end_time=end_time,
+            late_threshold_minutes=int(st.session_state.get(f"start_now_late_{section_id}", 15)),
+            created_by="Instructor",
+        )
+    except Exception as e:
+        logger.error(f"Could not start a session for section {section_id}: {e}")
+        _flash(f"❌ Not started: {e}", "error")
+        return
+    logger.info(f"Session #{session_id} started now for section {section_id}")
+    _open_camera(session_id)
+
+
+def _open_camera(session_id: int):
+    """Switch to the Real-Time Attendance page with this session selected (the camera starts by hand there)."""
+    st.session_state[NAV_KEY] = PAGE_ATTENDANCE
+    st.session_state[CAMERA_SELECTOR_KEY] = session_id
 
 
 def _render_section_settings(course_service: CourseService, section: Dict[str, Any]):

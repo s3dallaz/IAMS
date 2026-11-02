@@ -17,7 +17,7 @@ _FACE_ARGS = (
     "challenge_progress", "attendance_marked", "attendance_id", "attendance_status",
     "already_marked", "reason",
 )
-_FACE_EXTRA = ("spoof_score", "challenge_seconds_left")
+_FACE_EXTRA = ("spoof_score", "challenge_seconds_left", "not_in_class")
 
 
 def _json_number(value: Optional[float]) -> Optional[float]:
@@ -46,7 +46,8 @@ def face_from_dict(data: Dict[str, Any]) -> FaceProcessingResult:
         kwargs["recognition_distance"] = float("inf")
     face = FaceProcessingResult(**kwargs)
     for name in _FACE_EXTRA:
-        setattr(face, name, data.get(name))
+        if name in data:  # attributes missing from older messages keep their defaults
+            setattr(face, name, data[name])
     return face
 
 

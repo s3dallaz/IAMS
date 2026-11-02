@@ -9,6 +9,7 @@ import sqlite3
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
+from src.data.repositories.expected_students import expected_condition
 from src.database.connection import get_db_connection
 from src.utils.logger import get_logger
 
@@ -350,24 +351,31 @@ class AnalyticsRepository:
     # ------------------------------------------------------------------
     # Absences. Expected students of a session are the ones Session
     # Details lists (AttendanceRepository._ROSTER_FROM): everyone marked in
-    # it plus every active student registered (enrolled_at, UTC) before it
-    # started (start_time, local -> datetime(..., 'utc')). These queries
-    # return the pieces; StatisticsService counts with them.
+    # it plus the students expected_condition() expects - the class list of
+    # its section, or for a session without a section every active student
+    # registered before it started. These queries return the pieces;
+    # StatisticsService counts with them.
     # ------------------------------------------------------------------
-    
+
     def get_session_expectations(self) -> List[Dict[str, Any]]:
         """
-        Per session: its start time in UTC, how many students attended
-        (present / late), and how many of those are active students
-        registered before the start (they are already counted among the
-        registered students, so they must not be counted twice).
+        Per session: its section_id, start time in UTC, how many students
+        attended (present / late), how many of those are expected anyway
+        (attended_registered: they must not be counted twice) and, for a
+        session with a section, how many active students its class list had
+        at the start (listed; None without a section).
         """
-        query = """
-            SELECT sess.id AS session_id, sess.session_name, sess.course_code, sess.status,
+        query = f"""
+            SELECT sess.id AS session_id, sess.session_name, sess.course_code, sess.status, sess.section_id,
                    datetime(sess.start_time, 'utc') AS start_utc,
                    COALESCE(SUM(a.status IN ('present', 'late')), 0) AS attended,
-                   COALESCE(SUM(a.status IN ('present', 'late') AND s.is_active = 1
-                                AND s.enrolled_at <= datetime(sess.start_time, 'utc')), 0) AS attended_registered
+                   COALESCE(SUM(a.status IN ('present', 'late') AND {expected_condition('s', 'sess')}), 0)
+                       AS attended_registered,
+                   CASE WHEN sess.section_id IS NULL THEN NULL ELSE (
+                       SELECT COUNT(*) FROM section_students ss
+                       JOIN students st ON st.id = ss.student_id AND st.is_active = 1
+                       WHERE ss.section_id = sess.section_id
+                         AND ss.added_at <= datetime(sess.start_time, 'utc')) END AS listed
             FROM sessions sess
             LEFT JOIN attendance_records a ON a.session_id = sess.id
             LEFT JOIN students s ON s.id = a.student_id
@@ -395,15 +403,34 @@ class AnalyticsRepository:
             logger.error(f"Database error getting registration times: {e}")
             raise
     
+    def get_closed_section_sessions_by_student(self) -> Dict[int, int]:
+        """
+        Per student: how many closed sessions with a section expected them
+        (they were on its class list before the session started).
+        """
+        query = """
+            SELECT ss.student_id, COUNT(*) AS n
+            FROM section_students ss
+            JOIN sessions sess ON sess.section_id = ss.section_id AND sess.status = 'closed'
+            WHERE ss.added_at <= datetime(sess.start_time, 'utc')
+            GROUP BY ss.student_id
+        """
+        try:
+            with get_db_connection(self.database_path) as conn:
+                return {row['student_id']: row['n'] for row in conn.execute(query).fetchall()}
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting closed section sessions by student: {e}")
+            raise
+
     def get_closed_session_attendance_by_student(self) -> Dict[int, Tuple[int, int]]:
         """
         Per student with attendance in closed sessions:
-        (closed sessions attended, of those the ones held after the student registered).
+        (closed sessions attended, of those the ones that expected the student).
         """
-        query = """
+        query = f"""
             SELECT a.student_id,
                    COUNT(*) AS attended,
-                   COALESCE(SUM(s.enrolled_at <= datetime(sess.start_time, 'utc')), 0) AS attended_registered
+                   COALESCE(SUM({expected_condition('s', 'sess')}), 0) AS attended_registered
             FROM attendance_records a
             JOIN sessions sess ON sess.id = a.session_id AND sess.status = 'closed'
             JOIN students s ON s.id = a.student_id
@@ -420,17 +447,17 @@ class AnalyticsRepository:
     
     def get_missed_sessions(self, student_db_id: int) -> List[Dict[str, Any]]:
         """
-        Closed sessions an active student was expected at (held after they
-        registered) but did not attend, newest first. Empty for inactive
-        students, who are not expected anywhere.
+        Closed sessions an active student was expected at (expected_condition)
+        but did not attend, newest first. Empty for inactive students, who
+        are not expected anywhere.
         """
-        query = """
+        query = f"""
             SELECT sess.id AS session_id, sess.session_name, sess.course_code,
                    sess.start_time AS session_start_time
             FROM sessions sess
-            JOIN students s ON s.id = :student_id AND s.is_active = 1
+            JOIN students s ON s.id = :student_id
             WHERE sess.status = 'closed'
-              AND s.enrolled_at <= datetime(sess.start_time, 'utc')
+              AND {expected_condition('s', 'sess')}
               AND NOT EXISTS (
                   SELECT 1 FROM attendance_records a
                   WHERE a.session_id = sess.id AND a.student_id = s.id

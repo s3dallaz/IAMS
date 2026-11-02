@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from src.data.repositories.session_repository import SessionRepository
 from src.data.repositories.attendance_repository import AttendanceRepository
+from src.data.repositories.course_repository import CourseRepository
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -105,6 +106,7 @@ class SessionService:
         """
         self.repository = SessionRepository(database_path)
         self.attendance_repository = AttendanceRepository(database_path)
+        self.course_repository = CourseRepository(database_path)
         logger.debug("SessionService initialized")
     
     def create_session(
@@ -116,7 +118,8 @@ class SessionService:
         late_threshold_minutes: Optional[int] = None,
         status: str = SessionStatus.SCHEDULED,
         created_by: Optional[str] = None,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        section_id: Optional[int] = None
     ) -> int:
         """
         Create a new session with validation.
@@ -130,6 +133,9 @@ class SessionService:
             status: Initial session status (default: 'scheduled')
             created_by: User who created the session (optional)
             notes: Additional notes (optional)
+            section_id: Section whose class list is expected (optional; its
+                course code replaces course_code). Without one, every active
+                student is expected.
         
         Returns:
             Database ID of the newly created session
@@ -137,6 +143,9 @@ class SessionService:
         Raises:
             InvalidSessionDataError: If validation fails
         """
+        if section_id is not None:
+            course_code = self._active_section(section_id)['course_code']
+        
         # Validate session_name
         if not isinstance(session_name, str):
             raise InvalidSessionDataError("session_name must be a string")
@@ -225,7 +234,8 @@ class SessionService:
                 late_threshold_minutes=late_threshold_minutes,
                 status=status,
                 created_by=created_by,
-                notes=notes
+                notes=notes,
+                section_id=section_id
             )
             logger.info(f"Session created successfully: {session_name} (ID: {session_id})")
             return session_id
@@ -446,6 +456,61 @@ class SessionService:
         
         return self.repository.exists(session_id)
     
+    def _active_section(self, section_id: int) -> Dict[str, Any]:
+        """The section (with course_code); raises if it is missing or inactive."""
+        if not isinstance(section_id, int) or section_id <= 0:
+            raise InvalidSessionDataError("section_id must be a positive integer")
+        section = self.course_repository.get_section(section_id)
+        if not section:
+            raise InvalidSessionDataError(f"Section {section_id} not found")
+        if not section['is_active'] or not section['course_is_active']:
+            raise InvalidSessionDataError(
+                f"Section {section['course_code']} / {section['name']} is inactive. Activate it first.")
+        return section
+    
+    def start_section_session(
+        self,
+        section_id: int,
+        session_name: Optional[str] = None,
+        end_time: Optional[str] = None,
+        late_threshold_minutes: Optional[int] = None,
+        created_by: Optional[str] = None,
+        now: Optional[datetime] = None
+    ) -> int:
+        """
+        Create a session for a section that starts right now (status
+        'active'), e.g. from the instructor's "Start session now" button.
+        
+        Args:
+            section_id: The section whose class list is expected
+            session_name: Name (default: "<course> <section> - <date time>")
+            end_time: Optional end time; the session then closes by itself
+            late_threshold_minutes: Late threshold (default 15)
+            created_by: Who started it
+            now: Current local time (default: now)
+        
+        Returns:
+            Database ID of the new session
+        
+        Raises:
+            InvalidSessionDataError: If the section is missing / inactive or a value is invalid
+        """
+        section = self._active_section(section_id)
+        # Seconds are kept: students added to the class list moments ago must
+        # count as added before the start
+        now = (now or datetime.now()).replace(microsecond=0)
+        name = (session_name or "").strip() or (
+            f"{section['course_code']} {section['name']} - {now.strftime('%d %b %H:%M')}")
+        return self.create_session(
+            session_name=name,
+            start_time=now.strftime(DB_DATETIME_FORMAT),
+            end_time=end_time,
+            late_threshold_minutes=late_threshold_minutes,
+            status=SessionStatus.ACTIVE,
+            created_by=created_by,
+            section_id=section_id,
+        )
+    
     def update_session(
         self,
         session_id: int,
@@ -455,7 +520,9 @@ class SessionService:
         end_time: Optional[str] = None,
         late_threshold_minutes: Optional[int] = None,
         notes: Optional[str] = None,
-        clear_end_time: bool = False
+        clear_end_time: bool = False,
+        section_id: Optional[int] = None,
+        clear_section: bool = False
     ) -> int:
         """
         Update a session's information.
@@ -477,6 +544,9 @@ class SessionService:
             late_threshold_minutes: New late threshold (optional)
             notes: New notes (optional)
             clear_end_time: Remove the end time
+            section_id: New section (its course code replaces course_code);
+                who is expected changes with it
+            clear_section: Remove the section: every active student is expected
         
         Returns:
             Number of rows affected (1 if updated, 0 if session not found)
@@ -544,6 +614,11 @@ class SessionService:
             if not notes:
                 notes = None
         
+        if section_id is not None and not clear_section and section_id != session.get('section_id'):
+            course_code = self._active_section(section_id)['course_code']
+        elif section_id is not None and section_id == session.get('section_id'):
+            section_id = None  # unchanged (it may have been deactivated since)
+        
         regrade = self._check_timing_change(session, start_time, end_time, late_threshold_minutes, clear_end_time)
         
         # Update through repository
@@ -556,7 +631,9 @@ class SessionService:
                 end_time=end_time,
                 late_threshold_minutes=late_threshold_minutes,
                 notes=notes,
-                clear_end_time=clear_end_time
+                clear_end_time=clear_end_time,
+                section_id=section_id,
+                clear_section=clear_section
             )
             
             if rows_affected > 0:
@@ -687,9 +764,14 @@ class SessionService:
         start_time: str,
         end_time: Optional[str] = None,
         course_code: Optional[str] = None,
-        exclude_id: Optional[int] = None
+        exclude_id: Optional[int] = None,
+        section_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Open (scheduled / active) sessions of the same course whose times overlap."""
+        """
+        Open (scheduled / active) sessions of the same section - or without a
+        section, of the same course - whose times overlap.
+        """
         start = parse_session_datetime(start_time, "start_time").strftime(DB_DATETIME_FORMAT)
         end = parse_session_datetime(end_time, "end_time").strftime(DB_DATETIME_FORMAT) if end_time else None
-        return self.repository.find_overlapping(start, end, (course_code or "").strip() or None, exclude_id)
+        return self.repository.find_overlapping(start, end, (course_code or "").strip() or None, exclude_id,
+                                                section_id=section_id)

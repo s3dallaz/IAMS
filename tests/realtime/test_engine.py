@@ -116,7 +116,7 @@ def running_engine(monkeypatch):
     manager.process_frame_async.return_value = _result(_face())
     enrollment = MagicMock()
     enrollment.return_value.load_active_gallery.return_value = []
-    monkeypatch.setattr(engine_module, "CameraManager", MagicMock(return_value=camera))
+    monkeypatch.setattr(engine_module, "create_camera", MagicMock(return_value=camera))
     monkeypatch.setattr(engine_module, "RealTimeAttendanceManager", MagicMock(return_value=manager))
     monkeypatch.setattr(engine_module, "EnrollmentService", enrollment)
     monkeypatch.setattr(engine_module, "GALLERY_RELOAD_SECONDS", 0.05)
@@ -203,11 +203,20 @@ def test_gallery_is_reloaded_while_running(running_engine):
 def test_camera_failure_is_reported(monkeypatch):
     camera = MagicMock()
     camera.open.return_value = False
-    monkeypatch.setattr(engine_module, "CameraManager", MagicMock(return_value=camera))
+    monkeypatch.setattr(engine_module, "create_camera", MagicMock(return_value=camera))
     engine = VisionEngine(session_id=3, settings={})
     assert engine.start() is False
     assert engine.status()["state"] == "error"
     assert "camera" in engine.status()["error"].lower()
+
+
+def test_missing_named_camera_is_reported(monkeypatch):
+    error = engine_module.CameraNotFoundError("Camera 'Brio 100' was not found.")
+    monkeypatch.setattr(engine_module, "create_camera", MagicMock(side_effect=error))
+    engine = VisionEngine(session_id=3, settings={})
+    assert engine.start() is False
+    assert engine.status()["state"] == "error"
+    assert "Brio 100" in engine.status()["error"]
 
 
 def test_controller_without_an_engine():
@@ -250,7 +259,7 @@ def test_gallery_reload_runs_off_the_frame_loop_and_only_on_changes(monkeypatch)
     enrollment = MagicMock()
     enrollment.return_value.gallery_signature.side_effect = lambda: signature["value"]
     enrollment.return_value.load_active_gallery.side_effect = slow_load
-    monkeypatch.setattr(engine_module, "CameraManager", MagicMock(return_value=camera))
+    monkeypatch.setattr(engine_module, "create_camera", MagicMock(return_value=camera))
     monkeypatch.setattr(engine_module, "RealTimeAttendanceManager", MagicMock(return_value=manager))
     monkeypatch.setattr(engine_module, "EnrollmentService", enrollment)
     monkeypatch.setattr(engine_module, "GALLERY_RELOAD_SECONDS", 0.05)
@@ -289,7 +298,7 @@ def _engine_with_gallery_load(monkeypatch, load_active_gallery):
     enrollment = MagicMock()
     enrollment.return_value.gallery_signature.return_value = "v1"
     enrollment.return_value.load_active_gallery.side_effect = load_active_gallery
-    monkeypatch.setattr(engine_module, "CameraManager", MagicMock(return_value=camera))
+    monkeypatch.setattr(engine_module, "create_camera", MagicMock(return_value=camera))
     monkeypatch.setattr(engine_module, "RealTimeAttendanceManager", MagicMock(return_value=manager))
     monkeypatch.setattr(engine_module, "EnrollmentService", enrollment)
     monkeypatch.setattr(engine_module, "GALLERY_RETRY_SECONDS", 0.05)

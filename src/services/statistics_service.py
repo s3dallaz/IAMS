@@ -5,8 +5,9 @@ Computes attendance counts, absences, attendance and punctuality rates,
 temporal trends, and summaries for students, courses, and sessions.
 
 Absences follow the rule of Session Details: the students expected at a
-session are everyone marked in it plus every active student registered
-before it started (there are no class rosters yet). Absence totals for
+session are everyone marked in it plus its section's class list, or for a
+session without a section every active student registered before it
+started (see expected_students.expected_condition). Absence totals for
 students, courses and the whole system count closed sessions only, where
 attendance is final; a single session's figures are live while it runs.
 """
@@ -103,7 +104,8 @@ class StatisticsService:
         present_count = summary.get('present_count', 0) or 0
         late_count = summary.get('late_count', 0) or 0
         absence = self._student_absence(student, self._closed_session_starts(),
-                                        self.analytics_repo.get_closed_session_attendance_by_student())
+                                        self.analytics_repo.get_closed_session_attendance_by_student(),
+                                        self.analytics_repo.get_closed_section_sessions_by_student())
         
         # Get history records for this student
         history = self.analytics_repo.get_filtered_attendance_history(student_id_str=student['student_id'])
@@ -136,6 +138,7 @@ class StatisticsService:
         raw_summaries = self.analytics_repo.get_all_students_attendance_summary()
         closed_starts = self._closed_session_starts()
         closed_attendance = self.analytics_repo.get_closed_session_attendance_by_student()
+        closed_listed = self.analytics_repo.get_closed_section_sessions_by_student()
         results = []
         for s in raw_summaries:
             total_marked = s.get('total_marked', 0)
@@ -143,7 +146,7 @@ class StatisticsService:
             late_cnt = s.get('late_count', 0) or 0
             absence = self._student_absence(
                 {'id': s['student_db_id'], 'is_active': s['is_active'], 'enrolled_at': s.get('enrolled_at')},
-                closed_starts, closed_attendance
+                closed_starts, closed_attendance, closed_listed
             )
             
             results.append({
@@ -199,11 +202,15 @@ class StatisticsService:
             attendance_percentage = self._percentage(present_count + late_count, expected)
         
         records = self.analytics_repo.get_filtered_attendance_history(session_id=session_id)
+        session = self.session_repo.get_by_id(session_id) or {}
         
         return {
             'session_id': summary['session_id'],
             'session_name': summary['session_name'],
             'course_code': summary['course_code'] or '—',
+            'section_id': session.get('section_id'),
+            'section_name': session.get('section_name'),
+            'instructor_name': session.get('instructor_name'),
             'start_time': summary['start_time'],
             'end_time': summary.get('end_time'),
             'status': summary['status'],
@@ -277,6 +284,46 @@ class StatisticsService:
             course['attendance_rate'] = self._percentage(totals['expected'] - totals['absent'], totals['expected'])
         return courses
     
+    def get_section_statistics(self) -> List[Dict[str, Any]]:
+        """
+        One row per section that has sessions: its sessions, present / late
+        (all sessions), absences and attendance rate (closed sessions only,
+        like the course summary).
+        """
+        sections = {s['id']: s for s in self.session_repo.get_sections_with_sessions()}
+        if not sections:
+            return []
+        section_of = {s['id']: s['section_id'] for s in self.session_repo.get_all() if s.get('section_id')}
+        totals: Dict[int, Dict[str, int]] = {}
+        for s in self.get_all_sessions_statistics():
+            section_id = section_of.get(s['session_id'])
+            if section_id not in sections:
+                continue
+            row = totals.setdefault(section_id, {'sessions': 0, 'present': 0, 'late': 0,
+                                                 'expected': 0, 'absent': 0})
+            row['sessions'] += 1
+            row['present'] += s['present_count']
+            row['late'] += s['late_count']
+            if s['status'] == 'closed' and s['expected_students'] is not None:
+                row['expected'] += s['expected_students']
+                row['absent'] += s['absent_count']
+        results = []
+        for section_id, row in totals.items():
+            section = sections[section_id]
+            results.append({
+                'section_id': section_id,
+                'course_code': section['course_code'],
+                'section_name': section['name'],
+                'instructor_name': section['instructor_name'],
+                'class_list_size': section['student_count'],
+                'total_sessions': row['sessions'],
+                'present_count': row['present'],
+                'late_count': row['late'],
+                'absent_count': row['absent'],
+                'attendance_rate': self._percentage(row['expected'] - row['absent'], row['expected']),
+            })
+        return sorted(results, key=lambda r: (r['course_code'].lower(), r['section_name'].lower()))
+
     def get_session_roster(self, session_id: int, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Every expected student of a session with their status (present -> late -> absent), for reports."""
         return self.attendance_repo.get_session_roster(session_id, status=status)
@@ -316,44 +363,53 @@ class StatisticsService:
         """
         Expected and absent students of every session (None before it starts).
         
-        Expected = active students registered before the start (counted with
-        a binary search over the sorted registration times, not a scan per
-        session) + students who attended without being among them.
+        Expected = the section's class list at the start (listed), or for a
+        session without a section the active students registered before the
+        start (counted with a binary search over the sorted registration
+        times, not a scan per session) + students who attended without
+        being among them.
         """
         registration_times = self.analytics_repo.get_active_registration_times()
         result = {}
         for s in self.analytics_repo.get_session_expectations():
-            entry = {'status': s['status'], 'course_code': s['course_code'],
+            entry = {'status': s['status'], 'course_code': s['course_code'], 'section_id': s['section_id'],
                      'start_utc': s['start_utc'], 'expected': None, 'absent': None}
             if s['status'] != 'scheduled' and s['start_utc']:
-                registered = bisect_right(registration_times, s['start_utc'])
+                if s['section_id'] is not None:
+                    registered = s['listed']
+                else:
+                    registered = bisect_right(registration_times, s['start_utc'])
                 entry['absent'] = registered - s['attended_registered']
                 entry['expected'] = entry['absent'] + s['attended']
             result[s['session_id']] = entry
         return result
-    
+
     def _closed_session_starts(self) -> List[str]:
-        """Start times (UTC) of closed sessions, earliest first."""
+        """Start times (UTC) of closed sessions WITHOUT a section, earliest first."""
         return sorted(s['start_utc'] for s in self.analytics_repo.get_session_expectations()
-                      if s['status'] == 'closed' and s['start_utc'])
+                      if s['status'] == 'closed' and s['start_utc'] and s['section_id'] is None)
     
     def _student_absence(
         self,
         student: Dict[str, Any],
         closed_starts: List[str],
-        closed_attendance: Dict[int, tuple]
+        closed_attendance: Dict[int, tuple],
+        closed_listed: Dict[int, int]
     ) -> Dict[str, Any]:
         """
         A student's expected sessions, absences and attendance percentage
         over closed sessions. Active students are expected at every closed
-        session held after they registered; inactive students only where
-        they attended.
+        session without a section held after they registered (closed_starts)
+        and at the closed section sessions whose class list they were on
+        (closed_listed); inactive students only where they attended.
         """
         attended, attended_registered = closed_attendance.get(student['id'], (0, 0))
         absent = 0
-        if student.get('is_active') and student.get('enrolled_at'):
-            held_after_registering = len(closed_starts) - bisect_left(closed_starts, student['enrolled_at'])
-            absent = max(0, held_after_registering - attended_registered)
+        if student.get('is_active'):
+            held = closed_listed.get(student['id'], 0)
+            if student.get('enrolled_at'):
+                held += len(closed_starts) - bisect_left(closed_starts, student['enrolled_at'])
+            absent = max(0, held - attended_registered)
         expected = attended + absent
         return {'expected': expected, 'absent': absent, 'percentage': self._percentage(attended, expected)}
     
