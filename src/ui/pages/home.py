@@ -20,12 +20,16 @@ import pandas as pd
 import streamlit as st
 
 import config
+from src.services.auth_service import AuthService
 from src.services.enrollment_service import EnrollmentService
 from src.services.session_scheduler import is_session_scheduler_running
 from src.services.session_service import SessionService, SessionStatus
 from src.services.statistics_service import StatisticsService
 from src.services.student_service import StudentService
+from src.ui.access import can_open
 from src.ui.pages.courses_sections import TAB_SECTIONS as COURSES_TAB_SECTIONS, TABS_KEY as COURSES_TABS_KEY
+from src.ui.pages.login import current_user
+from src.ui.pages.users import render_second_it_warning
 from src.ui.pages.session_management import (
     DETAIL_SELECTOR_KEY, TAB_CREATE, TAB_DETAILS, TABS_KEY,
 )
@@ -209,6 +213,7 @@ def render_home():
     now = datetime.now()
     st.title("🏠 Home")
     st.caption(f"{now.strftime('%A, %d %B %Y')} · Intelligent Attendance Monitoring System")
+    render_second_it_warning(AuthService(), current_user())
 
     session_service = SessionService()
     stats_service = StatisticsService()
@@ -227,7 +232,8 @@ def render_home():
     with_faces = sum(1 for s in active_students if sample_counts.get(s['id'], 0) > 0)
     without_faces = len(active_students) - with_faces
 
-    _render_getting_started(stats, with_faces)
+    if can_open(current_user(), PAGE_STUDENTS):   # the setup steps are admin work
+        _render_getting_started(stats, with_faces)
     _render_today()
     st.markdown("---")
     _render_overview(stats_service, session_service, stats, len(active_students), without_faces, now)
@@ -272,13 +278,18 @@ def _render_today() -> None:
     st.subheader("📅 Today")
 
     # Horizontal rows wrap on narrow screens instead of cutting text off
+    # Only buttons for pages this user's role may open
+    user = current_user()
     quick = st.container(horizontal=True)
-    quick.button("▶️ Start a class", key="home_start_class", on_click=_go_start_class, type="primary",
-                 help="Pick a course and section, then start its session now")
+    if can_open(user, PAGE_COURSES):
+        quick.button("▶️ Start a class", key="home_start_class", on_click=_go_start_class, type="primary",
+                     help="Pick a course and section, then start its session now")
     quick.button("➕ New session", key="home_new_session", on_click=_go_create_session)
-    quick.button("👤 Add students", key="home_students", on_click=_go, args=(PAGE_STUDENTS,))
+    if can_open(user, PAGE_STUDENTS):
+        quick.button("👤 Add students", key="home_students", on_click=_go, args=(PAGE_STUDENTS,))
     quick.button("📊 Reports", key="home_reports", on_click=_go, args=(PAGE_REPORTS,))
-    quick.button("🤖 AI Assistant", key="home_ai", on_click=_go, args=(PAGE_ASSISTANT,))
+    if can_open(user, PAGE_ASSISTANT):
+        quick.button("🤖 AI Assistant", key="home_ai", on_click=_go, args=(PAGE_ASSISTANT,))
 
     active = [s for s in sessions if s['status'] == SessionStatus.ACTIVE]
     for session in active:

@@ -1,3 +1,7 @@
 [server]
 # Bulk import: a ZIP of face photos for hundreds of students can exceed the 200 MB default
 maxUploadSize = 1024
+# Only this PC can open the app. Other devices on the network (Wi-Fi) could
+# otherwise reach it, and the login password would cross the network
+# unencrypted. Opening it to the school network comes with HTTPS later.
+address = "localhost"

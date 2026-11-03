@@ -2,7 +2,8 @@
 Intelligent Attendance Monitoring System
 Main Streamlit application entry point
 
-The app opens on the Home dashboard (src/ui/pages/home.py).
+Everyone signs in first (src/ui/pages/login.py); the sidebar then shows the
+pages their role may open (src/ui/access.py), starting with the Home dashboard.
 """
 
 import streamlit as st
@@ -11,7 +12,13 @@ from dotenv import load_dotenv
 import config
 from src.utils.logger import get_logger
 from src.database.schema import initialize_database
+from src.services.auth_service import AuthService
 from src.services.session_scheduler import start_session_scheduler
+from src.ui.access import pages_for
+from src.ui.pages.login import (
+    has_pending_recovery_code, load_signed_in_user, render_account_box, render_first_setup,
+    render_forced_password_change, render_login, render_recovery_code_screen,
+)
 
 # Load environment variables
 load_dotenv()
@@ -58,24 +65,31 @@ def main():
     # e.g. started by run_app.py before the server)
     start_session_scheduler()
 
-    logger.info("Application started successfully")
+    # Sign in first: nothing below is shown without an account
+    auth = AuthService()
+    if auth.needs_first_account():
+        render_first_setup(auth)
+        return
+    user = load_signed_in_user(auth)
+    if user is None:
+        render_login(auth)
+        return
+    if has_pending_recovery_code():   # a new recovery code is shown once, before anything else
+        render_recovery_code_screen(user)
+        return
+    if user['must_change_password']:
+        render_forced_password_change(auth, user)
+        return
 
-    # Sidebar navigation
+    # Sidebar navigation: only the pages this user's role may open. A page
+    # chosen elsewhere (e.g. a Home button) that they may not open falls back to the first.
+    pages = pages_for(user)
+    if st.session_state.get("navigation") not in pages:
+        st.session_state["navigation"] = pages[0]
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
-        "Go to",
-        [
-            "Home",
-            "Real-Time Attendance",
-            "Session Management",
-            "Student Registry",
-            "Courses & Sections",
-            "Statistics & Reports",
-            "AI Assistant"
-        ],
-        key="navigation"
-    )
-    
+    page = st.sidebar.radio("Go to", pages, key="navigation")
+    render_account_box(auth, user)
+
     # Render selected page
     if page == "Home":
         render_home_page()
@@ -91,6 +105,8 @@ def main():
         render_statistics_reports_page()
     elif page == "AI Assistant":
         render_ai_assistant_page()
+    elif page == "Users":
+        render_users_page()
 
 
 def render_home_page():
@@ -133,6 +149,12 @@ def render_ai_assistant_page():
     """Render the AI Assistant page."""
     from src.ui.pages.ai_assistant import render_ai_assistant
     render_ai_assistant()
+
+
+def render_users_page():
+    """Render the Users page."""
+    from src.ui.pages.users import render_users
+    render_users()
 
 
 if __name__ == "__main__":

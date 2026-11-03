@@ -95,7 +95,7 @@ Every package in `requirements.txt` installs from a prebuilt wheel, so **no C++ 
    ```cmd
    run.bat
    ```
-   This starts the app with the `.venv` interpreter (nothing is reinstalled) and opens `http://localhost:8501` in your browser. It runs `run_app.py`, which first starts the **session scheduler** (the part that starts and closes scheduled sessions on time) and then the Streamlit server. Other devices on the same network can open the app too, using the "Network URL" printed in the window.
+   This starts the app with the `.venv` interpreter (nothing is reinstalled) and opens `http://localhost:8501` in your browser. It runs `run_app.py`, which first starts the **session scheduler** (the part that starts and closes scheduled sessions on time) and then the Streamlit server. Only **this PC** can open the app: other devices on the network (Wi-Fi) are refused, so nobody else can reach it and passwords never cross the network. Use from other devices comes later, together with HTTPS.
 
 4. **Uninstall** (optional):
    ```cmd
@@ -122,7 +122,33 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 
 ## 🎯 Using the System
 
-The app opens on **Home**. The sidebar has seven pages:
+### Signing in
+* **First start:** the app asks you to create the first **IT account**. That account creates every other account on the **Users** page.
+* **Roles:** *Instructor* < *Admin* < *IT*.
+
+  | | Instructor | Admin | IT |
+  |---|---|---|---|
+  | Home, Real-Time Attendance, Session Management, Statistics & Reports | ✅ | ✅ | ✅ |
+  | Student Registry, Courses & Sections, AI Assistant | ❌ | ✅ | ✅ |
+  | Users: instructor accounts | ❌ | ✅ | ✅ |
+  | Users: Admin and IT accounts | ❌ | ❌ | ✅ |
+
+* **New accounts** get a temporary password, shown once. Its owner must choose their own password at the first sign-in. **Reset password** on the Users page works the same way.
+* **Lockout:** 5 wrong passwords in a row lock the account for 15 minutes. An Admin / IT user can **Unlock** it sooner.
+* **Passwords** are stored only as scrypt hashes, never as text. Change yours with **🔑 Password** in the sidebar.
+* **Forgot your password?** Every account gets a one-time **recovery code**, shown once (after creating the first account, after choosing your own password, or with **🧾 New recovery code** in the sidebar). Save it somewhere safe. On the sign-in page, **Forgot your password?** takes your username + the code + a new password. The code is then used up and a new one is shown. Wrong codes count towards the same lockout as wrong passwords. No code? Instructors ask an Admin, Admins ask IT.
+* **Keep two IT accounts:** while only one exists, IT users see a warning on Home and Users, because a lost IT password plus a lost code would leave nobody to manage Admin / IT accounts.
+* **Signing out:** **🚪 Log out**, or refresh / close the browser tab.
+* **Last resort for technical staff** (password *and* recovery code lost, and no second IT account): on this PC run:
+
+  ```bash
+  .venv\Scripts\python scripts\manage_accounts.py reset-password <username>
+  ```
+
+  Also available: `list`, `unlock <username>` and `create-it <username> "<full name>"`.
+
+### Pages
+After signing in, the sidebar shows the pages your role may open:
 
 1. **Home** - the start page, top to bottom:
    * **Getting started** - the setup steps (add students → add face photos → create a session → take attendance), ticked off automatically, with a **Go** button for the next one. It folds away once all are done.
@@ -142,6 +168,7 @@ The app opens on **Home**. The sidebar has seven pages:
    * A course or section that has sessions can't be deleted - deactivate it instead, so its history is kept.
 6. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course (filter by course / section; session reports show the section and instructor; a **section summary** table), and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
 7. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
+8. **Users** (Admin / IT) - create accounts, change a name or role, reset a password, unlock, deactivate.
 
 ### How sessions behave
 
@@ -303,8 +330,9 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 Planned, not built yet:
 
 * **Instructor screen** - an instructor picks their course and session and starts it
-* **Login for instructors and admins** - each instructor sees and manages only their own sessions
-* **Use from several devices** - the app is already reachable on the local network; multi-device use will come together with the login
+* **Instructors see only their own classes** - sections linked to instructor accounts; sessions, Home and reports filtered for instructors
+* **Activity log** - who changed or deleted what, and when
+* **Use from several devices** - a school server with classroom PCs, HTTPS and device keys (today the app only opens on its own PC)
 * **AI Assistant updates** - e.g. answering questions about absent students
 * **New design** - a visual redesign of the whole app
 

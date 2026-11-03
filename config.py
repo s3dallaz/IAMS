@@ -179,7 +179,9 @@ LOGS_DIR: Final[Path] = DATA_DIR / "logs"
 ATTENDANCE_SNAPSHOTS_DIR: Final[Path] = DATA_DIR / "attendance_snapshots"
 
 # Database configuration
-DATABASE_NAME: Final[str] = "attendance.db"
+# DATABASE_NAME in the environment / .env uses another database file in data/database
+# (e.g. a copy for testing or a demo); default: attendance.db
+DATABASE_NAME: Final[str] = os.getenv("DATABASE_NAME", "attendance.db").strip() or "attendance.db"
 DATABASE_PATH: Final[Path] = DATABASE_DIR / DATABASE_NAME
 
 # Application settings

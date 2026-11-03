@@ -53,6 +53,27 @@ CREATE TABLE IF NOT EXISTS enrollments (
 )
 """
 
+# Accounts. role: instructor < admin < it. password_hash is scrypt (never the
+# password itself); failed_attempts / locked_until implement the lockout.
+# recovery_code_hash: the one-time code for a forgotten password (scrypt too).
+CREATE_USERS_TABLE = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    full_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('instructor', 'admin', 'it')),
+    password_hash TEXT NOT NULL,
+    is_active BOOLEAN DEFAULT 1,
+    must_change_password BOOLEAN DEFAULT 0,
+    recovery_code_hash TEXT,
+    failed_attempts INTEGER DEFAULT 0,
+    locked_until TIMESTAMP,
+    last_login_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_by TEXT
+)
+"""
+
 CREATE_COURSES_TABLE = """
 CREATE TABLE IF NOT EXISTS courses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,6 +248,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
     tables = [
         ("students", CREATE_STUDENTS_TABLE),
         ("enrollments", CREATE_ENROLLMENTS_TABLE),
+        ("users", CREATE_USERS_TABLE),
         ("courses", CREATE_COURSES_TABLE),
         ("sections", CREATE_SECTIONS_TABLE),
         ("section_students", CREATE_SECTION_STUDENTS_TABLE),
@@ -251,6 +273,10 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     Args:
         conn: Database connection
     """
+    user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if 'recovery_code_hash' not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN recovery_code_hash TEXT")
+        logger.info("Added users.recovery_code_hash (existing accounts have no recovery code yet)")
     session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
     if 'section_id' not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN section_id INTEGER REFERENCES sections(id)")
@@ -397,6 +423,7 @@ def verify_schema(database_path: Optional[Path] = None) -> bool:
     required_tables = [
         'students',
         'enrollments',
+        'users',
         'courses',
         'sections',
         'section_students',
