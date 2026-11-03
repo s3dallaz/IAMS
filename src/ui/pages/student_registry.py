@@ -36,6 +36,7 @@ from src.services.enrollment_service import (
 )
 from src.computer_vision.camera_devices import CameraNotFoundError, create_camera
 from src.computer_vision.camera_manager import CameraManager
+from src.ui.pages.camera_picker import render_camera_picker
 from src.ui.pages.bulk_import import recognition_data_progress_text, render_bulk_import_view
 from src.utils.logger import get_logger
 
@@ -727,6 +728,8 @@ def render_manage_face_view(
             else:
                 st.info("💡 Click **Take Photo** to start live preview, position face, and capture.")
             
+            render_camera_picker("reg_camera_picker")
+
             if st.button("📸 Take Photo", type="primary", width="stretch", key="btn_start_enroll_camera"):
                 cam = None
                 try:

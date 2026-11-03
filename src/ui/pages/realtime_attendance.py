@@ -41,6 +41,7 @@ from src.services.session_service import SessionService, SessionStatus
 from src.services.attendance_service import AttendanceService, AttendanceStatus
 from src.services.enrollment_service import EnrollmentService
 from src.realtime.engine_client import EngineController
+from src.ui.pages.camera_picker import render_camera_picker
 from src.realtime.protocol import result_from_dict
 from src.utils.logger import get_logger
 
@@ -91,6 +92,8 @@ def render_realtime_attendance():
     # Sidebar Configuration
     with st.sidebar:
         st.subheader("⚙️ Attendance Settings")
+
+        render_camera_picker("att_camera_picker", disabled=st.session_state.get('att_camera_active', False))
 
         require_liveness = st.checkbox(
             "Require Liveness Check",

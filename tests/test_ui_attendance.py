@@ -482,6 +482,7 @@ def test_render_realtime_attendance_no_sessions(mock_get_sessions, _apply):
     
     with patch("streamlit.warning") as mock_warning, \
          patch("streamlit.sidebar"), \
+         patch("src.ui.pages.realtime_attendance.render_camera_picker"), \
          patch("streamlit.session_state", {}):
         render_realtime_attendance()
         mock_warning.assert_called_once()
