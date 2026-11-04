@@ -120,7 +120,9 @@ class SessionService:
         created_by: Optional[str] = None,
         notes: Optional[str] = None,
         section_id: Optional[int] = None,
-        created_by_user_id: Optional[int] = None
+        created_by_user_id: Optional[int] = None,
+        checkout_enabled: bool = False,
+        checkout_minutes: int = 10
     ) -> int:
         """
         Create a new session with validation.
@@ -138,7 +140,9 @@ class SessionService:
                 course code replaces course_code). Without one, every active
                 student is expected.
             created_by_user_id: The signed-in account creating it (it then owns the session)
-        
+            checkout_enabled: Automatic check-out in the session's last checkout_minutes
+                (needs an end time to start by itself; CheckService runs it)
+
         Returns:
             Database ID of the newly created session
         
@@ -147,7 +151,8 @@ class SessionService:
         """
         if section_id is not None:
             course_code = self._active_section(section_id)['course_code']
-        
+        checkout_minutes = self._checkout_minutes(checkout_minutes)
+
         # Validate session_name
         if not isinstance(session_name, str):
             raise InvalidSessionDataError("session_name must be a string")
@@ -238,7 +243,9 @@ class SessionService:
                 created_by=created_by,
                 notes=notes,
                 section_id=section_id,
-                created_by_user_id=created_by_user_id
+                created_by_user_id=created_by_user_id,
+                checkout_enabled=bool(checkout_enabled),
+                checkout_minutes=checkout_minutes
             )
             logger.info(f"Session created successfully: {session_name} (ID: {session_id})")
             return session_id
@@ -459,6 +466,12 @@ class SessionService:
         
         return self.repository.exists(session_id)
     
+    @staticmethod
+    def _checkout_minutes(minutes: int) -> int:
+        if not isinstance(minutes, int) or not 1 <= minutes <= 60:
+            raise InvalidSessionDataError("The check-out lasts 1 to 60 minutes.")
+        return minutes
+
     def _active_section(self, section_id: int) -> Dict[str, Any]:
         """The section (with course_code); raises if it is missing or inactive."""
         if not isinstance(section_id, int) or section_id <= 0:
@@ -479,7 +492,9 @@ class SessionService:
         late_threshold_minutes: Optional[int] = None,
         created_by: Optional[str] = None,
         now: Optional[datetime] = None,
-        created_by_user_id: Optional[int] = None
+        created_by_user_id: Optional[int] = None,
+        checkout_enabled: bool = False,
+        checkout_minutes: int = 10
     ) -> int:
         """
         Create a session for a section that starts right now (status
@@ -514,6 +529,8 @@ class SessionService:
             created_by=created_by,
             section_id=section_id,
             created_by_user_id=created_by_user_id,
+            checkout_enabled=checkout_enabled,
+            checkout_minutes=checkout_minutes,
         )
     
     def update_session(
@@ -527,7 +544,9 @@ class SessionService:
         notes: Optional[str] = None,
         clear_end_time: bool = False,
         section_id: Optional[int] = None,
-        clear_section: bool = False
+        clear_section: bool = False,
+        checkout_enabled: Optional[bool] = None,
+        checkout_minutes: Optional[int] = None
     ) -> int:
         """
         Update a session's information.
@@ -638,7 +657,9 @@ class SessionService:
                 notes=notes,
                 clear_end_time=clear_end_time,
                 section_id=section_id,
-                clear_section=clear_section
+                clear_section=clear_section,
+                checkout_enabled=checkout_enabled,
+                checkout_minutes=None if checkout_minutes is None else self._checkout_minutes(checkout_minutes)
             )
             
             if rows_affected > 0:

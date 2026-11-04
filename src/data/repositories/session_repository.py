@@ -52,7 +52,9 @@ class SessionRepository:
         created_by: Optional[str] = None,
         notes: Optional[str] = None,
         section_id: Optional[int] = None,
-        created_by_user_id: Optional[int] = None
+        created_by_user_id: Optional[int] = None,
+        checkout_enabled: bool = False,
+        checkout_minutes: int = 10
     ) -> int:
         """
         Create a new session in the database.
@@ -68,7 +70,8 @@ class SessionRepository:
             notes: Additional notes (optional)
             section_id: Section whose class list is expected (optional)
             created_by_user_id: Account that created it (optional)
-        
+            checkout_enabled / checkout_minutes: automatic check-out in the last N minutes
+
         Returns:
             Database ID of the newly created session
         
@@ -78,9 +81,10 @@ class SessionRepository:
         query = """
             INSERT INTO sessions (
                 session_name, course_code, start_time, end_time,
-                late_threshold_minutes, status, created_by, notes, section_id, created_by_user_id
+                late_threshold_minutes, status, created_by, notes, section_id, created_by_user_id,
+                checkout_enabled, checkout_minutes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         
         try:
@@ -89,7 +93,8 @@ class SessionRepository:
                 cursor.execute(
                     query,
                     (session_name, course_code, start_time, end_time,
-                     late_threshold_minutes, status, created_by, notes, section_id, created_by_user_id)
+                     late_threshold_minutes, status, created_by, notes, section_id, created_by_user_id,
+                     int(checkout_enabled), checkout_minutes)
                 )
                 session_id = cursor.lastrowid
                 logger.info(f"Created session: {session_name} (ID: {session_id})")
@@ -184,7 +189,9 @@ class SessionRepository:
         notes: Optional[str] = None,
         clear_end_time: bool = False,
         section_id: Optional[int] = None,
-        clear_section: bool = False
+        clear_section: bool = False,
+        checkout_enabled: Optional[bool] = None,
+        checkout_minutes: Optional[int] = None
     ) -> int:
         """
         Update a session's information.
@@ -242,6 +249,14 @@ class SessionRepository:
             updates.append("notes = ?")
             params.append(notes)
         
+        if checkout_enabled is not None:
+            updates.append("checkout_enabled = ?")
+            params.append(int(checkout_enabled))
+
+        if checkout_minutes is not None:
+            updates.append("checkout_minutes = ?")
+            params.append(checkout_minutes)
+
         if clear_section:
             updates.append("section_id = NULL")
         elif section_id is not None:

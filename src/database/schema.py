@@ -134,7 +134,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     closed_at TIMESTAMP,
     notes TEXT,
     section_id INTEGER REFERENCES sections(id),
-    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    checkout_enabled BOOLEAN DEFAULT 0,
+    checkout_minutes INTEGER DEFAULT 10
 )
 """
 
@@ -151,9 +153,48 @@ CREATE TABLE IF NOT EXISTS attendance_records (
     verified_by TEXT,
     verified_at TIMESTAMP,
     notes TEXT,
+    left_early BOOLEAN DEFAULT 0,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
     FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
     UNIQUE(session_id, student_id)
+)
+"""
+
+# Check-out and spot checks: windows of time in which students who already
+# checked in show their face again. Times are local, like session times.
+# status: scheduled -> open -> done, or void (cancelled / nobody checked:
+# the camera was probably off, so nobody is flagged).
+CREATE_ATTENDANCE_CHECKS_TABLE = """
+CREATE TABLE IF NOT EXISTS attendance_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('checkout', 'spot')),
+    starts_at TIMESTAMP NOT NULL,
+    ends_at TIMESTAMP NOT NULL,
+    status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled', 'open', 'done', 'void')),
+    is_random BOOLEAN DEFAULT 0,
+    created_by TEXT,
+    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    camera_seen_at TIMESTAMP,
+    void_reason TEXT,
+    close_session_after BOOLEAN DEFAULT 0,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+)
+"""
+
+# Who showed their face during a check
+CREATE_CHECK_MARKS_TABLE = """
+CREATE TABLE IF NOT EXISTS check_marks (
+    check_id INTEGER NOT NULL,
+    student_id INTEGER NOT NULL,
+    marked_at TIMESTAMP NOT NULL,
+    detection_confidence REAL,
+    liveness_score REAL,
+    marked_by TEXT DEFAULT 'system',
+    PRIMARY KEY (check_id, student_id),
+    FOREIGN KEY (check_id) REFERENCES attendance_checks(id) ON DELETE CASCADE,
+    FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
 )
 """
 
@@ -215,6 +256,8 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance_records(student_id)",
     "CREATE INDEX IF NOT EXISTS idx_attendance_status ON attendance_records(status)",
     "CREATE INDEX IF NOT EXISTS idx_attendance_marked_at ON attendance_records(marked_at)",
+    "CREATE INDEX IF NOT EXISTS idx_checks_session ON attendance_checks(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_checks_status ON attendance_checks(status)",
     
     # Unknown faces indexes
     "CREATE INDEX IF NOT EXISTS idx_unknown_session ON unknown_faces(session_id)",
@@ -261,6 +304,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
         ("section_students", CREATE_SECTION_STUDENTS_TABLE),
         ("sessions", CREATE_SESSIONS_TABLE),
         ("attendance_records", CREATE_ATTENDANCE_RECORDS_TABLE),
+        ("attendance_checks", CREATE_ATTENDANCE_CHECKS_TABLE),
+        ("check_marks", CREATE_CHECK_MARKS_TABLE),
         ("unknown_faces", CREATE_UNKNOWN_FACES_TABLE),
         ("settings", CREATE_SETTINGS_TABLE),
     ]
@@ -292,6 +337,20 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN created_by_user_id INTEGER "
                      "REFERENCES users(id) ON DELETE SET NULL")
         logger.info("Added sessions.created_by_user_id")
+    if 'checkout_enabled' not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN checkout_enabled BOOLEAN DEFAULT 0")
+        conn.execute("ALTER TABLE sessions ADD COLUMN checkout_minutes INTEGER DEFAULT 10")
+        logger.info("Added sessions.checkout_enabled / checkout_minutes (off for existing sessions)")
+    record_columns = {row[1] for row in conn.execute("PRAGMA table_info(attendance_records)")}
+    if 'left_early' not in record_columns:
+        conn.execute("ALTER TABLE attendance_records ADD COLUMN left_early BOOLEAN DEFAULT 0")
+        logger.info("Added attendance_records.left_early")
+    check_columns = {row[1] for row in conn.execute("PRAGMA table_info(attendance_checks)")}
+    if check_columns and 'camera_seen_at' not in check_columns:
+        conn.execute("ALTER TABLE attendance_checks ADD COLUMN camera_seen_at TIMESTAMP")
+        conn.execute("ALTER TABLE attendance_checks ADD COLUMN void_reason TEXT")
+        conn.execute("ALTER TABLE attendance_checks ADD COLUMN close_session_after BOOLEAN DEFAULT 0")
+        logger.info("Added attendance_checks.camera_seen_at / void_reason / close_session_after")
     section_columns = {row[1] for row in conn.execute("PRAGMA table_info(sections)")}
     if 'instructor_id' not in section_columns:
         conn.execute("ALTER TABLE sections ADD COLUMN instructor_id INTEGER "
@@ -445,6 +504,8 @@ def verify_schema(database_path: Optional[Path] = None) -> bool:
         'section_students',
         'sessions',
         'attendance_records',
+        'attendance_checks',
+        'check_marks',
         'unknown_faces',
         'settings',
     ]

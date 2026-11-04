@@ -184,6 +184,11 @@ After signing in, the sidebar shows the pages your role may open:
 | The start time or late threshold of a session is edited | Every mark in it is re-checked as present or late against the new values |
 | A session has no end time | It stays active until someone closes it |
 | A session belongs to a **section** | Only the section's class list is expected and counted absent (students added to the list before the session started), plus anyone marked by hand. The camera marks only class-list students; it still recognises everyone, so a visitor is never mistaken for a look-alike on the list |
+| A session has **check-out** on (setting when creating / editing it, or on *Start session now*) | In its last N minutes (default 10) the camera asks everyone to show their face again (**CHECK-OUT** on the video). Needs an end time to start by itself; **🚪 Start check-out now** starts it by hand |
+| The instructor closes a session whose check-out hasn't run (e.g. no end time) | **⏹️ Close** asks first: **🚪 Check-out now, then close** runs the check-out and closes the session by itself when it ends, or **Close now, without check-out** |
+| The instructor presses **🔎 Spot check now** (or schedules one at a time / **at a random time**, hidden until it starts) | For a few minutes (default 5) students who already checked in show their face again (**SPOT CHECK**), with the same liveness test |
+| A check ends | Everyone present / late **before** it began but not seen during it becomes **🚪 Left early** (still counted as attended, shown in Session Details, statistics, CSV and PDF). Late arrivals aren't flagged for checks that ran before they came. A check the camera **never saw** (camera off the whole time) doesn't count, so nobody is flagged. With the camera on it counts even if nobody showed up |
+| The instructor disagrees | In Session Details set the student's Status to Present / Late (clears Left early) or to 🚪 Left early |
 | A session has **no section** (e.g. all sessions made before sections existed) | Every active student registered before it started is expected, as before |
 
 **Who counts as "expected" (and so as absent if not marked)?** Every active student who was registered before the session started, plus anyone who was marked in it. Courses / class lists are planned for a later phase; then only that class's students will be expected.

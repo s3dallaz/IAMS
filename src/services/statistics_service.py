@@ -210,6 +210,7 @@ class StatisticsService:
             'course_code': summary['course_code'] or '—',
             'section_id': session.get('section_id'),
             'section_name': session.get('section_name'),
+            'left_early_count': self.attendance_repo.count_left_early(session_id),
             'instructor_name': session.get('instructor_name'),
             'start_time': summary['start_time'],
             'end_time': summary.get('end_time'),

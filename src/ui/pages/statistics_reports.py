@@ -365,7 +365,9 @@ def render_session_course_tab(
     
     # Metrics: the same numbers as Session Management -> Session Details
     started = sess_stats['absence_supported']
-    c = st.columns(6)
+    c = st.columns(7)
+    c[6].metric("Left early", sess_stats.get('left_early_count', 0),
+                help="Checked in, but missed a check-out or spot check")
     c[0].metric("Expected", f"{sess_stats['expected_students']:,}" if started else "—")
     c[1].metric("Present", sess_stats['present_count'])
     c[2].metric("Late", sess_stats['late_count'])
@@ -413,7 +415,7 @@ def render_session_course_tab(
                 'Student ID': r.get('student_id', '—'),
                 'Name': r.get('student_name', '—'),
                 'Department': r.get('student_department', '—'),
-                'Status': STATUS_LABELS.get(r.get('status'), r.get('status')),
+                'Status': "🚪 Left early" if r.get('left_early') else STATUS_LABELS.get(r.get('status'), r.get('status')),
                 'Marked Time': format_datetime(r.get('marked_at')),
                 'Confidence': f"{r.get('detection_confidence', 0):.2f}" if r.get('detection_confidence') is not None else '—',
                 'Liveness': f"{r.get('liveness_score', 0):.2f}" if r.get('liveness_score') is not None else '—',
@@ -572,7 +574,7 @@ def render_filterable_history_tab(
             'Student Name': r['student_name'],
             'Course': r.get('course_code') or '—',
             'Session': r['session_name'],
-            'Status': "✅ Present" if r['status'] == 'present' else "⏰ Late",
+            'Status': "🚪 Left early" if r.get('left_early') else ("✅ Present" if r['status'] == 'present' else "⏰ Late"),
             'Marked At': format_datetime(r['marked_at']),
             'Confidence': f"{r.get('detection_confidence', 0):.2f}" if r.get('detection_confidence') is not None else '—',
             'Liveness': f"{r.get('liveness_score', 0):.2f}" if r.get('liveness_score') is not None else '—',

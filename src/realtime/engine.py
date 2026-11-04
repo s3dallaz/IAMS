@@ -49,6 +49,7 @@ from src.computer_vision.camera_devices import CameraNotFoundError, create_camer
 from src.computer_vision.camera_manager import CameraManager
 from src.computer_vision.liveness_detector import LivenessState
 from src.realtime.protocol import result_to_dict
+from src.services.check_service import CheckService
 from src.services.course_service import CourseService
 from src.services.enrollment_service import EnrollmentService
 from src.services.session_service import SessionService, SessionStatus
@@ -67,19 +68,29 @@ GALLERY_RELOAD_SECONDS = 30.0   # students enrolled during a session are picked 
 GALLERY_RETRY_SECONDS = 5.0     # retry of a failed first gallery load
 MARK_BANNER_SECONDS = 3.0       # how long "Marked: <name>" stays on the video
 SESSION_CHECK_SECONDS = 5.0     # the engine stops once its session is closed or deleted
+CHECK_POLL_SECONDS = 2.0        # how soon a spot check / check-out shows up on the video
 PERF_LOG_FRAMES = 150
+
+# On-video title of a running check, per kind
+CHECK_TITLES = {'checkout': "CHECK-OUT", 'spot': "SPOT CHECK"}
 
 # Instruction bar colours (BGR)
 GREEN, RED, ORANGE, YELLOW, BLUE, WHITE = (60, 180, 75), (40, 40, 220), (0, 140, 255), (0, 200, 255), (220, 140, 40), (255, 255, 255)
 
 
-def instruction_bar(result: RealTimeAttendanceResult, last_mark: Optional[Dict[str, Any]], now: float):
-    """Text and colour of the bar drawn under the video, or (None, None) for nothing."""
+def instruction_bar(result: RealTimeAttendanceResult, last_mark: Optional[Dict[str, Any]], now: float,
+                    open_check: Optional[str] = None):
+    """
+    Text and colour of the bar drawn under the video, or (None, None) for
+    nothing. open_check: the kind of check now running ('checkout' / 'spot').
+    """
     if last_mark and now - last_mark["time"] < MARK_BANNER_SECONDS:
         return f"MARKED: {last_mark['name']} ({last_mark['status']})", GREEN
     if result.multiple_faces:
         return "Multiple faces - please step up one at a time", ORANGE
     if not result.processed_faces:
+        if open_check:
+            return f"{CHECK_TITLES.get(open_check, 'CHECK')} - everyone please show your face", ORANGE
         return None, None
     face = result.processed_faces[0]
     if face.reason.startswith(SPOOF_RECHECK_PREFIX):
@@ -157,6 +168,7 @@ class VisionEngine:
         self.camera: Optional[CameraManager] = None
         self.manager: Optional[RealTimeAttendanceManager] = None
         self._last_mark: Optional[Dict[str, Any]] = None
+        self._open_check_kind: Optional[str] = None   # the check now running, for the video bar
         self._gallery_signature: Optional[str] = None
         self._gallery_ready = threading.Event()
         self._gallery_error: Optional[str] = None
@@ -233,6 +245,7 @@ class VisionEngine:
         # Before the first frame: never a moment where anyone could be marked
         try:
             self._apply_class_list(SessionService().get_session(self.session_id))
+            self._apply_open_check()
         except Exception as e:
             self._set_status(state="error", error=f"Could not load the session's class list: {e}")
             return False
@@ -243,6 +256,7 @@ class VisionEngine:
         threading.Thread(target=self._gil_probe, name="gil-probe", daemon=True).start()
         threading.Thread(target=self._gallery_loop, name="gallery", daemon=True).start()
         threading.Thread(target=self._session_watch, name="session-watch", daemon=True).start()
+        threading.Thread(target=self._check_watch, name="check-watch", daemon=True).start()
         self._set_status(state="running", error=None)
         logger.info(f"Vision engine running for session #{self.session_id}")
         return True
@@ -267,7 +281,7 @@ class VisionEngine:
                     manager.refresh_liveness_display(result)
                     now = time.time()
                     self._remember_mark(result, now)
-                    text, color = instruction_bar(result, self._last_mark, now)
+                    text, color = instruction_bar(result, self._last_mark, now, self._open_check_kind)
                 else:
                     # Recognition waits for the gallery: with an empty one every
                     # student would be shown as "Unknown person - not enrolled"
@@ -350,12 +364,34 @@ class VisionEngine:
             except Exception as e:
                 logger.warning(f"Could not refresh the class list of session #{self.session_id}: {e}")
 
+    def _check_watch(self) -> None:
+        """Pick up a check-out / spot check that opened or closed (and tell it the camera is on)."""
+        while not self._stop.wait(CHECK_POLL_SECONDS):
+            try:
+                self._apply_open_check()
+            except Exception as e:
+                logger.warning(f"Could not refresh the checks of session #{self.session_id}: {e}")
+
     def _apply_class_list(self, session: Optional[Dict[str, Any]]) -> None:
         """Let the manager mark only the section's class list (everyone when the session has no section)."""
         section_id = session.get('section_id') if session else None
         allowed = CourseService().get_class_list_student_ids(section_id) if section_id else None
         self.manager.set_class_list(allowed)
         self._set_status(class_list_size=None if allowed is None else len(allowed))
+
+    def _apply_open_check(self) -> None:
+        """Tell the manager which check is running (if any) and who was already seen in it."""
+        check = CheckService().get_open_check(self.session_id)
+        if check is None:
+            self.manager.set_open_check(None)
+            self._open_check_kind = None
+        else:
+            self.manager.set_open_check(check, CheckService().checked_student_ids(check['id']))
+            self._open_check_kind = check['kind']
+            if not check.get('camera_seen_at'):
+                CheckService().camera_saw(check['id'])   # the camera is on: this check counts
+        self._set_status(open_check=None if check is None else {
+            'id': check['id'], 'kind': check['kind'], 'ends_at': check['ends_at']})
 
     def _on_gallery_progress(self, done: int, total: int) -> None:
         if not self._gallery_ready.is_set():  # reloads during the session run silently
@@ -376,8 +412,12 @@ class VisionEngine:
     def _remember_mark(self, result: RealTimeAttendanceResult, now: float) -> None:
         """Keep the latest new attendance mark for the on-video banner."""
         for face in result.processed_faces:
+            # A check mark has no attendance_id: the status tells it apart from the check-in
             if face.attendance_marked and (self._last_mark is None or
-                                           self._last_mark.get("attendance_id") != face.attendance_id):
+                                           (self._last_mark.get("attendance_id"), self._last_mark.get("status"),
+                                            self._last_mark.get("student_id"))
+                                           != (face.attendance_id, (face.attendance_status or "present").upper(),
+                                               face.student_id)):
                 self._last_mark = {
                     "name": face.student_name or face.identity,
                     "student_id": face.student_id,

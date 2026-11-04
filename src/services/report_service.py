@@ -121,7 +121,7 @@ class ReportService:
                 r.get('session_name', ''),
                 r.get('session_start_time', ''),
                 r.get('marked_at', ''),
-                r.get('status', '').upper(),
+                r.get('status', '').upper() + (" (LEFT EARLY)" if r.get('left_early') else ""),
                 f"{r.get('detection_confidence', 0):.2f}" if r.get('detection_confidence') is not None else '',
                 f"{r.get('liveness_score', 0):.2f}" if r.get('liveness_score') is not None else '',
                 r.get('marked_by', ''),
@@ -209,6 +209,7 @@ class ReportService:
         writer.writerow(["Total Marked", session_stats.get('total_marked', 0)])
         writer.writerow(["Present Count", session_stats.get('present_count', 0)])
         writer.writerow(["Late Count", session_stats.get('late_count', 0)])
+        writer.writerow(["Left Early (missed a check)", session_stats.get('left_early_count', 0)])
         writer.writerow(["Absences", session_stats.get('absent_count') if started else not_started])
         writer.writerow(["Attendance Rate", _rate(session_stats.get('attendance_percentage')) if started else not_started])
         writer.writerow([])
@@ -345,7 +346,7 @@ class ReportService:
                 pdf.cell(30, 6, str(r.get('course_code') or '—')[:15], border=1, fill=fill_row)
                 pdf.cell(45, 6, str(r.get('marked_at', '—'))[:19], border=1, align='C', fill=fill_row)
                 
-                status_val = str(r.get('status', '—')).upper()
+                status_val = "LEFT EARLY" if r.get('left_early') else str(r.get('status', '—')).upper()
                 pdf.cell(25, 6, status_val, border=1, align='C', fill=fill_row)
                 pdf.cell(25, 6, marked_by_label(r.get('marked_by'), r.get('verified_by'))[:14] or '—',
                          border=1, align='C', fill=fill_row)

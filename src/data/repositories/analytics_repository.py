@@ -323,6 +323,7 @@ class AnalyticsRepository:
                 a.verified_by,
                 a.verified_at,
                 a.notes,
+                COALESCE(a.left_early, 0) AS left_early,
                 s.id AS student_db_id,
                 s.student_id,
                 s.name AS student_name,

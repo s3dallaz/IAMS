@@ -245,6 +245,9 @@ def _render_start_now(section: Dict[str, Any]):
                            help="The session closes by itself at this time today. Empty: close it by hand.")
         col_late.number_input("Late after (minutes)", min_value=0, max_value=120, value=15,
                               key=f"start_now_late_{section['id']}")
+        st.checkbox("🚪 Check-out in the last 10 minutes (needs an end time)", key=f"start_now_checkout_{section['id']}",
+                    help="Everyone shows their face again before leaving; whoever checked in but doesn't is "
+                         "marked Left early.")
         st.button("▶️ Start and open the camera page", key=f"start_now_btn_{section['id']}", type="primary",
                   width="stretch", disabled=not section['student_count'],
                   on_click=_start_section_now, args=(section['id'],))
@@ -270,6 +273,7 @@ def _start_section_now(section_id: int):
             late_threshold_minutes=int(st.session_state.get(f"start_now_late_{section_id}", 15)),
             created_by=user['full_name'] if user else None,
             created_by_user_id=user['id'] if user else None,
+            checkout_enabled=bool(st.session_state.get(f"start_now_checkout_{section_id}")),
         )
     except Exception as e:
         logger.error(f"Could not start a session for section {section_id}: {e}")

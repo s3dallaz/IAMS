@@ -32,6 +32,7 @@ from src.services.attendance_service import (
 from src.services.course_service import CourseService
 from src.services.student_service import StudentService
 from src.ui.access import owns_session, sees_everything, visible_sessions
+from src.ui.pages.checks_panel import render_checks_panel, render_close_session
 from src.ui.pages.login import current_user
 from src.utils.logger import get_logger
 
@@ -49,7 +50,9 @@ CREATE_FORM_VERSION_KEY = "create_session_form_version"
 
 NO_SECTION = 0              # course picker option: no course / section, every student is expected
 ADD_SEARCH_RESULTS = 30     # students offered when adding someone who is not on the class list
-ROSTER_MAX_ROWS = 500       # students sent to the browser at most; filter / search find the rest
+ROSTER_MAX_ROWS = 500
+CHECKOUT_HELP = ("In its last minutes the session asks everyone to show their face again; whoever checked in "
+                 "but doesn't is marked Left early. Starts by itself when the session has an end time.")       # students sent to the browser at most; filter / search find the rest
 STATUS_CHECK_SECONDS = 10   # an open page notices a scheduled start / automatic close this fast
 
 STATUS_BADGES = {
@@ -256,6 +259,9 @@ def render_create_session_tab(session_service: SessionService):
                 step=1,
                 help="Minutes after start time before student is considered late"
             )
+            checkout_enabled = st.checkbox("🚪 Check-out at the end", value=False, help=CHECKOUT_HELP)
+            checkout_minutes = st.number_input("Check-out minutes", min_value=1, max_value=60, value=10,
+                                               help="How long before the end time the check-out starts")
 
         notes = st.text_area(
             "Session Notes",
@@ -287,7 +293,9 @@ def render_create_session_tab(session_service: SessionService):
             created_by=created_by,
             notes=notes,
             section_id=section['id'] if section else None,
-            created_by_user_id=user['id']
+            created_by_user_id=user['id'],
+            checkout_enabled=checkout_enabled,
+            checkout_minutes=int(checkout_minutes)
         )
 
 
@@ -363,6 +371,8 @@ def render_session_details_tab(
     _render_session_actions(session_service, session, show_view=False)
 
     st.markdown("---")
+    render_checks_panel(session, key=f"details_checks_{session['id']}")
+    st.markdown("---")
 
     # Session Attendance Summary Metrics: counted over the same roster the
     # table below lists, so the numbers always match the table
@@ -377,12 +387,14 @@ def render_session_details_tab(
     rate = f"{attended / counts['expected'] * 100:.0f}%" if counts['expected'] else "—"
 
     st.markdown("### 📊 Session Summary")
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(6)
     metric_cols[0].metric("Expected", counts['expected'])
     metric_cols[1].metric("Present", counts[AttendanceStatus.PRESENT])
     metric_cols[2].metric("Late", counts[AttendanceStatus.LATE])
     metric_cols[3].metric("Absent", counts[AttendanceStatus.ABSENT])
     metric_cols[4].metric("Attendance", rate)
+    metric_cols[5].metric("Left early", attendance_service.count_left_early(selected_id),
+                          help="Checked in, but missed a check-out or spot check. They count as attended.")
 
     if session.get('section_id'):
         roster_note = (f"Expected students: the class list of section **{session['section_name']}** "
@@ -409,6 +421,16 @@ def render_session_details_tab(
         return
 
     _render_roster(attendance_service, selected_id, session['status'], counts)
+
+
+LEFT_EARLY_LABEL = "🚪 Left early"
+
+
+def status_label(row: Dict[str, Any]) -> str:
+    """The Status shown for a roster row: Present / Late / Absent, or Left early when flagged."""
+    if row.get('left_early') and row['status'] in (AttendanceStatus.PRESENT, AttendanceStatus.LATE):
+        return LEFT_EARLY_LABEL
+    return ATTENDANCE_LABELS.get(row['status'], row['status'])
 
 
 def _render_add_unlisted_student(attendance_service: AttendanceService, session: Dict[str, Any]):
@@ -498,7 +520,7 @@ def _render_roster(
     rows = rows[:ROSTER_MAX_ROWS]
 
     table = [{
-        'Status': ATTENDANCE_LABELS.get(r['status'], r['status']),
+        'Status': status_label(r),
         'Student ID': r['student_id'],
         'Student Name': r['name'],
         'Marked At': format_datetime(r['marked_at']) if r['marked_at'] else "",
@@ -522,7 +544,7 @@ def _render_roster(
         # A new key after each save: the editor starts clean on the re-sorted rows
         editor_key = f"roster_editor_{session_id}_{st.session_state.get(ROSTER_EDIT_VERSION_KEY, 0)}"
         column_config['Status'] = st.column_config.SelectboxColumn(
-            'Status', options=list(ATTENDANCE_LABELS.values()), required=True
+            'Status', options=list(ATTENDANCE_LABELS.values()) + [LEFT_EARLY_LABEL], required=True
         )
         st.data_editor(
             table, width="stretch", hide_index=True, height=height, key=editor_key, placeholder="",
@@ -549,15 +571,22 @@ def _save_status_changes(
     status_by_label = {label: status for status, label in ATTENDANCE_LABELS.items()}
     changed, errors = [], []
     for index, change in edited.items():
-        new_status = status_by_label.get(change.get('Status'))
-        if new_status is None or not (0 <= int(index) < len(rows)):
+        new_label = change.get('Status')
+        if not (0 <= int(index) < len(rows)) or new_label == status_label(rows[int(index)]):
             continue
         row = rows[int(index)]
-        if new_status == row['status']:
-            continue
         try:
-            attendance_service.set_attendance_manually(session_id, row['student_db_id'], new_status)
-            changed.append(f"{row['name']} → {ATTENDANCE_LABELS[new_status]}")
+            if new_label == LEFT_EARLY_LABEL:      # keeps present / late, adds the flag
+                attendance_service.set_left_early(session_id, row['student_db_id'], True)
+            else:
+                new_status = status_by_label.get(new_label)
+                if new_status is None:
+                    continue
+                if new_status != row['status']:
+                    attendance_service.set_attendance_manually(session_id, row['student_db_id'], new_status)
+                if row.get('left_early') and new_status != AttendanceStatus.ABSENT:
+                    attendance_service.set_left_early(session_id, row['student_db_id'], False)
+            changed.append(f"{row['name']} → {new_label}")
         except Exception as e:
             logger.error(f"Could not change attendance of {row['name']}: {e}")
             errors.append(f"{row['name']}: {e}")
@@ -592,9 +621,8 @@ def _render_session_actions(session_service: SessionService, session: Dict[str, 
         elif status == SessionStatus.ACTIVE:
             # Closing is final: a closed session cannot be reopened
             with st.popover("⏹️ Close", width="stretch"):
-                st.write("Closing ends attendance for this session. It cannot be reopened.")
-                if st.button("Close session", key=f"close_{session_id}", type="primary"):
-                    handle_close_session(session_service, session_id)
+                render_close_session(session, f"close_{session_id}",
+                                     lambda: handle_close_session(session_service, session_id))
         else:
             st.button("✔️ Closed", key=f"closed_{session_id}", width="stretch", disabled=True)
 
@@ -663,6 +691,11 @@ def _edit_session_dialog(session_service: SessionService, session: Dict[str, Any
                                          help="Optional; clear it for no end time")
         late_threshold = st.number_input("Late Threshold (Minutes)", min_value=0, max_value=120,
                                          value=int(session.get('late_threshold_minutes') or 15))
+        col_checkout, col_minutes = st.columns(2)
+        checkout_enabled = col_checkout.checkbox("🚪 Check-out at the end",
+                                                 value=bool(session.get('checkout_enabled')), help=CHECKOUT_HELP)
+        checkout_minutes = col_minutes.number_input("Check-out minutes", min_value=1, max_value=60,
+                                                    value=int(session.get('checkout_minutes') or 10))
         notes = st.text_area("Session Notes", value=session.get('notes') or "")
         submitted = st.form_submit_button("Save Changes", type="primary", width="stretch")
 
@@ -684,6 +717,8 @@ def _edit_session_dialog(session_service: SessionService, session: Dict[str, Any
     new_start = datetime.combine(start_date, start_time_val)
     changes['start_time'] = new_start.strftime(DB_DATETIME_FORMAT)
     changes['late_threshold_minutes'] = int(late_threshold)
+    changes['checkout_enabled'] = bool(checkout_enabled)
+    changes['checkout_minutes'] = int(checkout_minutes)
     if end_time_val is None:
         changes['clear_end_time'] = end_dt is not None
     else:
@@ -733,7 +768,9 @@ def handle_create_session(
     created_by: Optional[str],
     notes: Optional[str],
     section_id: Optional[int] = None,
-    created_by_user_id: Optional[int] = None
+    created_by_user_id: Optional[int] = None,
+    checkout_enabled: bool = False,
+    checkout_minutes: int = 10
 ):
     """Handle creating a new session through SessionService."""
     try:
@@ -759,7 +796,9 @@ def handle_create_session(
             created_by=created_by if created_by else None,
             notes=notes if notes else None,
             section_id=section_id,
-            created_by_user_id=created_by_user_id
+            created_by_user_id=created_by_user_id,
+            checkout_enabled=checkout_enabled,
+            checkout_minutes=checkout_minutes
         )
 
         logger.info(f"Session created via UI: ID {session_id}")

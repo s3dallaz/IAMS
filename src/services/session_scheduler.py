@@ -14,6 +14,8 @@ import threading
 from typing import Optional
 
 import config
+from src.database.schema import initialize_database
+from src.services.check_service import CheckService
 from src.services.session_service import SessionService
 from src.utils.logger import get_logger
 
@@ -37,11 +39,17 @@ def _running_thread() -> Optional[threading.Thread]:
 
 
 def _run(poll_seconds: float) -> None:
+    # The timer can start before any page is opened: add new tables / columns
+    # (e.g. for checks) first, so its queries don't fail until then
+    if config.DATABASE_PATH.exists():
+        initialize_database()
     service = SessionService()
+    checks = CheckService()
     while not _stop.is_set():
         try:
             if config.DATABASE_PATH.exists():  # app.py creates it on the first start
                 service.apply_scheduled_transitions()
+                checks.apply_due()   # open / close check-outs and spot checks on time
         except Exception as e:
             logger.error(f"Session scheduler check failed (retrying): {e}")
         _stop.wait(poll_seconds)

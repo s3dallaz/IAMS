@@ -590,6 +590,26 @@ class AttendanceService:
             raise InvalidAttendanceDataError("session_id must be a positive integer")
         return self.attendance_repo.get_session_status_counts(session_id)
 
+    def set_left_early(self, session_id: int, student_id: int, left_early: bool,
+                       changed_by: str = MANUAL_MARKER) -> None:
+        """
+        Set or clear 'left early' by hand (e.g. the student had a good reason
+        to leave, or the instructor saw them leave). Only for a student marked
+        present / late in the session.
+
+        Raises:
+            InvalidAttendanceDataError: The student is not marked in this session
+        """
+        existing = self.attendance_repo.get_by_session_and_student(session_id, student_id)
+        if not existing or existing['status'] not in (AttendanceStatus.PRESENT, AttendanceStatus.LATE):
+            raise InvalidAttendanceDataError("Only a student marked present or late can be set to 'left early'.")
+        self.attendance_repo.set_left_early(existing['id'], left_early, verified_by=changed_by)
+        logger.info(f"Session {session_id}: student {student_id} left_early={left_early} by {changed_by}")
+
+    def count_left_early(self, session_id: int) -> int:
+        """How many present / late students of the session are flagged 'left early'."""
+        return self.attendance_repo.count_left_early(session_id)
+
     def set_attendance_manually(
         self,
         session_id: int,

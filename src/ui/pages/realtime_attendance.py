@@ -43,6 +43,7 @@ from src.services.enrollment_service import EnrollmentService
 from src.realtime.engine_client import EngineController
 from src.ui.access import visible_sessions
 from src.ui.pages.camera_picker import render_camera_picker
+from src.ui.pages.checks_panel import render_checks_panel, render_close_session
 from src.ui.pages.login import current_user
 from src.realtime.protocol import result_from_dict
 from src.utils.logger import get_logger
@@ -202,15 +203,19 @@ def render_realtime_attendance():
                 except Exception as e:
                     st.error(f"Failed to activate session: {e}")
         elif is_active:
-            if st.button("⏹️ Close Session", width="stretch"):
+            def close_now():
                 try:
                     session_service.close_session(selected_session_id)
-                    _get_engine().stop()
-                    st.session_state.att_camera_active = False
-                    st.success(f"Session #{selected_session_id} closed!")
-                    st.rerun()
                 except Exception as e:
                     st.error(f"Failed to close session: {e}")
+                    return
+                _get_engine().stop()
+                st.session_state.att_camera_active = False
+                st.success(f"Session #{selected_session_id} closed!")
+                st.rerun()
+
+            with st.popover("⏹️ Close Session", width="stretch"):
+                render_close_session(selected_session, "att_close", close_now)
 
     # Display selected session banner
     if selected_session:
@@ -232,6 +237,7 @@ def render_realtime_attendance():
         if is_scheduled:
             st.caption(f"⏰ Starts automatically at {selected_session['start_time']}. "
                        f"The camera can be started once the session is active.")
+        render_checks_panel(selected_session, key="att_checks")
 
     st.markdown("---")
 

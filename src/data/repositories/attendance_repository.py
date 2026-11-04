@@ -301,6 +301,19 @@ class AttendanceRepository:
             logger.error(f"Database error updating attendance: {e}")
             raise
     
+    def set_left_early(self, attendance_id: int, left_early: bool, verified_by: Optional[str] = None) -> int:
+        """Set or clear the 'left early' flag of a record (a missed check-out / spot check)."""
+        with get_db_connection(self.database_path) as conn:
+            return conn.execute(
+                "UPDATE attendance_records SET left_early = ?, verified_by = COALESCE(?, verified_by), "
+                "verified_at = CASE WHEN ? IS NULL THEN verified_at ELSE CURRENT_TIMESTAMP END WHERE id = ?",
+                (int(left_early), verified_by, verified_by, attendance_id)).rowcount
+
+    def count_left_early(self, session_id: int) -> int:
+        with get_db_connection(self.database_path) as conn:
+            return conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id = ? AND left_early = 1 "
+                                "AND status IN ('present', 'late')", (session_id,)).fetchone()[0]
+
     def delete_attendance(self, attendance_id: int) -> int:
         """
         Delete an attendance record (the student then counts as absent).
@@ -427,7 +440,8 @@ class AttendanceRepository:
         query = f"""
             SELECT s.id AS student_db_id, s.student_id, s.name, s.department,
                    COALESCE(a.status, 'absent') AS status, a.id AS record_id, a.marked_at,
-                   a.detection_confidence, a.liveness_score, a.marked_by, a.verified_by, a.notes
+                   a.detection_confidence, a.liveness_score, a.marked_by, a.verified_by, a.notes,
+                   COALESCE(a.left_early, 0) AS left_early
             {self._ROSTER_FROM}
         """
         params: Dict[str, Any] = {'session_id': session_id}

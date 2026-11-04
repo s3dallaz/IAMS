@@ -42,6 +42,7 @@ from src.services.attendance_service import (
     SessionNotAcceptingAttendanceError,
     InvalidAttendanceDataError
 )
+from src.services.check_service import CheckError, CheckService
 from src.services.session_service import SessionService, SessionStatus
 from src.services.student_service import StudentService
 from src.services.enrollment_service import EnrollmentService
@@ -53,6 +54,9 @@ logger = get_logger(__name__)
 # Start of the reason shown while a suspected spoof is being checked again
 # (the UI shows it as a recheck, not a final rejection)
 SPOOF_RECHECK_PREFIX = "Spoof suspected - rechecking"
+
+# What a check mark is called on screen, per check kind
+CHECK_LABELS = {'checkout': "checked out", 'spot': "spot check"}
 
 # Reason for a recognised student who is not on the session's class list
 NOT_IN_CLASS_REASON = "Not in this class - not on the section's class list"
@@ -279,6 +283,7 @@ class RealTimeAttendanceManager:
         self.attendance_service = attendance_service or AttendanceService(database_path)
         self.session_service = session_service or SessionService(database_path)
         self.student_service = student_service or StudentService(database_path)
+        self.check_service = CheckService(database_path)
 
         # Initialize CV components (lazy/injected)
         self.face_detector = face_detector
@@ -305,6 +310,12 @@ class RealTimeAttendanceManager:
         # Recognition still uses the whole gallery: an outsider is recognised as
         # themselves (and refused) instead of matching a look-alike on the list.
         self._class_list: Optional[frozenset] = None
+        # The check-out / spot check now running (None: none), and the students
+        # already seen in it. During a check, students who already checked in
+        # show their face again (with the liveness test) instead of being told
+        # "already marked".
+        self._open_check: Optional[Dict[str, Any]] = None
+        self._check_done: Set[int] = set()
 
         # Per-session student-record cache: identity_string -> student dict (or None if not found).
         # Avoids a SQLite round-trip on every CV frame for the same recognized identity.
@@ -462,6 +473,20 @@ class RealTimeAttendanceManager:
             )
         except Exception as e:
             logger.warning(f"Could not pre-load attendance for session {session_id}: {e}")
+
+    def set_open_check(self, check: Optional[Dict[str, Any]], checked_ids: Optional[Set[int]] = None) -> None:
+        """
+        The check now running in the session (a dict with id and kind) and who
+        was already seen in it; None when no check runs. Safe to call from
+        another thread.
+        """
+        self._check_done = set(checked_ids or ())
+        self._open_check = check
+
+    def _check_pending(self, student_db_id: int) -> bool:
+        """True if a check is running and this checked-in student still has to show up for it."""
+        check = self._open_check
+        return check is not None and student_db_id not in self._check_done
 
     def set_class_list(self, student_db_ids: Optional[Set[int]]) -> None:
         """
@@ -1387,7 +1412,7 @@ class RealTimeAttendanceManager:
         # Step D: In-memory duplicate cache. Checked before liveness because
         # liveness restarts after each mark: a student who is already marked
         # is told so instead of being asked to blink and turn again.
-        if student_db_id in self._marked_students:
+        if student_db_id in self._marked_students and not self._check_pending(student_db_id):
             return FaceProcessingResult(
                 bbox=bbox,
                 detection_confidence=det_conf,
@@ -1412,7 +1437,8 @@ class RealTimeAttendanceManager:
         # Step D2: Only students on the session's class list are marked. Told
         # before liveness, so they are not asked to blink for nothing.
         class_list = self._class_list
-        if class_list is not None and student_db_id not in class_list:
+        if (class_list is not None and student_db_id not in class_list
+                and student_db_id not in self._marked_students):   # marked by hand: may take checks
             not_listed = FaceProcessingResult(
                 bbox=bbox,
                 detection_confidence=det_conf,
@@ -1544,6 +1570,42 @@ class RealTimeAttendanceManager:
                 self._tracked_face.update(distance=fresh_distance, verified_at=current_time)
 
         self._cooldown_tracker[student_db_id] = current_time
+
+        # Step G2: A running check: a student who already checked in is seen again
+        check = self._open_check
+        if check is not None and student_db_id in self._marked_students:
+            try:
+                self.check_service.record_mark(check['id'], student_db_id, detection_confidence=det_conf,
+                                               liveness_score=liveness_confidence, marked_by=self.marked_by)
+            except CheckError as e:   # the check ended meanwhile
+                logger.info(f"Check mark for {identity} not recorded: {e}")
+                self._open_check = None
+            else:
+                self._check_done.add(student_db_id)
+                self._reset_liveness()
+                label = CHECK_LABELS.get(check['kind'], "check")
+                logger.info(f"{label} recorded: student {identity} (DB: {student_db_id}) in session {target_session}")
+                return FaceProcessingResult(
+                    bbox=bbox,
+                    detection_confidence=det_conf,
+                    identity=identity,
+                    is_recognized=True,
+                    recognition_distance=distance,
+                    student_id=student_id_str,
+                    student_db_id=student_db_id,
+                    student_name=student_name,
+                    liveness_state=liveness_state,
+                    liveness_confidence=liveness_confidence,
+                    blink_count=blinks_detected,
+                    min_blinks_required=min_blinks,
+                    challenge_type=challenge_progress['challenge_type'],
+                    challenge_state=challenge_progress['challenge_state'],
+                    challenge_progress=challenge_progress['progress_percent'],
+                    attendance_marked=True,
+                    attendance_status=label,
+                    already_marked=False,
+                    reason=f"{label.capitalize()} recorded"
+                )
 
         # Step H: Mark Attendance via AttendanceService
         try:
