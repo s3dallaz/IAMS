@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.data.repositories.course_repository import CourseRepository
 from src.data.repositories.user_repository import UserRepository
 from src.utils.logger import get_logger
 
@@ -347,7 +348,10 @@ class AuthService:
         if user['id'] == actor['id'] and role != user['role']:
             raise PermissionDeniedError("You can't change your own role.")
         self._keep_one_it(user, new_role=role)
-        self.repository.update_user(user_id, self._clean_name(full_name), role)
+        full_name = self._clean_name(full_name)
+        self.repository.update_user(user_id, full_name, role)
+        if full_name != user['full_name']:   # sections show their instructor's name
+            CourseRepository(self.repository.database_path).rename_instructor(user_id, full_name)
 
     def set_active(self, actor: Dict[str, Any], user_id: int, active: bool) -> None:
         user = self._require_manageable(actor, user_id)

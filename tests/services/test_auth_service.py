@@ -209,9 +209,12 @@ def test_duplicate_username_is_refused(auth, people):
 
 def test_pages_per_role(people):
     teacher_pages = pages_for(people['teacher'])
-    assert teacher_pages == ["Home", "Real-Time Attendance", "Session Management", "Statistics & Reports"]
+    assert teacher_pages == ["Home", "My Classes", "Real-Time Attendance", "Session Management",
+                             "Statistics & Reports"]
     assert "Users" in pages_for(people['admin']) and "Student Registry" in pages_for(people['admin'])
     assert pages_for(people['it']) == pages_for(people['admin'])
+    assert "My Classes" not in pages_for(people['admin'])                  # no sections linked to them
+    assert "My Classes" in pages_for(people['admin'], teaches=True)       # an admin who also teaches
     assert not can_open(people['teacher'], "Users") and not can_open(None, "Home")
 
 

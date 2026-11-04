@@ -469,7 +469,7 @@ def test_render_session_management_page(mock_tabs, mock_get_sessions, mock_overv
     mock_overview.return_value = []
     mock_tabs.return_value = [MagicMock(), MagicMock(), MagicMock()]
     
-    with patch("streamlit.session_state", {}):
+    with patch("streamlit.session_state", {'auth_user': {'id': 1, 'username': 'admin', 'full_name': 'Admin', 'role': 'admin'}}):   # signed in as an admin
         render_session_management()
         mock_tabs.assert_called_once()
 

@@ -13,6 +13,7 @@ import config
 from src.utils.logger import get_logger
 from src.database.schema import initialize_database
 from src.services.auth_service import AuthService
+from src.services.course_service import CourseService
 from src.services.session_scheduler import start_session_scheduler
 from src.ui.access import pages_for
 from src.ui.pages.login import (
@@ -83,7 +84,8 @@ def main():
 
     # Sidebar navigation: only the pages this user's role may open. A page
     # chosen elsewhere (e.g. a Home button) that they may not open falls back to the first.
-    pages = pages_for(user)
+    teaches = bool(CourseService().instructor_sections(user['id']))   # Admin / IT who also teach get My Classes
+    pages = pages_for(user, teaches=teaches)
     if st.session_state.get("navigation") not in pages:
         st.session_state["navigation"] = pages[0]
     st.sidebar.title("Navigation")
@@ -93,6 +95,8 @@ def main():
     # Render selected page
     if page == "Home":
         render_home_page()
+    elif page == "My Classes":
+        render_my_classes_page()
     elif page == "Real-Time Attendance":
         render_realtime_attendance_page()
     elif page == "Session Management":
@@ -113,6 +117,12 @@ def render_home_page():
     """Render the Home page."""
     from src.ui.pages.home import render_home
     render_home()
+
+
+def render_my_classes_page():
+    """Render the My Classes page."""
+    from src.ui.pages.my_classes import render_my_classes
+    render_my_classes()
 
 
 def render_student_registry_page():

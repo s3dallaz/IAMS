@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from src.data.repositories.course_repository import CourseRepository
+from src.data.repositories.user_repository import UserRepository
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -76,6 +77,7 @@ class CourseService:
 
     def __init__(self, database_path: Optional[Path] = None):
         self.repository = CourseRepository(database_path)
+        self.user_repository = UserRepository(database_path)
 
     # ------------------------------------------------------------------------
     # Courses
@@ -157,19 +159,24 @@ class CourseService:
     # ------------------------------------------------------------------------
 
     def create_section(self, course_id: int, name: str, instructor_name: Optional[str] = None,
-                       notes: Optional[str] = None) -> int:
+                       notes: Optional[str] = None, instructor_id: Optional[int] = None) -> int:
         """
+        Args:
+            instructor_id: The instructor's account (they then see and run the
+                section); its name replaces instructor_name
+
         Raises:
             CourseNotFoundError, InvalidCourseDataError,
             DuplicateCourseError: If the course already has a section with this name
         """
         course = self._require_course(course_id)
         name = clean_section_name(name)
-        instructor_name = _clean(instructor_name, "Instructor name", MAX_INSTRUCTOR_LENGTH)
+        instructor_name = self._instructor_name(instructor_id, instructor_name)
         if self.repository.get_section_by_name(course_id, name):
             raise DuplicateCourseError(f"{course['course_code']} already has a section '{name}'")
         try:
-            return self.repository.create_section(course_id, name, instructor_name, _clean(notes, "Notes", 500))
+            return self.repository.create_section(course_id, name, instructor_name, _clean(notes, "Notes", 500),
+                                                  instructor_id)
         except sqlite3.IntegrityError:
             raise DuplicateCourseError(f"{course['course_code']} already has a section '{name}'")
 
@@ -177,12 +184,22 @@ class CourseService:
         """The section with course_code, course_name, student_count and session_count."""
         return self.repository.get_section(section_id)
 
-    def list_sections(self, course_id: Optional[int] = None, active_only: bool = False) -> List[Dict[str, Any]]:
-        return self.repository.list_sections(course_id=course_id, active_only=active_only)
+    def list_sections(self, course_id: Optional[int] = None, active_only: bool = False,
+                      instructor_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Sections, optionally only one course's or only one instructor account's."""
+        return self.repository.list_sections(course_id=course_id, active_only=active_only,
+                                             instructor_id=instructor_id)
+
+    def instructor_sections(self, user_id: int, active_only: bool = True) -> List[Dict[str, Any]]:
+        """The sections an account teaches (its "My Classes")."""
+        return self.list_sections(active_only=active_only, instructor_id=user_id)
 
     def update_section(self, section_id: int, name: str, instructor_name: Optional[str] = None,
-                       notes: Optional[str] = None) -> None:
+                       notes: Optional[str] = None, instructor_id: Optional[int] = None) -> None:
         """
+        instructor_id: the instructor's account, or None for none (then
+        instructor_name is a typed name).
+
         Raises:
             CourseNotFoundError, InvalidCourseDataError, DuplicateCourseError
         """
@@ -192,11 +209,19 @@ class CourseService:
         if other and other['id'] != section_id:
             raise DuplicateCourseError(f"{section['course_code']} already has a section '{name}'")
         try:
-            self.repository.update_section(section_id, name,
-                                           _clean(instructor_name, "Instructor name", MAX_INSTRUCTOR_LENGTH),
-                                           _clean(notes, "Notes", 500))
+            self.repository.update_section(section_id, name, self._instructor_name(instructor_id, instructor_name),
+                                           _clean(notes, "Notes", 500), instructor_id)
         except sqlite3.IntegrityError:
             raise DuplicateCourseError(f"{section['course_code']} already has a section '{name}'")
+
+    def _instructor_name(self, instructor_id: Optional[int], typed_name: Optional[str]) -> Optional[str]:
+        """The account's name for a linked instructor, else the typed name (validated)."""
+        if instructor_id is None:
+            return _clean(typed_name, "Instructor name", MAX_INSTRUCTOR_LENGTH)
+        user = self.user_repository.get_by_id(instructor_id)
+        if not user or not user['is_active']:
+            raise InvalidCourseDataError("The chosen instructor account does not exist or is deactivated.")
+        return user['full_name']
 
     def set_section_active(self, section_id: int, active: bool) -> None:
         self._require_section(section_id)

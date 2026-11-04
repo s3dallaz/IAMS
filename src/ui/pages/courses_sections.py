@@ -19,9 +19,11 @@ from src.services.class_list_import_service import (
     ClassListImportPlan, apply_class_list_import, class_list_errors_csv,
     class_list_template_csv, plan_class_list_import, read_class_list_table,
 )
+from src.services.auth_service import ROLE_LABELS
 from src.services.course_service import CourseService, CourseServiceError
 from src.services.session_service import DB_DATETIME_FORMAT, SessionService, SessionStatus
 from src.services.student_service import StudentService
+from src.ui.pages.login import current_user
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -182,13 +184,13 @@ def _render_sections_tab(course_service: CourseService, student_service: Student
 
     with st.expander("➕ Add a section to this course", expanded=False):
         with st.form(f"add_section_form_{course_id}_{_table_version()}"):
-            c1, c2 = st.columns([1, 2])
-            name = c1.text_input("Section name *", placeholder="e.g. A, B, Lab 1")
-            instructor = c2.text_input("Instructor", placeholder="e.g. Dr. Sara Ali")
+            name = st.text_input("Section name *", placeholder="e.g. A, B, Lab 1")
+            instructor_id, instructor = _instructor_fields(course_service, None, None)
             notes = st.text_input("Notes", placeholder="optional, e.g. Sunday 10:00, Hall 3")
             if st.form_submit_button("Add section", type="primary"):
                 try:
-                    section_id = course_service.create_section(course_id, name, instructor, notes)
+                    section_id = course_service.create_section(course_id, name, instructor, notes,
+                                                               instructor_id=instructor_id)
                 except CourseServiceError as e:
                     st.error(f"❌ {e}")
                 else:
@@ -201,7 +203,7 @@ def _render_sections_tab(course_service: CourseService, student_service: Student
     if not sections:
         st.info("This course has no sections yet. Add one above.")
         return
-    section_labels = {s['id']: f"{s['name']} · {s['instructor_name'] or 'no instructor'} · "
+    section_labels = {s['id']: f"{s['name']} · {_instructor_label(s)} · "
                                f"{s['student_count']:,} student(s)" + ("" if s['is_active'] else " (inactive)")
                       for s in sections}
     if st.session_state.get(SECTION_SELECTOR_KEY) not in section_labels:
@@ -250,6 +252,7 @@ def _render_start_now(section: Dict[str, Any]):
 
 def _start_section_now(section_id: int):
     """'Start session now' callback: runs before the rerun, so it can switch to the camera page."""
+    user = current_user()
     end = st.session_state.get(f"start_now_end_{section_id}")
     now = datetime.now()
     end_time = None
@@ -265,7 +268,8 @@ def _start_section_now(section_id: int):
             session_name=st.session_state.get(f"start_now_name_{section_id}"),
             end_time=end_time,
             late_threshold_minutes=int(st.session_state.get(f"start_now_late_{section_id}", 15)),
-            created_by="Instructor",
+            created_by=user['full_name'] if user else None,
+            created_by_user_id=user['id'] if user else None,
         )
     except Exception as e:
         logger.error(f"Could not start a session for section {section_id}: {e}")
@@ -281,15 +285,50 @@ def _open_camera(session_id: int):
     st.session_state[CAMERA_SELECTOR_KEY] = session_id
 
 
+def _instructor_label(section: Dict[str, Any]) -> str:
+    """'Dr. Sara Ali', 'Dr. Sara Ali (no account)' or 'no instructor'."""
+    if not section.get('instructor_name'):
+        return "no instructor"
+    return section['instructor_name'] + ("" if section.get('instructor_id') else " (no account)")
+
+
+def _instructor_fields(course_service: CourseService, current_id: Optional[int],
+                       current_name: Optional[str]):
+    """
+    Inside a form: the instructor's account (they then see the section in
+    My Classes and run its sessions), or a typed name for someone without an
+    account. Returns (instructor_id or None, typed name).
+    """
+    accounts = {u['id']: u for u in course_service.user_repository.list_active_users()}
+    options = [None] + list(accounts)
+    c1, c2 = st.columns(2)
+    instructor_id = c1.selectbox(
+        "Instructor account", options, index=options.index(current_id) if current_id in accounts else 0,
+        format_func=lambda i: "— No account —" if i is None else
+        f"{accounts[i]['full_name']} ({accounts[i]['username']}, {ROLE_LABELS[accounts[i]['role']]})",
+        help="The instructor sees this section in My Classes and can start its sessions.")
+    typed = c2.text_input("Or instructor name (no account)",
+                          value="" if current_id in accounts else (current_name or ""),
+                          placeholder="e.g. Dr. Sara Ali",
+                          help="Only used when no account is chosen; this person can't sign in.")
+    return instructor_id, typed
+
+
+def render_start_now(section: Dict[str, Any]):
+    """The quick start used by My Classes (same as on the sections tab)."""
+    _render_start_now(section)
+
+
 def _render_section_settings(course_service: CourseService, section: Dict[str, Any]):
     with st.expander(f"⚙️ Section {section['name']} settings", expanded=False):
         with st.form(f"edit_section_form_{section['id']}"):
-            c1, c2 = st.columns([1, 2])
-            name = c1.text_input("Section name *", value=section['name'])
-            instructor = c2.text_input("Instructor", value=section['instructor_name'] or "")
+            name = st.text_input("Section name *", value=section['name'])
+            instructor_id, instructor = _instructor_fields(course_service, section.get('instructor_id'),
+                                                           section['instructor_name'])
             notes = st.text_input("Notes", value=section['notes'] or "")
             if st.form_submit_button("Save changes", type="primary"):
-                _run(lambda: course_service.update_section(section['id'], name, instructor, notes),
+                _run(lambda: course_service.update_section(section['id'], name, instructor, notes,
+                                                           instructor_id=instructor_id),
                      f"✅ Section **{name.strip()}** saved.")
         b1, b2 = st.columns(2)
         if section['is_active']:

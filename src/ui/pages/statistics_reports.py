@@ -23,6 +23,8 @@ from src.services.statistics_service import StatisticsService
 from src.services.report_service import ReportService
 from src.services.student_service import StudentService
 from src.services.session_service import SessionService
+from src.ui.access import sees_everything, visible_sessions
+from src.ui.pages.login import current_user
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +49,20 @@ def render_statistics_reports_page():
     student_service = StudentService()
     session_service = SessionService()
     
+    # Instructors: their own sessions and their history only (the overview
+    # and single students' records are school-wide)
+    user = current_user()
+    if not sees_everything(user):
+        tab_session, tab_history = st.tabs(["📅 My Sessions", "🔍 My Attendance History"],
+                                           key="stats_tab_instructor", on_change="rerun")
+        if tab_session.open:
+            with tab_session:
+                render_session_course_tab(stats_service, report_service, session_service, user)
+        if tab_history.open:
+            with tab_history:
+                render_filterable_history_tab(stats_service, report_service, session_service, user)
+        return
+
     # Top Level Navigation: only the open tab runs
     tab_dash, tab_student, tab_session, tab_history = st.tabs([
         "📈 Overview Dashboard",
@@ -283,14 +299,21 @@ def render_student_statistics_tab(
 def render_session_course_tab(
     stats_service: StatisticsService,
     report_service: ReportService,
-    session_service: SessionService
+    session_service: SessionService,
+    user: Optional[Dict[str, Any]] = None
 ):
-    """Render session and course attendance statistics and document export."""
+    """
+    Render session and course attendance statistics and document export.
+    With an instructor `user`: their own sessions and sections only.
+    """
     st.subheader("📅 Session & Course Attendance Analytics")
-    
+
+    everything = user is None or sees_everything(user)
     sessions = session_service.get_all_sessions()
+    if not everything:
+        sessions = visible_sessions(user, sessions)
     if not sessions:
-        st.info("No sessions created in system.")
+        st.info("No sessions created in system." if everything else "No sessions for your classes yet.")
         return
     
     # Narrow the session list to one section (sessions without one: "No section")
@@ -402,6 +425,19 @@ def render_session_course_tab(
     if started:
         st.caption("Absent students are in the CSV report and in **Session Management → Session Details**.")
     
+    if not everything:   # a course mixes several instructors' sections
+        own_sections = {s['section_id'] for s in sessions if s.get('section_id')}
+        section_stats = [r for r in stats_service.get_section_statistics() if r['section_id'] in own_sections]
+        if section_stats:
+            st.markdown("#### My sections")
+            st.dataframe([{
+                'Course': r['course_code'], 'Section': r['section_name'], 'Class list': r['class_list_size'],
+                'Sessions': r['total_sessions'], 'Present': r['present_count'], 'Late': r['late_count'],
+                'Absent': r['absent_count'], 'Attendance %': r['attendance_rate'],
+            } for r in section_stats], hide_index=True)
+            st.caption(ABSENCE_NOTE)
+        return
+
     st.markdown("#### Course summary")
     course_stats = stats_service.get_course_statistics()
     if course_stats:
@@ -444,9 +480,14 @@ def render_session_course_tab(
 def render_filterable_history_tab(
     stats_service: StatisticsService,
     report_service: ReportService,
-    session_service: SessionService
+    session_service: SessionService,
+    user: Optional[Dict[str, Any]] = None
 ):
-    """Render search and multi-parameter filterable history with CSV export."""
+    """
+    Render search and multi-parameter filterable history with CSV export.
+    With an instructor `user`: records of their own sessions only.
+    """
+    everything = user is None or sees_everything(user)
     st.subheader("🔍 Searchable Attendance History")
     st.markdown("Filter attendance records across students, courses, sessions, statuses, and date ranges.")
     
@@ -460,6 +501,8 @@ def render_filterable_history_tab(
         f_status = st.selectbox("Status", ["All", "Present", "Late"], key="hist_f_status")
     with col_f3:
         all_sessions = session_service.get_all_sessions()
+        if not everything:
+            all_sessions = visible_sessions(user, all_sessions)
         sess_map = {s['id']: s['session_name'] for s in all_sessions}
         sess_options = ["All"] + list(sess_map.keys())
         f_session = st.selectbox(
@@ -496,6 +539,8 @@ def render_filterable_history_tab(
         start_date=start_date_val,
         end_date=end_date_val
     )
+    if not everything:
+        records = [r for r in records if r['session_id'] in sess_map]
     
     st.markdown("---")
     

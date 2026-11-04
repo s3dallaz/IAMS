@@ -415,7 +415,9 @@ def test_render_statistics_reports_page(mock_tabs):
     with patch("src.ui.pages.statistics_reports.render_overview_dashboard"), \
          patch("src.ui.pages.statistics_reports.render_student_statistics_tab"), \
          patch("src.ui.pages.statistics_reports.render_session_course_tab"), \
-         patch("src.ui.pages.statistics_reports.render_filterable_history_tab"):
+         patch("src.ui.pages.statistics_reports.render_filterable_history_tab"), \
+         patch("src.ui.pages.statistics_reports.current_user",
+               return_value={'id': 1, 'username': 'admin', 'full_name': 'Admin', 'role': 'admin'}):
         render_statistics_reports_page()
         mock_tabs.assert_called_once()
 

@@ -123,7 +123,7 @@ class CourseRepository:
     """
 
     def create_section(self, course_id: int, name: str, instructor_name: Optional[str] = None,
-                       notes: Optional[str] = None) -> int:
+                       notes: Optional[str] = None, instructor_id: Optional[int] = None) -> int:
         """
         Returns:
             Database ID of the new section
@@ -131,9 +131,10 @@ class CourseRepository:
         Raises:
             sqlite3.IntegrityError: If the course already has a section with this name
         """
-        query = "INSERT INTO sections (course_id, name, instructor_name, notes) VALUES (?, ?, ?, ?)"
+        query = """INSERT INTO sections (course_id, name, instructor_name, notes, instructor_id)
+                   VALUES (?, ?, ?, ?, ?)"""
         with get_db_connection(self.database_path) as conn:
-            section_id = conn.execute(query, (course_id, name, instructor_name, notes)).lastrowid
+            section_id = conn.execute(query, (course_id, name, instructor_name, notes, instructor_id)).lastrowid
         logger.info(f"Created section '{name}' of course {course_id} (DB ID: {section_id})")
         return section_id
 
@@ -145,25 +146,40 @@ class CourseRepository:
         return self._fetch_one(f"{self._SECTION_SELECT} WHERE s.course_id = ? AND s.name = ?",
                                (course_id, name))
 
-    def list_sections(self, course_id: Optional[int] = None, active_only: bool = False) -> List[Dict[str, Any]]:
+    def list_sections(self, course_id: Optional[int] = None, active_only: bool = False,
+                      instructor_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Sections by course code and name, with the same extra fields as get_section."""
         conditions, params = [], []
         if course_id is not None:
             conditions.append("s.course_id = ?")
             params.append(course_id)
+        if instructor_id is not None:
+            conditions.append("s.instructor_id = ?")
+            params.append(instructor_id)
         if active_only:
             conditions.append("s.is_active = 1 AND c.is_active = 1")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         return self._fetch_all(f"{self._SECTION_SELECT} {where} ORDER BY c.course_code, s.name", params)
 
     def update_section(self, section_id: int, name: str, instructor_name: Optional[str],
-                       notes: Optional[str]) -> int:
+                       notes: Optional[str], instructor_id: Optional[int] = None) -> int:
         """
         Raises:
             sqlite3.IntegrityError: If the course already has another section with this name
         """
-        query = "UPDATE sections SET name = ?, instructor_name = ?, notes = ? WHERE id = ?"
-        return self._execute(query, (name, instructor_name, notes, section_id))
+        query = "UPDATE sections SET name = ?, instructor_name = ?, notes = ?, instructor_id = ? WHERE id = ?"
+        return self._execute(query, (name, instructor_name, notes, instructor_id, section_id))
+
+    def rename_instructor(self, instructor_id: int, full_name: str) -> int:
+        """Keep the shown name of an instructor's sections in step with their account's name."""
+        return self._execute("UPDATE sections SET instructor_name = ? WHERE instructor_id = ?",
+                             (full_name, instructor_id))
+
+    def set_section_instructors(self, links: List[Dict[str, Any]]) -> None:
+        """Link sections to instructor accounts: dicts with section_id, instructor_id, instructor_name."""
+        with get_db_connection(self.database_path) as conn:
+            conn.executemany("UPDATE sections SET instructor_id = :instructor_id, "
+                             "instructor_name = :instructor_name WHERE id = :section_id", links)
 
     def set_section_active(self, section_id: int, active: bool) -> int:
         return self._execute("UPDATE sections SET is_active = ? WHERE id = ?", (int(active), section_id))
@@ -236,7 +252,7 @@ class CourseRepository:
 
         Args:
             new_courses: dicts with course_code, name
-            new_sections: dicts with course_code, name, instructor_name
+            new_sections: dicts with course_code, name, instructor_name, instructor_id (or None)
             memberships: dicts with course_code, section, student_id (student DB ID)
 
         Returns:
@@ -244,8 +260,9 @@ class CourseRepository:
         """
         insert_course = "INSERT INTO courses (course_code, name) VALUES (:course_code, :name)"
         insert_section = """
-            INSERT INTO sections (course_id, name, instructor_name)
-            VALUES ((SELECT id FROM courses WHERE course_code = :course_code), :name, :instructor_name)
+            INSERT INTO sections (course_id, name, instructor_name, instructor_id)
+            VALUES ((SELECT id FROM courses WHERE course_code = :course_code), :name, :instructor_name,
+                    :instructor_id)
         """
         insert_member = """
             INSERT OR IGNORE INTO section_students (section_id, student_id)
@@ -255,7 +272,7 @@ class CourseRepository:
         try:
             with get_db_connection(self.database_path) as conn:
                 conn.executemany(insert_course, new_courses)
-                conn.executemany(insert_section, new_sections)
+                conn.executemany(insert_section, [{'instructor_id': None, **s} for s in new_sections])
                 before = conn.total_changes
                 conn.executemany(insert_member, memberships)
                 added = conn.total_changes - before

@@ -26,7 +26,7 @@ from src.services.session_scheduler import is_session_scheduler_running
 from src.services.session_service import SessionService, SessionStatus
 from src.services.statistics_service import StatisticsService
 from src.services.student_service import StudentService
-from src.ui.access import can_open
+from src.ui.access import MY_CLASSES, can_open, sees_everything, visible_sessions
 from src.ui.pages.courses_sections import TAB_SECTIONS as COURSES_TAB_SECTIONS, TABS_KEY as COURSES_TABS_KEY
 from src.ui.pages.login import current_user
 from src.ui.pages.users import render_second_it_warning
@@ -213,7 +213,12 @@ def render_home():
     now = datetime.now()
     st.title("🏠 Home")
     st.caption(f"{now.strftime('%A, %d %B %Y')} · Intelligent Attendance Monitoring System")
-    render_second_it_warning(AuthService(), current_user())
+    user = current_user()
+    render_second_it_warning(AuthService(), user)
+    if not sees_everything(user):
+        # Instructors: their own classes only (the overview and system check are school-wide)
+        _render_today()
+        return
 
     session_service = SessionService()
     stats_service = StatisticsService()
@@ -269,18 +274,21 @@ def _render_today() -> None:
     now = datetime.now()
     session_service = SessionService()
     stats_service = StatisticsService()
+    user = current_user()
     try:
-        sessions = session_service.get_sessions_overview()
+        sessions = visible_sessions(user, session_service.get_sessions_overview())
     except Exception as e:
         st.error(f"Could not load today's sessions: {e}")
         return
 
-    st.subheader("📅 Today")
+    st.subheader("📅 Today" if sees_everything(user) else "📅 Today - my classes")
 
     # Horizontal rows wrap on narrow screens instead of cutting text off
     # Only buttons for pages this user's role may open
-    user = current_user()
     quick = st.container(horizontal=True)
+    if not sees_everything(user):
+        quick.button("▶️ My classes", key="home_my_classes", on_click=_go, args=(MY_CLASSES,), type="primary",
+                     help="Your sections: start a session, see the class list")
     if can_open(user, PAGE_COURSES):
         quick.button("▶️ Start a class", key="home_start_class", on_click=_go_start_class, type="primary",
                      help="Pick a course and section, then start its session now")

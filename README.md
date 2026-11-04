@@ -128,7 +128,8 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 
   | | Instructor | Admin | IT |
   |---|---|---|---|
-  | Home, Real-Time Attendance, Session Management, Statistics & Reports | ✅ | ✅ | ✅ |
+  | Home, Real-Time Attendance, Session Management, Statistics & Reports | ✅ own classes | ✅ all | ✅ all |
+  | My Classes (their sections: start a session, class list) | ✅ | if they teach | if they teach |
   | Student Registry, Courses & Sections, AI Assistant | ❌ | ✅ | ✅ |
   | Users: instructor accounts | ❌ | ✅ | ✅ |
   | Users: Admin and IT accounts | ❌ | ❌ | ✅ |
@@ -138,6 +139,7 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
 * **Passwords** are stored only as scrypt hashes, never as text. Change yours with **🔑 Password** in the sidebar.
 * **Forgot your password?** Every account gets a one-time **recovery code**, shown once (after creating the first account, after choosing your own password, or with **🧾 New recovery code** in the sidebar). Save it somewhere safe. On the sign-in page, **Forgot your password?** takes your username + the code + a new password. The code is then used up and a new one is shown. Wrong codes count towards the same lockout as wrong passwords. No code? Instructors ask an Admin, Admins ask IT.
 * **Keep two IT accounts:** while only one exists, IT users see a warning on Home and Users, because a lost IT password plus a lost code would leave nobody to manage Admin / IT accounts.
+* **Instructors see only their own classes:** an Admin links each section to its instructor's account (Courses & Sections → section settings → **Instructor account**; a class-list import also links an `instructor` that matches an account's username or full name). An instructor then sees only the sessions of their sections and the ones they created: on Home, My Classes, Real-Time Attendance, Session Management and Statistics (*My Sessions*, *My Attendance History*). They create sessions only for their own sections, can't delete sessions, and "Created by" is always the signed-in person. A section without an account shows "(no account)".
 * **Signing out:** **🚪 Log out**, or refresh / close the browser tab.
 * **Last resort for technical staff** (password *and* recovery code lost, and no second IT account): on this PC run:
 
@@ -330,7 +332,6 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 Planned, not built yet:
 
 * **Instructor screen** - an instructor picks their course and session and starts it
-* **Instructors see only their own classes** - sections linked to instructor accounts; sessions, Home and reports filtered for instructors
 * **Activity log** - who changed or deleted what, and when
 * **Use from several devices** - a school server with classroom PCs, HTTPS and device keys (today the app only opens on its own PC)
 * **AI Assistant updates** - e.g. answering questions about absent students

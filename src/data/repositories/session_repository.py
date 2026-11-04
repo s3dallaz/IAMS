@@ -14,9 +14,11 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# Session columns plus its section's name and instructor (None without a section)
+# Session columns plus its section's name, instructor and instructor account
+# (None without a section)
 _SESSION_SELECT = """
-    SELECT sess.*, sec.name AS section_name, sec.instructor_name AS instructor_name
+    SELECT sess.*, sec.name AS section_name, sec.instructor_name AS instructor_name,
+           sec.instructor_id AS section_instructor_id
     FROM sessions sess
     LEFT JOIN sections sec ON sec.id = sess.section_id
 """
@@ -49,7 +51,8 @@ class SessionRepository:
         status: str = 'scheduled',
         created_by: Optional[str] = None,
         notes: Optional[str] = None,
-        section_id: Optional[int] = None
+        section_id: Optional[int] = None,
+        created_by_user_id: Optional[int] = None
     ) -> int:
         """
         Create a new session in the database.
@@ -64,6 +67,7 @@ class SessionRepository:
             created_by: User who created the session (optional)
             notes: Additional notes (optional)
             section_id: Section whose class list is expected (optional)
+            created_by_user_id: Account that created it (optional)
         
         Returns:
             Database ID of the newly created session
@@ -74,9 +78,9 @@ class SessionRepository:
         query = """
             INSERT INTO sessions (
                 session_name, course_code, start_time, end_time,
-                late_threshold_minutes, status, created_by, notes, section_id
+                late_threshold_minutes, status, created_by, notes, section_id, created_by_user_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         
         try:
@@ -85,7 +89,7 @@ class SessionRepository:
                 cursor.execute(
                     query,
                     (session_name, course_code, start_time, end_time,
-                     late_threshold_minutes, status, created_by, notes, section_id)
+                     late_threshold_minutes, status, created_by, notes, section_id, created_by_user_id)
                 )
                 session_id = cursor.lastrowid
                 logger.info(f"Created session: {session_name} (ID: {session_id})")
@@ -416,6 +420,7 @@ class SessionRepository:
         where = "WHERE sess.status = ?" if status else ""
         query = f"""
             SELECT sess.*, sec.name AS section_name, sec.instructor_name AS instructor_name,
+                   sec.instructor_id AS section_instructor_id,
                    COUNT(a.id) AS marked_count,
                    COALESCE(SUM(a.status = 'present'), 0) AS present_count,
                    COALESCE(SUM(a.status = 'late'), 0) AS late_count

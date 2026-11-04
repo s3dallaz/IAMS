@@ -69,6 +69,12 @@ class UserRepository:
         row = self._fetch_one("SELECT password_hash FROM users WHERE id = ?", (user_id,))
         return row['password_hash'] if row else None
 
+    def list_active_users(self) -> List[Dict[str, Any]]:
+        """Active accounts by name (e.g. to choose a section's instructor)."""
+        query = f"SELECT {_PUBLIC_COLUMNS} FROM users WHERE is_active = 1 ORDER BY full_name COLLATE NOCASE"
+        with get_db_connection(self.database_path) as conn:
+            return [dict(row) for row in conn.execute(query).fetchall()]
+
     def list_users(self) -> List[Dict[str, Any]]:
         """All users, by role (IT, admin, instructor) then name."""
         query = f"""

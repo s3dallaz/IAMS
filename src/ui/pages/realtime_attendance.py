@@ -41,7 +41,9 @@ from src.services.session_service import SessionService, SessionStatus
 from src.services.attendance_service import AttendanceService, AttendanceStatus
 from src.services.enrollment_service import EnrollmentService
 from src.realtime.engine_client import EngineController
+from src.ui.access import visible_sessions
 from src.ui.pages.camera_picker import render_camera_picker
+from src.ui.pages.login import current_user
 from src.realtime.protocol import result_from_dict
 from src.utils.logger import get_logger
 
@@ -145,7 +147,7 @@ def render_realtime_attendance():
         logger.error(f"Could not apply scheduled session changes: {e}")
 
     # Get active and scheduled sessions
-    all_sessions = session_service.get_all_sessions()
+    all_sessions = visible_sessions(current_user(), session_service.get_all_sessions())
     active_sessions = [s for s in all_sessions if s['status'] == SessionStatus.ACTIVE]
     scheduled_sessions = [s for s in all_sessions if s['status'] == SessionStatus.SCHEDULED]
 

@@ -31,6 +31,8 @@ from src.services.attendance_service import (
 )
 from src.services.course_service import CourseService
 from src.services.student_service import StudentService
+from src.ui.access import owns_session, sees_everything, visible_sessions
+from src.ui.pages.login import current_user
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -125,9 +127,9 @@ def render_sessions_list_tab(session_service: SessionService):
         ).strip().lower()
 
     try:
-        sessions = session_service.get_sessions_overview(
+        sessions = visible_sessions(current_user(), session_service.get_sessions_overview(
             status=None if status_filter == "All" else status_filter
-        )
+        ))
     except Exception as e:
         logger.error(f"Error loading sessions: {e}")
         st.error(f"Failed to load sessions: {e}")
@@ -187,9 +189,15 @@ def render_create_session_tab(session_service: SessionService):
     st.caption("Times are the attendance computer's local time. A scheduled session starts by itself "
                "at its start time (no one needs to be here) and closes by itself at its end time.")
 
+    user = current_user()
+    if not sees_everything(user) and not CourseService().instructor_sections(user['id']):
+        st.info("No sections are linked to your account yet, so you can't create sessions. Ask an "
+                "administrator to set you as the instructor of your sections (Courses & Sections).")
+        return
+
     # Outside the form, so the section list follows the chosen course
     st.markdown("**Who is this session for?**")
-    section = _section_picker("create")
+    section = _section_picker("create", user=user)
     _section_caption(section)
 
     # A new form key after each successful create gives an empty form,
@@ -215,11 +223,9 @@ def render_create_session_tab(session_service: SessionService):
                     placeholder="e.g., CS101",
                     help="Course code or identifier (optional)"
                 )
-            created_by = st.text_input(
-                "Created By",
-                value="Admin",
-                help="Instructor or administrator name"
-            )
+            created_by = user['full_name']
+            st.text_input("Created By", value=created_by, disabled=True,
+                          help="The signed-in account creates the session")
             initial_status = st.selectbox(
                 "Initial Status",
                 options=[SessionStatus.SCHEDULED, SessionStatus.ACTIVE],
@@ -280,7 +286,8 @@ def render_create_session_tab(session_service: SessionService):
             status=initial_status,
             created_by=created_by,
             notes=notes,
-            section_id=section['id'] if section else None
+            section_id=section['id'] if section else None,
+            created_by_user_id=user['id']
         )
 
 
@@ -293,7 +300,7 @@ def render_session_details_tab(
 
     # Session Selector (the overview also has the counts the Delete action needs)
     try:
-        sessions = session_service.get_sessions_overview()
+        sessions = visible_sessions(current_user(), session_service.get_sessions_overview())
     except Exception as e:
         logger.error(f"Error loading sessions: {e}")
         st.error(f"Failed to load sessions: {e}")
@@ -601,7 +608,10 @@ def _render_session_actions(session_service: SessionService, session: Dict[str, 
             _edit_session_dialog(session_service, session)
 
     with cols[3]:
-        if status == SessionStatus.ACTIVE:
+        if not sees_everything(current_user()):
+            st.button("🗑️ Delete", key=f"delete_{session_id}", width="stretch", disabled=True,
+                      help="Only an administrator can delete sessions")
+        elif status == SessionStatus.ACTIVE:
             st.button("🗑️ Delete", key=f"delete_{session_id}", width="stretch", disabled=True,
                       help="Close the session before deleting it")
         else:
@@ -632,7 +642,7 @@ def _edit_session_dialog(session_service: SessionService, session: Dict[str, Any
         st.caption("Changing the start time or late threshold re-checks who was present or late. "
                    + ("The session stays closed." if status == SessionStatus.CLOSED else ""))
 
-    section = _section_picker(f"edit_{session['id']}", session)
+    section = _section_picker(f"edit_{session['id']}", session, user=current_user())
     section_id = section['id'] if section else None
     if section_id != session.get('section_id') and status != SessionStatus.SCHEDULED:
         st.warning("Changing the section changes who is expected - and counted absent - in this session.")
@@ -722,7 +732,8 @@ def handle_create_session(
     status: str,
     created_by: Optional[str],
     notes: Optional[str],
-    section_id: Optional[int] = None
+    section_id: Optional[int] = None,
+    created_by_user_id: Optional[int] = None
 ):
     """Handle creating a new session through SessionService."""
     try:
@@ -747,7 +758,8 @@ def handle_create_session(
             status=status,
             created_by=created_by if created_by else None,
             notes=notes if notes else None,
-            section_id=section_id
+            section_id=section_id,
+            created_by_user_id=created_by_user_id
         )
 
         logger.info(f"Session created via UI: ID {session_id}")
@@ -816,15 +828,19 @@ def handle_delete_session(session_service: SessionService, session_id: int):
 # Helpers
 # ============================================================================
 
-def _section_picker(key: str, session: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def _section_picker(key: str, session: Optional[Dict[str, Any]] = None,
+                    user: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """
     Course -> Section pickers. Returns the chosen section (with course_code and
     student_count), or None for "no section": every active student is expected.
     Outside a form, so the section list follows the course. When editing,
     the session's own section stays selectable even if it was deactivated.
+    Instructors choose among their own sections only, and always choose one.
     """
     course_service = CourseService()
-    sections = course_service.list_sections(active_only=True)
+    instructor_only = user is not None and not sees_everything(user)
+    sections = (course_service.instructor_sections(user['id']) if instructor_only
+                else course_service.list_sections(active_only=True))
     current_id = session.get('section_id') if session else None
     if current_id and all(s['id'] != current_id for s in sections):
         current = course_service.get_section(current_id)
@@ -838,8 +854,8 @@ def _section_picker(key: str, session: Optional[Dict[str, Any]] = None) -> Optio
     courses = {}
     for s in sections:
         courses.setdefault(s['course_id'], f"{s['course_code']} - {s['course_name']}")
-    course_options = [NO_SECTION] + sorted(courses, key=lambda c: courses[c].lower())
-    current_course = next((s['course_id'] for s in sections if s['id'] == current_id), NO_SECTION)
+    course_options = ([] if instructor_only else [NO_SECTION]) + sorted(courses, key=lambda c: courses[c].lower())
+    current_course = next((s['course_id'] for s in sections if s['id'] == current_id), course_options[0])
     col_course, col_section = st.columns(2)
     course_id = col_course.selectbox(
         "Course", course_options, index=course_options.index(current_course),

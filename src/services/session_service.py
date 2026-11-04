@@ -119,7 +119,8 @@ class SessionService:
         status: str = SessionStatus.SCHEDULED,
         created_by: Optional[str] = None,
         notes: Optional[str] = None,
-        section_id: Optional[int] = None
+        section_id: Optional[int] = None,
+        created_by_user_id: Optional[int] = None
     ) -> int:
         """
         Create a new session with validation.
@@ -136,6 +137,7 @@ class SessionService:
             section_id: Section whose class list is expected (optional; its
                 course code replaces course_code). Without one, every active
                 student is expected.
+            created_by_user_id: The signed-in account creating it (it then owns the session)
         
         Returns:
             Database ID of the newly created session
@@ -235,7 +237,8 @@ class SessionService:
                 status=status,
                 created_by=created_by,
                 notes=notes,
-                section_id=section_id
+                section_id=section_id,
+                created_by_user_id=created_by_user_id
             )
             logger.info(f"Session created successfully: {session_name} (ID: {session_id})")
             return session_id
@@ -475,7 +478,8 @@ class SessionService:
         end_time: Optional[str] = None,
         late_threshold_minutes: Optional[int] = None,
         created_by: Optional[str] = None,
-        now: Optional[datetime] = None
+        now: Optional[datetime] = None,
+        created_by_user_id: Optional[int] = None
     ) -> int:
         """
         Create a session for a section that starts right now (status
@@ -509,6 +513,7 @@ class SessionService:
             status=SessionStatus.ACTIVE,
             created_by=created_by,
             section_id=section_id,
+            created_by_user_id=created_by_user_id,
         )
     
     def update_session(

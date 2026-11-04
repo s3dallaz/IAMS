@@ -86,13 +86,16 @@ CREATE TABLE IF NOT EXISTS courses (
 )
 """
 
-# A course's group of students (e.g. "A", "Lab 1"), with its instructor
+# A course's group of students (e.g. "A", "Lab 1"), with its instructor.
+# instructor_id: the instructor's account (they see and run this section);
+# instructor_name: the name shown (the account's name, or typed without an account)
 CREATE_SECTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS sections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id INTEGER NOT NULL,
     name TEXT NOT NULL COLLATE NOCASE,
     instructor_name TEXT,
+    instructor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     is_active BOOLEAN DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     notes TEXT,
@@ -114,7 +117,9 @@ CREATE TABLE IF NOT EXISTS section_students (
 """
 
 # section_id: the section whose class list is expected (NULL = no section).
-# Databases made before sections existed get it from migrate_schema().
+# created_by_user_id: the account that created it (an instructor owns the
+# sessions of their sections and the ones they created).
+# Older databases get these columns from migrate_schema().
 CREATE_SESSIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +133,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     closed_at TIMESTAMP,
     notes TEXT,
-    section_id INTEGER REFERENCES sections(id)
+    section_id INTEGER REFERENCES sections(id),
+    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
 )
 """
 
@@ -201,6 +207,7 @@ CREATE_INDEXES = [
 
     # Courses / sections / class lists indexes
     "CREATE INDEX IF NOT EXISTS idx_sections_course ON sections(course_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sections_instructor ON sections(instructor_id)",
     "CREATE INDEX IF NOT EXISTS idx_section_students_student ON section_students(student_id)",
 
     # Attendance records indexes
@@ -281,6 +288,15 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     if 'section_id' not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN section_id INTEGER REFERENCES sections(id)")
         logger.info("Added sessions.section_id (existing sessions have no section)")
+    if 'created_by_user_id' not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN created_by_user_id INTEGER "
+                     "REFERENCES users(id) ON DELETE SET NULL")
+        logger.info("Added sessions.created_by_user_id")
+    section_columns = {row[1] for row in conn.execute("PRAGMA table_info(sections)")}
+    if 'instructor_id' not in section_columns:
+        conn.execute("ALTER TABLE sections ADD COLUMN instructor_id INTEGER "
+                     "REFERENCES users(id) ON DELETE SET NULL")
+        logger.info("Added sections.instructor_id (existing sections keep their typed instructor name)")
     conn.commit()
 
 

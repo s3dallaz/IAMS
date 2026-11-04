@@ -5,6 +5,9 @@ or CSV file, one row per student and section:
     course_code, section, student_id          (required)
     course_name, instructor                   (optional, used for NEW courses / sections)
 
+An instructor that matches an account's username or full name is linked to
+that account, so the instructor sees the section in "My Classes".
+
 Courses and sections that don't exist yet are created. The file is checked
 first (plan_class_list_import) and nothing is saved until the plan is
 applied, in one transaction. Re-importing the same file is safe: students
@@ -98,6 +101,10 @@ def plan_class_list_import(table: pd.DataFrame, course_service: CourseService,
                            ignored_columns: Optional[List[str]] = None) -> ClassListImportPlan:
     """Check every row and decide what importing it would do. Nothing is saved."""
     students = {s['student_id']: s for s in student_service.get_all_students(active_only=False)}
+    accounts: Dict[str, Dict[str, Any]] = {}
+    for user in course_service.user_repository.list_active_users():
+        accounts.setdefault(user['username'].lower(), user)
+        accounts.setdefault(user['full_name'].lower(), user)
     courses = {c['course_code'].lower(): c for c in course_service.list_courses()}
     sections = {(s['course_id'], s['name'].lower()): s for s in course_service.list_sections()}
     class_lists: Dict[int, set] = {}            # section id -> student DB IDs, loaded when first needed
@@ -148,8 +155,11 @@ def plan_class_list_import(table: pd.DataFrame, course_service: CourseService,
         if section is None:
             planned = new_sections.setdefault((code_key, section_key), {
                 'course_code': course['course_code'] if course else new_courses[code_key]['course_code'],
-                'name': row.section, 'instructor_name': None})
-            planned['instructor_name'] = planned['instructor_name'] or row.instructor
+                'name': row.section, 'instructor_name': None, 'instructor_id': None})
+            if row.instructor and not planned['instructor_name']:
+                account = accounts.get(row.instructor.strip().lower())
+                planned['instructor_name'] = account['full_name'] if account else row.instructor
+                planned['instructor_id'] = account['id'] if account else None
             continue
 
         if section['id'] not in class_lists:
