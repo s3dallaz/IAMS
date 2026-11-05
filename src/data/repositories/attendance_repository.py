@@ -44,7 +44,8 @@ class AttendanceRepository:
         liveness_score: Optional[float] = None,
         marked_by: str = 'system',
         notes: Optional[str] = None,
-        marked_at: Optional[str] = None
+        marked_at: Optional[str] = None,
+        arrived_at: Optional[str] = None
     ) -> int:
         """
         Create a new attendance record in the database.
@@ -59,10 +60,12 @@ class AttendanceRepository:
             liveness_score: Liveness detection score (optional)
             marked_by: Who marked the attendance (default: 'system')
             notes: Additional notes (optional)
-        
+            arrived_at: Earlier time present / late is judged by (optional;
+                None = marked_at)
+
         Returns:
             Database ID of the newly created attendance record
-        
+
         Raises:
             sqlite3.IntegrityError: If duplicate (session_id, student_id) or invalid foreign key
             sqlite3.Error: On other database errors
@@ -70,18 +73,18 @@ class AttendanceRepository:
         query = """
             INSERT INTO attendance_records (
                 session_id, student_id, status, marked_at, detection_confidence,
-                liveness_score, marked_by, notes
+                liveness_score, marked_by, notes, arrived_at
             )
-            VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)
+            VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?)
         """
-        
+
         try:
             with get_db_connection(self.database_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     query,
                     (session_id, student_id, status, marked_at, detection_confidence,
-                      liveness_score, marked_by, notes)
+                      liveness_score, marked_by, notes, arrived_at)
                 )
                 attendance_id = cursor.lastrowid
                 logger.info(
@@ -439,7 +442,7 @@ class AttendanceRepository:
         """
         query = f"""
             SELECT s.id AS student_db_id, s.student_id, s.name, s.department,
-                   COALESCE(a.status, 'absent') AS status, a.id AS record_id, a.marked_at,
+                   COALESCE(a.status, 'absent') AS status, a.id AS record_id, a.marked_at, a.arrived_at,
                    a.detection_confidence, a.liveness_score, a.marked_by, a.verified_by, a.notes,
                    COALESCE(a.left_early, 0) AS left_early
             {self._ROSTER_FROM}
@@ -501,7 +504,8 @@ class AttendanceRepository:
     def regrade_session(self, session_id: int, late_cutoff: str) -> int:
         """
         Re-decide present / late for every present or late record of a
-        session: marked before `late_cutoff` = present, otherwise late.
+        session: arrived (arrived_at, else marked_at) before `late_cutoff` =
+        present, otherwise late.
         Absent records, and statuses set or changed by hand (marked_by /
         verified_by = MANUAL_MARKER), are left alone.
         
@@ -514,11 +518,13 @@ class AttendanceRepository:
         """
         query = """
             UPDATE attendance_records
-            SET status = CASE WHEN datetime(marked_at) < datetime(:cutoff) THEN 'present' ELSE 'late' END
+            SET status = CASE WHEN datetime(COALESCE(arrived_at, marked_at)) < datetime(:cutoff)
+                              THEN 'present' ELSE 'late' END
             WHERE session_id = :session_id
               AND status IN ('present', 'late')
               AND verified_by IS NULL AND COALESCE(marked_by, '') != :manual
-              AND status != CASE WHEN datetime(marked_at) < datetime(:cutoff) THEN 'present' ELSE 'late' END
+              AND status != CASE WHEN datetime(COALESCE(arrived_at, marked_at)) < datetime(:cutoff)
+                                 THEN 'present' ELSE 'late' END
         """
         
         try:

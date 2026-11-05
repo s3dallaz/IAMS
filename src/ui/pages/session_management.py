@@ -526,6 +526,9 @@ def _render_roster(
         'Student ID': r['student_id'],
         'Student Name': r['name'],
         'Marked At': format_datetime(r['marked_at']) if r['marked_at'] else "",
+        # Present / late is judged by this time: first seen by the camera, or
+        # the start of the line the student was in (empty = Marked At)
+        'Arrived': format_datetime(r['arrived_at']) if r.get('arrived_at') else "",
         'Confidence': r['detection_confidence'],
         'Liveness': r['liveness_score'],
         'Marked By': marked_by_label(r['marked_by'], r.get('verified_by')),

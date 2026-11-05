@@ -306,6 +306,15 @@ class RealTimeAttendanceManager:
         self._session_id: Optional[int] = None
         self._marked_students: Set[int] = set()  # Set of student_db_id already marked for current session
         self._cooldown_tracker: Dict[int, float] = {}  # student_db_id -> last_processed_timestamp
+        # Present / late counts from the moment a student was first recognised,
+        # not from the end of the liveness test (config.FIRST_SEEN_MAX_WAIT_SECONDS):
+        # student_db_id -> when first recognised, for students not marked yet.
+        self._first_seen: Dict[int, float] = {}
+        # The line at the camera: students stepping up one after another with
+        # at most config.LATE_LINE_GAP_SECONDS between them. When the current
+        # line began and when someone to be marked was last in front.
+        self._line_started_at: Optional[float] = None
+        self._line_last_seen: Optional[float] = None
         # Students the session may mark (its section's class list); None = everyone.
         # Recognition still uses the whole gallery: an outsider is recognised as
         # themselves (and refused) instead of matching a look-alike on the list.
@@ -458,6 +467,9 @@ class RealTimeAttendanceManager:
         self._session_id = session_id
         self._marked_students.clear()
         self._cooldown_tracker.clear()
+        self._first_seen.clear()
+        self._line_started_at = None
+        self._line_last_seen = None
         self._student_record_cache.clear()
         self._tracked_face = None
 
@@ -651,6 +663,34 @@ class RealTimeAttendanceManager:
         recent = list(self._spoof_scores)[-config.ANTI_SPOOF_MIN_FRAMES:]
         return (len(recent) < config.ANTI_SPOOF_MIN_FRAMES
                 or any(s < config.ANTI_SPOOF_THRESHOLD for s in recent))
+
+    def _note_arrival(self, student_db_id: int, now: float) -> None:
+        """
+        A student who still has to be marked is in front of the camera: keep
+        the time they were first recognised, and keep the line going (a gap
+        longer than config.LATE_LINE_GAP_SECONDS starts a new line).
+        """
+        if self._line_last_seen is None or now - self._line_last_seen > config.LATE_LINE_GAP_SECONDS:
+            self._line_started_at = now
+        self._line_last_seen = now
+        first = self._first_seen.get(student_db_id)
+        if first is None or now - first > config.FIRST_SEEN_MAX_WAIT_SECONDS:
+            self._first_seen[student_db_id] = now   # first time, or back much later
+
+    def _keep_line_going(self, now: float) -> None:
+        """People crowd the camera (several faces): a running line does not break."""
+        if self._line_last_seen is not None and now - self._line_last_seen <= config.LATE_LINE_GAP_SECONDS:
+            self._line_last_seen = now
+
+    def _arrival_times(self, student_db_id: int, now: float) -> Tuple[Optional[str], Optional[str]]:
+        """(first seen, start of the line) as local times for marking this student now."""
+        def local(t: float) -> str:
+            return datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S')
+
+        first = self._first_seen.get(student_db_id)
+        arrived_at = local(first) if first is not None and now - first <= config.FIRST_SEEN_MAX_WAIT_SECONDS else None
+        line_since = local(self._line_started_at) if self._line_started_at is not None else None
+        return arrived_at, line_since
 
     def _challenge_seconds_left(self, current_time: float) -> Optional[float]:
         if self._challenge_started_at is None or config.LIVENESS_CHALLENGE_TIMEOUT <= 0:
@@ -1111,6 +1151,7 @@ class RealTimeAttendanceManager:
             self._tracked_face = None
             self._last_face = None
             self._reset_liveness()
+            self._keep_line_going(current_time)
             return RealTimeAttendanceResult(
                 session_id=target_session,
                 faces_detected=len(detected_faces),
@@ -1461,6 +1502,11 @@ class RealTimeAttendanceManager:
             not_listed.not_in_class = True
             return not_listed
 
+        # A student still to be marked is in front: present / late will count
+        # from now (or from when they were first seen), not from the end of the test
+        if student_db_id not in self._marked_students:
+            self._note_arrival(student_db_id, current_time)
+
         # Step E: Verify Liveness Requirement: spoof checks, blinks + challenge
         liveness_reason = None
         if self.require_liveness:
@@ -1607,7 +1653,10 @@ class RealTimeAttendanceManager:
                     reason=f"{label.capitalize()} recorded"
                 )
 
-        # Step H: Mark Attendance via AttendanceService
+        # Step H: Mark Attendance via AttendanceService. Without an explicit
+        # time, present / late counts from when the student arrived.
+        arrived_at, line_since = (None, None) if marked_at is not None \
+            else self._arrival_times(student_db_id, current_time)
         try:
             attendance_id = self.attendance_service.record_attendance(
                 session_id=target_session,
@@ -1616,11 +1665,14 @@ class RealTimeAttendanceManager:
                 detection_confidence=det_conf,
                 liveness_score=liveness_confidence,
                 marked_by=self.marked_by,
-                notes="Marked via Real-Time Computer Vision"
+                notes="Marked via Real-Time Computer Vision",
+                arrived_at=arrived_at,
+                line_since=line_since
             )
 
             # Update cache
             self._marked_students.add(student_db_id)
+            self._first_seen.pop(student_db_id, None)
 
             # Audit photo of who was marked (for teacher review)
             self._save_snapshot(frame, bbox, target_session, student_id_str, current_time)
@@ -1663,6 +1715,7 @@ class RealTimeAttendanceManager:
 
         except DuplicateAttendanceError:
             self._marked_students.add(student_db_id)
+            self._first_seen.pop(student_db_id, None)
             self._reset_liveness()
             return FaceProcessingResult(
                 bbox=bbox,

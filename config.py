@@ -359,6 +359,24 @@ LIVENESS_FACE_LOST_GRACE: float = _env_float("LIVENESS_FACE_LOST_GRACE", 2.0)
 BACKGROUND_FACE_MAX_RATIO: float = _env_float("BACKGROUND_FACE_MAX_RATIO", 0.5)
 
 # ----------------------------------------------------------------------------
+# Present / late: time spent at the camera does not make a student late
+# ----------------------------------------------------------------------------
+# A student counts from the moment the camera first recognised them, not from
+# the moment the blink / head-turn test finished - if the test finished within
+# this many seconds of that moment. Later (e.g. they left and came back), the
+# time the test finished counts.
+FIRST_SEEN_MAX_WAIT_SECONDS: float = _env_float("FIRST_SEEN_MAX_WAIT_SECONDS", 60.0)
+
+# Line at the camera: students stepping up one after another, with at most
+# this many seconds between one student and the next, form one line.
+LATE_LINE_GAP_SECONDS: float = _env_float("LATE_LINE_GAP_SECONDS", 20.0)
+
+# A line that was already at the camera when the late time passed keeps
+# everyone in it Present, for at most this many minutes after the late time
+# (0 turns the line rule off).
+LATE_LINE_GRACE_MINUTES: float = _env_float("LATE_LINE_GRACE_MINUTES", 5.0)
+
+# ----------------------------------------------------------------------------
 # Spoof (presentation attack) detection - part of the liveness requirement
 # ----------------------------------------------------------------------------
 # Blinks and head turns can be replayed from a video, so with liveness required

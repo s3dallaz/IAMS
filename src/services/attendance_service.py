@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime, timedelta
 
+import config
 from src.data.repositories.attendance_repository import AttendanceRepository, MANUAL_MARKER
 from src.data.repositories.student_repository import StudentRepository
 from src.data.repositories.session_repository import SessionRepository
@@ -64,6 +65,22 @@ class SessionNotAcceptingAttendanceError(AttendanceServiceError):
     pass
 
 
+def _valid_time(value: Optional[str], name: str) -> Optional[str]:
+    """A local 'YYYY-MM-DD HH:MM:SS' time, or None for an empty value."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InvalidAttendanceDataError(f"{name} must be a string")
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        datetime.fromisoformat(value.replace(' ', 'T'))
+    except ValueError:
+        raise InvalidAttendanceDataError(f"{name} must be a valid ISO format datetime")
+    return value
+
+
 # ============================================================================
 # Attendance Service
 # ============================================================================
@@ -109,7 +126,9 @@ class AttendanceService:
         detection_confidence: Optional[float] = None,
         liveness_score: Optional[float] = None,
         marked_by: str = 'system',
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        arrived_at: Optional[str] = None,
+        line_since: Optional[str] = None
     ) -> int:
         """
         Record attendance for a student in a session.
@@ -130,10 +149,16 @@ class AttendanceService:
             liveness_score: Liveness detection score (0.0-1.0, optional)
             marked_by: Who marked the attendance (default: 'system')
             notes: Additional notes (optional)
-        
+            arrived_at: When the camera first recognised the student (local
+                'YYYY-MM-DD HH:MM:SS', optional). Present / late is judged by
+                it when it is earlier than marked_at.
+            line_since: When the line at the camera the student was in began
+                (optional). If that line was already there at the late time,
+                the student stays present (config.LATE_LINE_GRACE_MINUTES).
+
         Returns:
             Database ID of the newly created attendance record
-        
+
         Raises:
             InvalidAttendanceDataError: If validation fails
             SessionNotAcceptingAttendanceError: If session cannot accept attendance
@@ -216,9 +241,16 @@ class AttendanceService:
             if not notes:
                 notes = None
         
-        # Calculate attendance status (present vs late)
-        status = self._calculate_attendance_status(session, marked_at)
-        
+        # Calculate attendance status (present vs late) from the time the
+        # student arrived, which may be earlier than the mark itself
+        judged_at, line_used = self._arrival_time(session, marked_at,
+                                                  _valid_time(arrived_at, 'arrived_at'),
+                                                  _valid_time(line_since, 'line_since'))
+        status = self._calculate_attendance_status(session, judged_at)
+        if line_used:
+            line_note = f"In the line at the camera since {judged_at[11:19]}"
+            notes = f"{notes}; {line_note}" if notes else line_note
+
         # Record attendance through repository
         try:
             attendance_id = self.attendance_repo.create_attendance(
@@ -229,7 +261,8 @@ class AttendanceService:
                 detection_confidence=detection_confidence,
                 liveness_score=liveness_score,
                 marked_by=marked_by,
-                notes=notes
+                notes=notes,
+                arrived_at=judged_at if judged_at != marked_at else None
             )
             logger.info(
                 f"Attendance recorded: Session {session_id}, Student {student_id}, "
@@ -250,6 +283,40 @@ class AttendanceService:
             logger.error(f"Database error recording attendance: {e}")
             raise InvalidAttendanceDataError(f"Failed to record attendance: {e}")
     
+    @staticmethod
+    def _late_cutoff(session: Dict[str, Any]) -> datetime:
+        """Start time + late threshold (default 15 minutes)."""
+        start_time = datetime.fromisoformat(session['start_time'].replace(' ', 'T'))
+        late_threshold_minutes = session.get('late_threshold_minutes', 15)
+        if late_threshold_minutes is None:
+            late_threshold_minutes = 15
+        return start_time + timedelta(minutes=late_threshold_minutes)
+
+    def _arrival_time(self, session: Dict[str, Any], marked_at: str, arrived_at: Optional[str],
+                      line_since: Optional[str]) -> tuple:
+        """
+        The time present / late is judged by, and whether the line rule gave it.
+
+        - arrived_at (first seen by the camera) counts when it is earlier than
+          marked_at; a later one is ignored.
+        - A line that began before the late time and that the student reached
+          at most config.LATE_LINE_GRACE_MINUTES after it: its start time counts.
+        """
+        def parse(value: str) -> datetime:
+            return datetime.fromisoformat(value.replace(' ', 'T'))
+
+        judged_at = marked_at
+        if arrived_at is not None and parse(arrived_at) < parse(marked_at):
+            judged_at = arrived_at
+
+        grace = timedelta(minutes=config.LATE_LINE_GRACE_MINUTES)
+        if line_since is not None and grace > timedelta(0):
+            cutoff = self._late_cutoff(session)
+            arrival, line_start = parse(judged_at), parse(line_since)
+            if line_start < cutoff <= arrival and arrival - cutoff <= grace:
+                return line_since, True
+        return judged_at, False
+
     def _calculate_attendance_status(self, session: Dict[str, Any], marked_at: str) -> str:
         """
         Calculate attendance status based on session start time and late threshold.
@@ -265,18 +332,9 @@ class AttendanceService:
         Returns:
             Attendance status: 'present' or 'late'
         """
-        # Parse timestamps
-        start_time = datetime.fromisoformat(session['start_time'].replace(' ', 'T'))
         marked_time = datetime.fromisoformat(marked_at.replace(' ', 'T'))
-        
-        # Get late threshold (default to 15 if not set)
-        late_threshold_minutes = session.get('late_threshold_minutes', 15)
-        if late_threshold_minutes is None:
-            late_threshold_minutes = 15
-        
-        # Calculate late cutoff time
-        late_cutoff = start_time + timedelta(minutes=late_threshold_minutes)
-        
+        late_cutoff = self._late_cutoff(session)
+
         # Determine status
         if marked_time < late_cutoff:
             return AttendanceStatus.PRESENT

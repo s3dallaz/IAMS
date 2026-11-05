@@ -373,7 +373,7 @@ def test_report_service_export_session_summary_csv(populated_db):
     rows = list(csv.reader(io.StringIO(csv_str)))
     assert ["Absences", "1"] in rows
     # Every expected student is listed: present, late, and the absent one
-    statuses = {r[1]: r[4] for r in rows if len(r) == 8 and r[0].startswith("STU")}
+    statuses = {r[1]: r[5] for r in rows if len(r) == 9 and r[0].startswith("STU")}
     assert statuses == {"Alice Smith": "PRESENT", "Bob Jones": "LATE", "Charlie Brown": "ABSENT"}
 
 

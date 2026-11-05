@@ -161,7 +161,7 @@ After signing in, the sidebar shows the pages your role may open:
 3. **Session Management** - three tabs:
    * **Sessions List** - every session with its status and present / late counts. Click a row to get its buttons: **Start Now**, **Close**, **View**, **Edit**, **Delete** (an active session must be closed before it can be deleted).
    * **Create New Session** - first pick **Course → Section** (or *No section*), then name, start date and time, optional end time, late threshold, and *Scheduled* or *Active (start now)*. The section can also be changed later with **Edit**.
-   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed). In a section session, **Mark a student who is not on the class list** adds someone who attended but isn't on the list.
+   * **Session Details & Records** - the session's info, the counts (expected / present / late / absent / attendance %) and the list of students, sorted present → late → absent. **Arrived** shows the time present / late was judged by when it is earlier than *Marked At* (first seen by the camera, or the start of the line the student was in). Use the filter buttons or the search box to find someone; at most 500 rows are shown at once to keep the page fast. **To fix attendance**, double-click a student's *Status* and pick Present, Late or Absent — it is saved at once (possible once the session has started, also after it closed). In a section session, **Mark a student who is not on the class list** adds someone who attended but isn't on the list.
 4. **Student Registry** - add / edit students, manage their face photos, bulk import.
 5. **Courses & Sections** - three tabs:
    * **Courses** - add, edit, deactivate or delete courses (e.g. TM103). Select a row for its buttons.
@@ -184,6 +184,8 @@ After signing in, the sidebar shows the pages your role may open:
 | A session is started by hand **before** its scheduled time | It keeps its scheduled start time |
 | The start time or late threshold of a session is edited | Every mark in it is re-checked as present or late against the new values |
 | A session has no end time | It stays active until someone closes it |
+| A student takes a few seconds for the blink / head-turn test | Present or late counts from the moment the camera **first recognised** them, not from the end of the test (if the test ends within 60 seconds; someone who leaves and comes back later counts from their return) |
+| A line of students is still at the camera when the late time passes | Students who step up one after another (at most 20 seconds between them) form one line. A line that began **before** the late time keeps everyone in it **Present**, for up to 5 minutes after the late time. Their record says *In the line at the camera since …* |
 | A session belongs to a **section** | Only the section's class list is expected and counted absent (students added to the list before the session started), plus anyone marked by hand. The camera marks only class-list students; it still recognises everyone, so a visitor is never mistaken for a look-alike on the list |
 | A session has **check-out** on (setting when creating / editing it, or on *Start session now*) | In its last N minutes (default 10) the camera asks everyone to show their face again (**CHECK-OUT** on the video). Needs an end time to start by itself; **🚪 Start check-out now** starts it by hand |
 | The instructor closes a session whose check-out hasn't run (e.g. no end time) | **⏹️ Close** asks first: **🚪 Check-out now, then close** runs the check-out and closes the session by itself when it ends, or **Close now, without check-out** |
@@ -260,6 +262,15 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 # A face narrower than this share of the face in front counts as someone in
 # the background and is ignored (0 = any second face blocks marking)
 # BACKGROUND_FACE_MAX_RATIO=0.5
+
+# Present / late: count from the first time the camera recognised the student
+# (if the liveness test ends within this many seconds)
+# FIRST_SEEN_MAX_WAIT_SECONDS=60
+# Line at the camera: at most this many seconds between two students
+# LATE_LINE_GAP_SECONDS=20
+# A line that began before the late time keeps students Present for this
+# many minutes after it (0 = off)
+# LATE_LINE_GRACE_MINUTES=5
 
 # Server
 # STREAMLIT_SERVER_PORT=8502

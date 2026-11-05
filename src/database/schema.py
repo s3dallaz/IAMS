@@ -154,6 +154,10 @@ CREATE TABLE IF NOT EXISTS attendance_records (
     verified_at TIMESTAMP,
     notes TEXT,
     left_early BOOLEAN DEFAULT 0,
+    -- Time present / late is judged by, when it is earlier than marked_at:
+    -- first seen by the camera, or the start of the line the student was in.
+    -- NULL = marked_at.
+    arrived_at TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
     FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
     UNIQUE(session_id, student_id)
@@ -370,6 +374,9 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     if 'left_early' not in record_columns:
         conn.execute("ALTER TABLE attendance_records ADD COLUMN left_early BOOLEAN DEFAULT 0")
         logger.info("Added attendance_records.left_early")
+    if 'arrived_at' not in record_columns:
+        conn.execute("ALTER TABLE attendance_records ADD COLUMN arrived_at TIMESTAMP")
+        logger.info("Added attendance_records.arrived_at (existing records are judged by marked_at)")
     check_columns = {row[1] for row in conn.execute("PRAGMA table_info(attendance_checks)")}
     if check_columns and 'camera_seen_at' not in check_columns:
         conn.execute("ALTER TABLE attendance_checks ADD COLUMN camera_seen_at TIMESTAMP")

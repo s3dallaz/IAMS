@@ -214,7 +214,8 @@ class ReportService:
         writer.writerow(["Attendance Rate", _rate(session_stats.get('attendance_percentage')) if started else not_started])
         writer.writerow([])
         
-        writer.writerow(["Student ID", "Student Name", "Department", "Marked Time", "Status", "Confidence", "Liveness", "Marked By"])
+        writer.writerow(["Student ID", "Student Name", "Department", "Marked Time", "Arrived", "Status",
+                         "Confidence", "Liveness", "Marked By"])
         rows = self.statistics_service.get_session_roster(session_stats['session_id']) if started else []
         for r in rows:
             writer.writerow([
@@ -222,6 +223,7 @@ class ReportService:
                 r.get('name', ''),
                 r.get('department', '') or '',
                 r.get('marked_at', '') or '',
+                r.get('arrived_at', '') or '',   # present / late judged by it (empty = Marked Time)
                 r.get('status', '').upper(),
                 f"{r['detection_confidence']:.2f}" if r.get('detection_confidence') is not None else '',
                 f"{r['liveness_score']:.2f}" if r.get('liveness_score') is not None else '',
