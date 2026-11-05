@@ -21,6 +21,7 @@ from src.computer_vision.face_embedder import FaceEmbedder, FaceEmbedding, FaceE
 from src.data.repositories.enrollment_repository import EnrollmentRepository
 from src.data.repositories.student_repository import StudentRepository
 from src.services.face_index import SIMILAR_WARN_FRACTION, DuplicatePair, FaceCheck, FaceIndex
+from src.services.activity_log import ActivityLog, Category
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -242,6 +243,11 @@ class EnrollmentService:
         # The attendance engine then finds the new sample in the cache instead
         # of reading it at start-up (bulk imports update the cache once at the end)
         self.update_gallery_cache()
+        ActivityLog(self.database_path).record(
+            Category.STUDENTS, 'face_added',
+            f"Added a face photo ({enrollment_method}) for {student['name']} ({student['student_id']})"
+            + (" - confirmed although it looked like another student / unlike their photos" if confirmed else ""),
+            target_type='student', target_id=student_db_id)
         return enrollment_id
 
     def prepare_face_sample(self, face_image: np.ndarray) -> Tuple[DetectedFace, np.ndarray, FaceEmbedding]:
@@ -708,4 +714,8 @@ class EnrollmentService:
                     pass
                     
         logger.info(f"Cleared {deleted_count} face sample(s) for student {student_id_str}")
+        ActivityLog(self.database_path).record(
+            Category.STUDENTS, 'faces_deleted',
+            f"Deleted all {deleted_count} face photo(s) of {student['name']} ({student_id_str})",
+            target_type='student', target_id=student_db_id)
         return deleted_count

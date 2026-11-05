@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from src.data.repositories.student_repository import StudentRepository
+from src.services.activity_log import ActivityLog, Category, changes, describe_changes
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -44,6 +45,10 @@ class StudentNotFoundError(StudentServiceError):
 # Student Service
 # ============================================================================
 
+def _label(student: Dict[str, Any]) -> str:
+    return f"{student.get('name', '?')} ({student.get('student_id', '?')})"
+
+
 class StudentService:
     """
     Service layer for student management.
@@ -63,7 +68,12 @@ class StudentService:
             database_path: Path to database file. If None, uses config.DATABASE_PATH
         """
         self.repository = StudentRepository(database_path)
+        self.activity = ActivityLog(database_path)
         logger.debug("StudentService initialized")
+
+    def _log(self, action: str, summary: str, student_db_id: int, details: Optional[Dict[str, Any]] = None) -> None:
+        self.activity.record(Category.STUDENTS, action, summary, target_type='student', target_id=student_db_id,
+                             details=details)
     
     def create_student(
         self,
@@ -158,6 +168,7 @@ class StudentService:
                 raise StudentServiceError(f"Database insertion verification failed for student ID '{student_id}'.")
                 
             logger.info(f"Student created and verified successfully: {student_id} (DB ID: {student_db_id})")
+            self._log('student_added', f"Added student {_label(saved_student)}", student_db_id)
             return student_db_id
             
         except sqlite3.IntegrityError as e:
@@ -347,6 +358,7 @@ class StudentService:
             if not isinstance(is_active, bool):
                 raise InvalidStudentDataError("is_active must be a boolean")
         
+        before = self.repository.get_by_id(student_db_id) or {}
         # Update through repository
         try:
             rows_affected = self.repository.update_student(
@@ -361,6 +373,12 @@ class StudentService:
             
             if rows_affected > 0:
                 logger.info(f"Student DB ID {student_db_id} updated successfully")
+                after = self.repository.get_by_id(student_db_id) or {}
+                changed = changes(before, after, ('student_id', 'name', 'email', 'department', 'notes', 'is_active'))
+                if changed:
+                    self._log('student_updated', f"Changed student {_label(before)}: "
+                              f"{describe_changes(changed, {'student_id': 'student ID', 'is_active': 'active'})}",
+                              student_db_id, details=changed)
             
             return rows_affected
             
@@ -393,9 +411,10 @@ class StudentService:
             raise StudentNotFoundError(f"Student with DB ID {student_db_id} not found")
         
         rows_affected = self.repository.activate_student(student_db_id)
-        
+
         if rows_affected > 0:
             logger.info(f"Student DB ID {student_db_id} activated successfully")
+            self._log('student_activated', f"Activated student {_label(existing_student)}", student_db_id)
         
         return rows_affected
     
@@ -423,9 +442,10 @@ class StudentService:
             raise StudentNotFoundError(f"Student with DB ID {student_db_id} not found")
         
         rows_affected = self.repository.deactivate_student(student_db_id)
-        
+
         if rows_affected > 0:
             logger.info(f"Student DB ID {student_db_id} deactivated successfully")
+            self._log('student_deactivated', f"Deactivated student {_label(existing_student)}", student_db_id)
         
         return rows_affected
 
@@ -451,9 +471,11 @@ class StudentService:
             raise StudentNotFoundError(f"Student with DB ID {student_db_id} not found")
             
         rows_affected = self.repository.delete_student(student_db_id)
-        
+
         if rows_affected > 0:
             logger.info(f"Student DB ID {student_db_id} deleted successfully")
+            self._log('student_deleted', f"Deleted student {_label(existing_student)} with their attendance "
+                      f"and face data", student_db_id, details={'student': existing_student})
             
         return rows_affected
 

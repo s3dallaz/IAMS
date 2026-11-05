@@ -32,6 +32,7 @@ from src.services.attendance_service import (
 from src.services.course_service import CourseService
 from src.services.student_service import StudentService
 from src.ui.access import owns_session, sees_everything, visible_sessions
+from src.ui.pages.activity_log import render_session_history
 from src.ui.pages.checks_panel import render_checks_panel, render_close_session
 from src.ui.pages.login import current_user
 from src.utils.logger import get_logger
@@ -372,6 +373,7 @@ def render_session_details_tab(
 
     st.markdown("---")
     render_checks_panel(session, key=f"details_checks_{session['id']}")
+    render_session_history(session['id'], key=f"details_history_{session['id']}")
     st.markdown("---")
 
     # Session Attendance Summary Metrics: counted over the same roster the

@@ -12,17 +12,21 @@ from dotenv import load_dotenv
 import config
 from src.utils.logger import get_logger
 from src.database.schema import initialize_database
+from src.services.activity_log import set_actor_provider
 from src.services.auth_service import AuthService
 from src.services.course_service import CourseService
 from src.services.session_scheduler import start_session_scheduler
 from src.ui.access import pages_for
 from src.ui.pages.login import (
-    has_pending_recovery_code, load_signed_in_user, render_account_box, render_first_setup,
+    acting_user, has_pending_recovery_code, load_signed_in_user, render_account_box, render_first_setup,
     render_forced_password_change, render_login, render_recovery_code_screen,
 )
 
 # Load environment variables
 load_dotenv()
+
+# The activity log records changes under the signed-in user of the page making them
+set_actor_provider(acting_user)
 
 # Set up logging
 logger = get_logger(__name__)
@@ -111,6 +115,14 @@ def main():
         render_ai_assistant_page()
     elif page == "Users":
         render_users_page()
+    elif page == "Activity Log":
+        render_activity_log_page()
+
+
+def render_activity_log_page():
+    """Render the Activity Log page."""
+    from src.ui.pages.activity_log import render_activity_log
+    render_activity_log()
 
 
 def render_home_page():

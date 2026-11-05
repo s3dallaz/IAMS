@@ -13,9 +13,19 @@ from datetime import datetime, timedelta
 from src.data.repositories.session_repository import SessionRepository
 from src.data.repositories.attendance_repository import AttendanceRepository
 from src.data.repositories.course_repository import CourseRepository
+from src.services.activity_log import (
+    SYSTEM_ACTOR, ActivityLog, Category, acting_as, changes, describe_changes,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# What the activity log compares when a session is edited
+SESSION_LOGGED_FIELDS = ('session_name', 'course_code', 'section_id', 'start_time', 'end_time',
+                         'late_threshold_minutes', 'notes', 'checkout_enabled', 'checkout_minutes')
+SESSION_FIELD_LABELS = {'session_name': 'name', 'course_code': 'course', 'section_id': 'section',
+                        'start_time': 'start', 'end_time': 'end', 'late_threshold_minutes': 'late after (min)',
+                        'checkout_enabled': 'check-out', 'checkout_minutes': 'check-out minutes'}
 
 
 # ============================================================================
@@ -107,6 +117,11 @@ class SessionService:
         self.repository = SessionRepository(database_path)
         self.attendance_repository = AttendanceRepository(database_path)
         self.course_repository = CourseRepository(database_path)
+        self.activity = ActivityLog(database_path)
+
+    def _log(self, action: str, summary: str, session_id: int, details: Optional[Dict[str, Any]] = None) -> None:
+        self.activity.record(Category.SESSIONS, action, summary, target_type='session', target_id=session_id,
+                             session_id=session_id, details=details)
         logger.debug("SessionService initialized")
     
     def create_session(
@@ -248,6 +263,18 @@ class SessionService:
                 checkout_minutes=checkout_minutes
             )
             logger.info(f"Session created successfully: {session_name} (ID: {session_id})")
+            section = self.course_repository.get_section(section_id) if section_id else None
+            where = f" for {section['course_code']} / {section['name']}" if section else (
+                f" ({course_code})" if course_code else "")
+            when = "running now" if status == SessionStatus.ACTIVE else f"starts {start_time}"
+            self._log('session_created', f'Created session #{session_id} "{session_name}"{where}, {when}'
+                      + (f", ends {end_time}" if end_time else ", no end time")
+                      + (f", check-out {checkout_minutes} min" if checkout_enabled else ""),
+                      session_id, details={'start_time': start_time, 'end_time': end_time, 'status': status,
+                                           'section_id': section_id, 'course_code': course_code,
+                                           'late_threshold_minutes': late_threshold_minutes,
+                                           'checkout_enabled': bool(checkout_enabled),
+                                           'checkout_minutes': checkout_minutes})
             return session_id
         except sqlite3.Error as e:
             logger.error(f"Database error creating session: {e}")
@@ -379,6 +406,8 @@ class SessionService:
             )
         
         logger.info(f"Session {session_id} activated")
+        self._log('session_started', f'Started session #{session_id} "{session["session_name"]}" by hand'
+                  + (" (after its scheduled time: lateness counts from now)" if fresh_start else ""), session_id)
         return rows_affected
     
     def close_session(self, session_id: int) -> int:
@@ -421,6 +450,7 @@ class SessionService:
             raise InvalidSessionStateError("Session is already closed")
         
         logger.info(f"Session {session_id} closed")
+        self._log('session_closed', f'Closed session #{session_id} "{session["session_name"]}"', session_id)
         return rows_affected
     
     def can_accept_attendance(self, session_id: int) -> bool:
@@ -664,8 +694,15 @@ class SessionService:
             
             if rows_affected > 0:
                 logger.info(f"Session {session_id} updated")
-                if regrade:
-                    self.regrade_attendance(session_id)
+                regraded = self.regrade_attendance(session_id) if regrade else 0
+                after = self.repository.get_by_id(session_id) or {}
+                changed = changes(session, after, SESSION_LOGGED_FIELDS)
+                if changed:
+                    self._log('session_updated',
+                              f'Changed session #{session_id} "{session["session_name"]}": '
+                              f'{describe_changes(changed, SESSION_FIELD_LABELS)}'
+                              + (f" ({regraded} student(s) re-graded present / late)" if regraded else ""),
+                              session_id, details=changed)
             
             return rows_affected
         except sqlite3.Error as e:
@@ -742,8 +779,14 @@ class SessionService:
             raise SessionNotFoundError(f"Session with ID {session_id} not found")
         if session['status'] == SessionStatus.ACTIVE:
             raise InvalidSessionStateError("Close the session before deleting it")
-        
-        return self.repository.delete_session(session_id)
+
+        records = len(self.attendance_repository.get_by_session(session_id))
+        rows = self.repository.delete_session(session_id)
+        if rows:
+            self._log('session_deleted', f'Deleted session #{session_id} "{session["session_name"]}" '
+                      f'({session["status"]}, started {session["start_time"]}) with its {records} attendance record(s)',
+                      session_id, details={'session': session, 'attendance_records': records})
+        return rows
     
     def apply_scheduled_transitions(self, now: Optional[datetime] = None) -> Dict[str, List[int]]:
         """
@@ -760,11 +803,20 @@ class SessionService:
         """
         now = now or datetime.now()
         changed = self.repository.apply_due_transitions(now.strftime(DB_DATETIME_FORMAT))
-        for session_id in changed['started']:
-            logger.info(f"Session {session_id} started automatically at its scheduled time")
-        for session_id in changed['closed']:
-            logger.info(f"Session {session_id} closed automatically at its end time")
+        with acting_as(SYSTEM_ACTOR):
+            for session_id in changed['started']:
+                logger.info(f"Session {session_id} started automatically at its scheduled time")
+                self._log('session_started_auto', f'Session #{session_id} "{self._name(session_id)}" '
+                          f'started by itself at its start time', session_id)
+            for session_id in changed['closed']:
+                logger.info(f"Session {session_id} closed automatically at its end time")
+                self._log('session_closed_auto', f'Session #{session_id} "{self._name(session_id)}" '
+                          f'closed by itself at its end time', session_id)
         return changed
+
+    def _name(self, session_id: int) -> str:
+        session = self.repository.get_by_id(session_id)
+        return session['session_name'] if session else "?"
     
     def get_sessions_overview(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """

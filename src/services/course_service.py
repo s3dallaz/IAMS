@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from src.data.repositories.course_repository import CourseRepository
 from src.data.repositories.user_repository import UserRepository
+from src.services.activity_log import ActivityLog, Category, changes, describe_changes
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -78,6 +79,12 @@ class CourseService:
     def __init__(self, database_path: Optional[Path] = None):
         self.repository = CourseRepository(database_path)
         self.user_repository = UserRepository(database_path)
+        self.activity = ActivityLog(database_path)
+
+    def _log(self, action: str, summary: str, target_type: str, target_id: int,
+             details: Optional[Dict[str, Any]] = None) -> None:
+        self.activity.record(Category.COURSES, action, summary, target_type=target_type, target_id=target_id,
+                             details=details)
 
     # ------------------------------------------------------------------------
     # Courses
@@ -97,9 +104,11 @@ class CourseService:
         if self.repository.get_course_by_code(code):
             raise DuplicateCourseError(f"Course {code} already exists")
         try:
-            return self.repository.create_course(code, name, department, notes)
+            course_id = self.repository.create_course(code, name, department, notes)
         except sqlite3.IntegrityError:
             raise DuplicateCourseError(f"Course {code} already exists")
+        self._log('course_added', f"Added course {code} - {name}", 'course', course_id)
+        return course_id
 
     def get_course(self, course_id: int) -> Optional[Dict[str, Any]]:
         return self.repository.get_course(course_id)
@@ -114,7 +123,7 @@ class CourseService:
         Raises:
             CourseNotFoundError, InvalidCourseDataError, DuplicateCourseError
         """
-        self._require_course(course_id)
+        before = self._require_course(course_id)
         code = clean_course_code(course_code)
         name = _clean(name, "Course name", MAX_COURSE_NAME_LENGTH, required=True)
         other = self.repository.get_course_by_code(code)
@@ -126,11 +135,19 @@ class CourseService:
                                           _clean(notes, "Notes", 500))
         except sqlite3.IntegrityError:
             raise DuplicateCourseError(f"Course {code} already exists")
+        changed = changes(before, self.repository.get_course(course_id) or {},
+                          ('course_code', 'name', 'department', 'notes'))
+        if changed:
+            self._log('course_updated', f"Changed course {before['course_code']}: "
+                      f"{describe_changes(changed, {'course_code': 'code'})}", 'course', course_id, changed)
 
     def set_course_active(self, course_id: int, active: bool) -> None:
         """An inactive course and its sections are hidden from new sessions; nothing is deleted."""
-        self._require_course(course_id)
+        course = self._require_course(course_id)
         self.repository.set_course_active(course_id, active)
+        self._log('course_activated' if active else 'course_deactivated',
+                  f"{'Activated' if active else 'Deactivated'} course {course['course_code']} - {course['name']}",
+                  'course', course_id)
 
     def delete_course(self, course_id: int) -> None:
         """
@@ -147,6 +164,8 @@ class CourseService:
                                    f"deleted. Deactivate it instead - its history is kept.")
         self.repository.delete_course(course_id)
         logger.info(f"Deleted course {course['course_code']}")
+        self._log('course_deleted', f"Deleted course {course['course_code']} - {course['name']} "
+                  f"with its sections and class lists", 'course', course_id, {'course': course})
 
     def _require_course(self, course_id: int) -> Dict[str, Any]:
         course = self.repository.get_course(course_id)
@@ -175,10 +194,13 @@ class CourseService:
         if self.repository.get_section_by_name(course_id, name):
             raise DuplicateCourseError(f"{course['course_code']} already has a section '{name}'")
         try:
-            return self.repository.create_section(course_id, name, instructor_name, _clean(notes, "Notes", 500),
-                                                  instructor_id)
+            section_id = self.repository.create_section(course_id, name, instructor_name,
+                                                        _clean(notes, "Notes", 500), instructor_id)
         except sqlite3.IntegrityError:
             raise DuplicateCourseError(f"{course['course_code']} already has a section '{name}'")
+        self._log('section_added', f"Added section {course['course_code']} / {name}"
+                  + (f" (instructor: {instructor_name})" if instructor_name else ""), 'section', section_id)
+        return section_id
 
     def get_section(self, section_id: int) -> Optional[Dict[str, Any]]:
         """The section with course_code, course_name, student_count and session_count."""
@@ -213,6 +235,13 @@ class CourseService:
                                            _clean(notes, "Notes", 500), instructor_id)
         except sqlite3.IntegrityError:
             raise DuplicateCourseError(f"{section['course_code']} already has a section '{name}'")
+        changed = changes(section, self.repository.get_section(section_id) or {},
+                          ('name', 'instructor_name', 'instructor_id', 'notes'))
+        changed.pop('instructor_id', None) if 'instructor_name' in changed else None
+        if changed:
+            self._log('section_updated', f"Changed section {section['course_code']} / {section['name']}: "
+                      f"{describe_changes(changed, {'instructor_name': 'instructor', 'instructor_id': 'instructor account'})}",
+                      'section', section_id, changed)
 
     def _instructor_name(self, instructor_id: Optional[int], typed_name: Optional[str]) -> Optional[str]:
         """The account's name for a linked instructor, else the typed name (validated)."""
@@ -224,8 +253,11 @@ class CourseService:
         return user['full_name']
 
     def set_section_active(self, section_id: int, active: bool) -> None:
-        self._require_section(section_id)
+        section = self._require_section(section_id)
         self.repository.set_section_active(section_id, active)
+        self._log('section_activated' if active else 'section_deactivated',
+                  f"{'Activated' if active else 'Deactivated'} section {section['course_code']} / {section['name']}",
+                  'section', section_id)
 
     def delete_section(self, section_id: int) -> None:
         """
@@ -241,6 +273,8 @@ class CourseService:
                                    f"can't be deleted. Deactivate it instead - its history is kept.")
         self.repository.delete_section(section_id)
         logger.info(f"Deleted section {section['course_code']} / {section['name']}")
+        self._log('section_deleted', f"Deleted section {section['course_code']} / {section['name']} "
+                  f"and its class list ({section.get('student_count', 0)} student(s))", 'section', section_id)
 
     def _require_section(self, section_id: int) -> Dict[str, Any]:
         section = self.repository.get_section(section_id)
@@ -262,17 +296,40 @@ class CourseService:
 
     def add_students(self, section_id: int, student_db_ids: Iterable[int]) -> int:
         """Add students to a class list (ones already on it are skipped). Returns how many were added."""
-        self._require_section(section_id)
-        added = self.repository.add_students(section_id, list(dict.fromkeys(student_db_ids)))
+        section = self._require_section(section_id)
+        ids = list(dict.fromkeys(student_db_ids))
+        added = self.repository.add_students(section_id, ids)
         logger.info(f"Added {added} student(s) to section {section_id}")
+        if added:
+            self._log('class_list_added', f"Added {added} student(s) to the class list of "
+                      f"{section['course_code']} / {section['name']}{self._names(ids)}", 'section', section_id,
+                      {'student_db_ids': ids[:2000]})
         return added
 
     def remove_students(self, section_id: int, student_db_ids: Iterable[int]) -> int:
         """Remove students from a class list. Returns how many were removed."""
-        self._require_section(section_id)
-        removed = self.repository.remove_students(section_id, list(student_db_ids))
+        section = self._require_section(section_id)
+        ids = list(student_db_ids)
+        names = self._names(ids)          # before they are removed
+        removed = self.repository.remove_students(section_id, ids)
         logger.info(f"Removed {removed} student(s) from section {section_id}")
+        if removed:
+            self._log('class_list_removed', f"Removed {removed} student(s) from the class list of "
+                      f"{section['course_code']} / {section['name']}{names}", 'section', section_id,
+                      {'student_db_ids': ids[:2000]})
         return removed
+
+    def _names(self, student_db_ids: List[int], shown: int = 5) -> str:
+        """': Alice (1), Omar (2) and 3 more' for a short summary."""
+        from src.data.repositories.student_repository import StudentRepository
+        repository = StudentRepository(self.repository.database_path)
+        names = []
+        for student_db_id in student_db_ids[:shown]:
+            student = repository.get_by_id(student_db_id)
+            if student:
+                names.append(f"{student['name']} ({student['student_id']})")
+        more = len(student_db_ids) - shown
+        return (": " + ", ".join(names) + (f" and {more} more" if more > 0 else "")) if names else ""
 
     def get_student_sections(self, student_db_id: int) -> List[Dict[str, Any]]:
         """The sections a student is on."""

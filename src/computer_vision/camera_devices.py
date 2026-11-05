@@ -135,12 +135,16 @@ def load_saved_camera(database_path: Optional[Path] = None) -> Optional[SavedCam
 
 def save_camera(camera: Optional[CameraDevice], database_path: Optional[Path] = None) -> None:
     """Remember the picked camera; None goes back to automatic."""
+    from src.services.activity_log import ActivityLog, Category   # services import this module
     repository = SettingsRepository(database_path)
     if camera is None:
         repository.delete(CAMERA_SETTING_KEY)
     else:
         repository.set(CAMERA_SETTING_KEY, json.dumps({"device_id": camera.device_id, "name": camera.name}),
                        description="Camera picked on the Real-Time Attendance page")
+    ActivityLog(database_path).record(Category.SETTINGS, 'camera_chosen',
+                                      f"Chose the camera: {camera.name}" if camera
+                                      else "Camera set back to automatic")
 
 
 def automatic_camera(devices: Sequence[CameraDevice]) -> Optional[CameraDevice]:

@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.data.repositories.course_repository import CourseRepository
 from src.data.repositories.user_repository import UserRepository
+from src.services.activity_log import ActivityLog, Category, acting_user, changes, describe_changes
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -157,11 +158,24 @@ def validate_password(password: str, username: str = "") -> None:
         raise InvalidUserDataError("The password must mix letters with digits or symbols.")
 
 
+_UNKNOWN_PERSON = {'id': None, 'username': None, 'full_name': "Unknown (not signed in)", 'role': None}
+
+
+def _who(user: Dict[str, Any]) -> str:
+    return f"{user['full_name']} ({user['username']})"
+
+
 class AuthService:
     """Accounts, login and permission checks. Does not contain SQL."""
 
     def __init__(self, database_path: Optional[Path] = None):
         self.repository = UserRepository(database_path)
+        self.activity = ActivityLog(database_path)
+
+    def _log(self, category: str, action: str, summary: str, actor: Optional[Dict[str, Any]] = None,
+             target: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> None:
+        self.activity.record(category, action, summary, actor=actor, details=details,
+                             target_type='user' if target else None, target_id=target['id'] if target else None)
 
     # -- setup / login -------------------------------------------------------
 
@@ -173,7 +187,11 @@ class AuthService:
         """The first IT account. Refused once any account exists."""
         if not self.needs_first_account():
             raise PermissionDeniedError("The first account already exists. Ask IT to create your account.")
-        return self._create(username, full_name, Role.IT, password, must_change_password=False, created_by=None)
+        user_id = self._create(username, full_name, Role.IT, password, must_change_password=False, created_by=None)
+        user = self.repository.get_by_id(user_id)
+        self._log(Category.ACCOUNTS, 'first_account', f"Created the first IT account: {_who(user)}",
+                  actor=user, target=user)
+        return user_id
 
     def authenticate(self, username: str, password: str, now: Optional[datetime] = None) -> Dict[str, Any]:
         """
@@ -188,30 +206,45 @@ class AuthService:
         user = self.repository.get_by_username((username or "").strip())
         if user is None:
             verify_password(password or "", _DUMMY_HASH)   # same time as a known username
+            if (username or "").strip():                   # an empty form is not worth an entry
+                self._log(Category.SIGN_IN, 'sign_in_failed',
+                          f"Failed sign-in: unknown username \"{username.strip()[:40]}\"", actor=_UNKNOWN_PERSON)
             raise InvalidCredentialsError("Wrong username or password.")
 
         locked_until = _parse_utc(user['locked_until'])
         if locked_until and locked_until > now:
+            self._log(Category.SIGN_IN, 'sign_in_refused', "Sign-in refused: the account is locked",
+                      actor=user, target=user)
             raise AccountLockedError(self._locked_message(locked_until, now), locked_until)
 
         if not verify_password(password or "", self.repository.get_password_hash(user['id'])):
-            self._count_failure(user, locked_until, now, "Wrong username or password.")
+            self._count_failure(user, locked_until, now, "Wrong username or password.", what="password")
 
         if not user['is_active']:
+            self._log(Category.SIGN_IN, 'sign_in_refused', "Sign-in refused: the account is deactivated",
+                      actor=user, target=user)
             raise AccountInactiveError("This account is deactivated. Ask an administrator.")
 
         self.repository.record_login(user['id'], now.strftime(DB_TIME_FORMAT))
         logger.info(f"User '{user['username']}' logged in")
+        self._log(Category.SIGN_IN, 'sign_in', "Signed in", actor=user, target=user)
         return self.repository.get_by_id(user['id'])
 
+    def record_sign_out(self, user: Dict[str, Any]) -> None:
+        self._log(Category.SIGN_IN, 'sign_out', "Signed out", actor=user, target=user)
+
     def _count_failure(self, user: Dict[str, Any], locked_until: Optional[datetime], now: datetime,
-                       message: str) -> None:
+                       message: str, what: str) -> None:
         """Count a wrong password / recovery code; lock the account at MAX_FAILED_ATTEMPTS. Always raises."""
         attempts = (0 if locked_until else user['failed_attempts'] or 0) + 1   # an expired lock starts anew
+        self._log(Category.SIGN_IN, 'sign_in_failed',
+                  f"Wrong {what} ({attempts} of {MAX_FAILED_ATTEMPTS} tries)", actor=user, target=user)
         if attempts >= MAX_FAILED_ATTEMPTS:
             until = now + timedelta(minutes=LOCK_MINUTES)
             self.repository.record_failed_login(user['id'], attempts, until.strftime(DB_TIME_FORMAT))
             logger.warning(f"Account '{user['username']}' locked after {attempts} wrong tries")
+            self._log(Category.SIGN_IN, 'account_locked',
+                      f"Account locked for {LOCK_MINUTES} minutes after {attempts} wrong tries", actor=user, target=user)
             raise AccountLockedError(self._locked_message(until, now), until)
         self.repository.record_failed_login(user['id'], attempts, None)
         left = MAX_FAILED_ATTEMPTS - attempts
@@ -246,6 +279,7 @@ class AuthService:
         validate_password(new_password, user['username'])
         self.repository.set_password(user_id, hash_password(new_password), must_change_password=False)
         logger.info(f"User '{user['username']}' changed their password")
+        self._log(Category.ACCOUNTS, 'password_changed', "Changed their own password", actor=user, target=user)
 
     # -- recovery codes --------------------------------------------------------------
 
@@ -258,6 +292,8 @@ class AuthService:
         code = generate_recovery_code()
         self.repository.set_recovery_code_hash(user_id, hash_password(normalize_recovery_code(code)))
         logger.info(f"New recovery code issued for '{user['username']}'")
+        self._log(Category.ACCOUNTS, 'recovery_code_issued', f"New recovery code made for {_who(user)}",
+                  actor=acting_user() or user, target=user)
         return code
 
     def renew_recovery_code(self, user_id: int, current_password: str) -> str:
@@ -292,7 +328,7 @@ class AuthService:
             raise AccountLockedError(self._locked_message(locked_until, now), locked_until)
         if not verify_password(normalize_recovery_code(recovery_code),
                                self.repository.get_recovery_code_hash(user['id'])):
-            self._count_failure(user, locked_until, now, message)
+            self._count_failure(user, locked_until, now, message, what="recovery code")
         if not user['is_active']:
             raise AccountInactiveError("This account is deactivated. Ask an administrator.")
         validate_password(new_password, user['username'])
@@ -301,6 +337,8 @@ class AuthService:
         new_code = self.issue_recovery_code(user['id'])
         self.repository.record_login(user['id'], now.strftime(DB_TIME_FORMAT))
         logger.warning(f"Password of '{user['username']}' reset with its recovery code")
+        self._log(Category.ACCOUNTS, 'password_recovered', "Reset their forgotten password with their recovery code",
+                  actor=user, target=user)
         return self.repository.get_by_id(user['id']), new_code
 
     def active_it_accounts(self) -> int:
@@ -324,8 +362,12 @@ class AuthService:
         """
         if not can_manage(actor, role):
             raise PermissionDeniedError(f"You can't create {ROLE_LABELS.get(role, role)} accounts.")
-        return self._create(username, full_name, role, temporary_password, must_change_password=True,
-                            created_by=actor['username'])
+        user_id = self._create(username, full_name, role, temporary_password, must_change_password=True,
+                               created_by=actor['username'])
+        user = self.repository.get_by_id(user_id)
+        self._log(Category.ACCOUNTS, 'account_created',
+                  f"Created the {ROLE_LABELS[role]} account {_who(user)}", actor=actor, target=user)
+        return user_id
 
     def reset_password(self, actor: Dict[str, Any], user_id: int, temporary_password: str) -> None:
         """New temporary password (also unlocks); the owner must change it at the next login."""
@@ -333,11 +375,15 @@ class AuthService:
         validate_password(temporary_password, user['username'])
         self.repository.set_password(user_id, hash_password(temporary_password), must_change_password=True)
         logger.info(f"'{actor['username']}' reset the password of '{user['username']}'")
+        self._log(Category.ACCOUNTS, 'password_reset',
+                  f"Gave {_who(user)} a temporary password (must change it at the next sign-in)",
+                  actor=actor, target=user)
 
     def unlock(self, actor: Dict[str, Any], user_id: int) -> None:
         user = self._require_manageable(actor, user_id)
         self.repository.unlock(user_id)
         logger.info(f"'{actor['username']}' unlocked '{user['username']}'")
+        self._log(Category.ACCOUNTS, 'account_unlocked', f"Unlocked {_who(user)}", actor=actor, target=user)
 
     def update_user(self, actor: Dict[str, Any], user_id: int, full_name: str, role: str) -> None:
         user = self._require_manageable(actor, user_id)
@@ -352,6 +398,11 @@ class AuthService:
         self.repository.update_user(user_id, full_name, role)
         if full_name != user['full_name']:   # sections show their instructor's name
             CourseRepository(self.repository.database_path).rename_instructor(user_id, full_name)
+        changed = changes(user, {'full_name': full_name, 'role': role}, ('full_name', 'role'))
+        if changed:
+            self._log(Category.ACCOUNTS, 'account_updated',
+                      f"Changed the account {_who(user)}: {describe_changes(changed, {'full_name': 'name'})}",
+                      actor=actor, target=user, details=changed)
 
     def set_active(self, actor: Dict[str, Any], user_id: int, active: bool) -> None:
         user = self._require_manageable(actor, user_id)
@@ -361,6 +412,8 @@ class AuthService:
             self._keep_one_it(user, new_role=None)
         self.repository.set_active(user_id, active)
         logger.info(f"'{actor['username']}' {'activated' if active else 'deactivated'} '{user['username']}'")
+        self._log(Category.ACCOUNTS, 'account_activated' if active else 'account_deactivated',
+                  f"{'Activated' if active else 'Deactivated'} the account {_who(user)}", actor=actor, target=user)
 
     # -- helpers ---------------------------------------------------------------------
 

@@ -27,6 +27,7 @@ from src.services.course_service import (
     CourseService, InvalidCourseDataError, clean_course_code, clean_section_name,
 )
 from src.services.student_service import StudentService
+from src.services.activity_log import ActivityLog, Category
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -185,6 +186,11 @@ def apply_class_list_import(plan: ClassListImportPlan, course_service: CourseSer
         added = course_service.repository.bulk_import(plan.new_courses, plan.new_sections, memberships)
     except Exception as e:
         raise BulkImportError(f"Nothing was saved - the database refused the import: {e}")
+    ActivityLog(course_service.repository.database_path).record(
+        Category.COURSES, 'class_lists_imported',
+        f"Imported class lists from a CSV file: {len(plan.new_courses)} new course(s), "
+        f"{len(plan.new_sections)} new section(s), {added} student(s) added to class lists, "
+        f"{plan.counts['error']} row(s) with errors skipped")
     return {"courses": len(plan.new_courses), "sections": len(plan.new_sections), "added": added,
             "skipped": plan.counts["skip"], "errors": plan.counts["error"]}
 

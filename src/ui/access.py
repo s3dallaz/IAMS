@@ -26,6 +26,7 @@ PAGE_ROLES = {
     "Statistics & Reports": Role.INSTRUCTOR,
     "AI Assistant": Role.ADMIN,
     "Users": Role.ADMIN,
+    "Activity Log": Role.ADMIN,
 }
 
 

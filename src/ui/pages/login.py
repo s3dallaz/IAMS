@@ -47,6 +47,17 @@ def current_user() -> Optional[Dict[str, Any]]:
     return st.session_state.get(USER_KEY)
 
 
+def acting_user() -> Optional[Dict[str, Any]]:
+    """
+    For the activity log: the signed-in user of the page now running, or
+    None in a background thread (the scheduler), which has no page.
+    """
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    if get_script_run_ctx(suppress_warning=True) is None:
+        return None
+    return current_user()
+
+
 def load_signed_in_user(auth: AuthService) -> Optional[Dict[str, Any]]:
     """The signed-in user, freshly read; logs out a deleted / deactivated account."""
     user_id = st.session_state.get(AUTH_KEY)
@@ -251,4 +262,5 @@ def logout() -> None:
     st.session_state.clear()
     if user:
         logger.info(f"User '{user['username']}' logged out")
+        AuthService().record_sign_out(user)
     st.rerun()

@@ -14,6 +14,7 @@ from src.data.repositories.attendance_repository import AttendanceRepository, MA
 from src.data.repositories.student_repository import StudentRepository
 from src.data.repositories.session_repository import SessionRepository
 from src.services.session_service import SessionService, SessionStatus
+from src.services.activity_log import ActivityLog, Category
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -87,7 +88,18 @@ class AttendanceService:
         self.student_repo = StudentRepository(database_path)
         self.session_repo = SessionRepository(database_path)
         self.session_service = SessionService(database_path)
+        self.activity = ActivityLog(database_path)
         logger.debug("AttendanceService initialized")
+
+    def _log_manual(self, action: str, session_id: int, student_id: int, what: str) -> None:
+        """Activity log for a change made by hand: '<what> <student> in session #N "name"'."""
+        student = self.student_repo.get_by_id(student_id) or {}
+        session = self.session_repo.get_by_id(session_id) or {}
+        label = f"{student.get('name', '?')} ({student.get('student_id', '?')})"
+        self.activity.record(
+            Category.ATTENDANCE, action,
+            f"{what.replace('{student}', label)} in session #{session_id} \"{session.get('session_name', '?')}\"",
+            target_type='student', target_id=student_id, session_id=session_id)
     
     def record_attendance(
         self,
@@ -603,8 +615,12 @@ class AttendanceService:
         existing = self.attendance_repo.get_by_session_and_student(session_id, student_id)
         if not existing or existing['status'] not in (AttendanceStatus.PRESENT, AttendanceStatus.LATE):
             raise InvalidAttendanceDataError("Only a student marked present or late can be set to 'left early'.")
+        if bool(existing.get('left_early')) == bool(left_early):
+            return
         self.attendance_repo.set_left_early(existing['id'], left_early, verified_by=changed_by)
         logger.info(f"Session {session_id}: student {student_id} left_early={left_early} by {changed_by}")
+        self._log_manual('left_early_set' if left_early else 'left_early_cleared', session_id, student_id,
+                         "Marked {student} as 🚪 Left early" if left_early else "Cleared 🚪 Left early for {student}")
 
     def count_left_early(self, session_id: int) -> int:
         """How many present / late students of the session are flagged 'left early'."""
@@ -668,6 +684,8 @@ class AttendanceService:
                     self.attendance_repo.delete_attendance(existing['id'])
                     logger.info(f"Session {session_id}: student {student_id} set to absent by {changed_by} "
                                 f"(was {existing['status']})")
+                    self._log_manual('attendance_removed', session_id, student_id,
+                                     f"Set {{student}} to absent (was {existing['status']})")
                 return None
             
             if existing:
@@ -677,6 +695,8 @@ class AttendanceService:
                         notes=f"Changed by hand from {existing['status']} to {status}"
                     )
                     logger.info(f"Session {session_id}: student {student_id} changed to {status} by {changed_by}")
+                    self._log_manual('attendance_changed', session_id, student_id,
+                                     f"Changed {{student}} from {existing['status']} to {status}")
                 return existing['id']
             
             attendance_id = self.attendance_repo.create_attendance(
@@ -688,6 +708,7 @@ class AttendanceService:
                 notes="Marked by hand"
             )
             logger.info(f"Session {session_id}: student {student_id} marked {status} by {changed_by}")
+            self._log_manual('attendance_marked', session_id, student_id, f"Marked {{student}} {status} by hand")
             return attendance_id
         except sqlite3.IntegrityError:
             # The camera marked the student a moment ago: change that record instead

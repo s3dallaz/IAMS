@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from src.data.repositories.check_repository import CheckRepository
 from src.data.repositories.session_repository import SessionRepository
+from src.services.activity_log import SYSTEM_ACTOR, ActivityLog, Category, acting_as
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -87,6 +88,7 @@ class CheckService:
     def __init__(self, database_path: Optional[Path] = None):
         self.repository = CheckRepository(database_path)
         self.session_repository = SessionRepository(database_path)
+        self.activity = ActivityLog(database_path)
 
     # -- starting / scheduling ---------------------------------------------------------
 
@@ -97,8 +99,12 @@ class CheckService:
         now = self._now(now)
         self._require_active(session_id)
         self._require_none_open(session_id)
-        return self._create(session_id, CheckKind.SPOT, now, now + timedelta(minutes=self._minutes(minutes)),
-                            CheckStatus.OPEN, False, created_by, created_by_user_id)
+        ends = now + timedelta(minutes=self._minutes(minutes))
+        check_id = self._create(session_id, CheckKind.SPOT, now, ends, CheckStatus.OPEN, False,
+                                created_by, created_by_user_id)
+        self._log('spot_check_started', session_id, check_id,
+                  f"Started spot check #{check_id} now, until {ends:%H:%M}")
+        return check_id
 
     def schedule_spot_check(self, session_id: int, at: Optional[datetime] = None, randomly: bool = False,
                             minutes: int = DEFAULT_SPOT_MINUTES, created_by: Optional[str] = None,
@@ -128,8 +134,13 @@ class CheckService:
             raise CheckError("That time has already passed. Use 'Spot check now' instead.")
         if end is not None and at + timedelta(minutes=minutes) > end:
             raise CheckError("The spot check would run past the session's end time.")
-        return self._create(session_id, CheckKind.SPOT, at, at + timedelta(minutes=minutes),
-                            CheckStatus.SCHEDULED, randomly, created_by, created_by_user_id)
+        check_id = self._create(session_id, CheckKind.SPOT, at, at + timedelta(minutes=minutes),
+                                CheckStatus.SCHEDULED, randomly, created_by, created_by_user_id)
+        # A random time stays secret, also in the log
+        self._log('spot_check_scheduled', session_id, check_id,
+                  f"Scheduled spot check #{check_id} " + ("at a random time (hidden)" if randomly
+                                                          else f"at {at:%H:%M} for {minutes} min"))
+        return check_id
 
     def start_checkout_now(self, session_id: int, minutes: Optional[int] = None,
                            created_by: Optional[str] = None, created_by_user_id: Optional[int] = None,
@@ -151,8 +162,12 @@ class CheckService:
         for check in self.repository.list_checks(session_id):
             if check['kind'] == CheckKind.CHECKOUT and check['status'] == CheckStatus.SCHEDULED:
                 self.repository.set_status(check['id'], CheckStatus.VOID, void_reason=VoidReason.REPLACED)
-        return self._create(session_id, CheckKind.CHECKOUT, now, ends_at, CheckStatus.OPEN, False,
-                            created_by, created_by_user_id, close_session_after)
+        check_id = self._create(session_id, CheckKind.CHECKOUT, now, ends_at, CheckStatus.OPEN, False,
+                                created_by, created_by_user_id, close_session_after)
+        self._log('checkout_started', session_id, check_id,
+                  f"Started check-out #{check_id} now, until {ends_at:%H:%M}"
+                  + ("; the session closes by itself when it ends" if close_session_after else ""))
+        return check_id
 
     def checkout_still_due(self, session_id: int) -> bool:
         """True when the session has check-out on and no check-out has run (or is running) yet."""
@@ -178,6 +193,8 @@ class CheckService:
         running = self.repository.get_open_check(session_id)
         if running and running['kind'] == CheckKind.CHECKOUT:
             self.repository.set_close_session_after(running['id'])
+            self._log('checkout_close_after', session_id, running['id'],
+                      f"Asked to close the session when check-out #{running['id']} ends ({running['ends_at'][11:16]})")
             return self.repository.get_check(running['id'])
         if running:
             raise CheckError("A spot check is running. Finish or cancel it first.")
@@ -194,6 +211,9 @@ class CheckService:
             raise CheckError("Only a scheduled or running check can be cancelled.")
         self.repository.set_status(check_id, CheckStatus.VOID, void_reason=VoidReason.CANCELLED)
         logger.info(f"{KIND_LABELS[check['kind']]} #{check_id} of session {check['session_id']} cancelled")
+        self._log('check_cancelled', check['session_id'], check_id,
+                  f"Cancelled {KIND_LABELS[check['kind']].lower()} #{check_id} "
+                  f"({'scheduled' if check['status'] == CheckStatus.SCHEDULED else 'running'}); nobody flagged")
 
     def finish_check_now(self, check_id: int, now: Optional[datetime] = None) -> Optional[int]:
         """
@@ -203,7 +223,7 @@ class CheckService:
         check = self.repository.get_check(check_id)
         if not check or check['status'] != CheckStatus.OPEN:
             raise CheckError("Only a running check can be finished.")
-        return self._finalize(check, _fmt(self._now(now)))
+        return self._finalize(check, _fmt(self._now(now)), by_hand=True)
 
     # -- the camera ---------------------------------------------------------------------
 
@@ -250,7 +270,10 @@ class CheckService:
         missed them), and wind down checks of closed / deleted sessions.
         Cheap when nothing is due.
         """
-        now = self._now(now)
+        with acting_as(SYSTEM_ACTOR):   # background work: logged as "System (automatic)"
+            return self._apply_due(self._now(now))
+
+    def _apply_due(self, now: datetime) -> Dict[str, List[int]]:
         changed: Dict[str, List[int]] = {'opened': [], 'closed': [], 'voided': []}
         self._sync_automatic_checkouts(now)
 
@@ -265,6 +288,10 @@ class CheckService:
                 changed['opened'].append(check['id'])
                 logger.info(f"{KIND_LABELS[check['kind']]} #{check['id']} of session "
                             f"{check['session_id']} opened")
+                self._log('check_opened', check['session_id'], check['id'],
+                          f"{KIND_LABELS[check['kind']]} #{check['id']} started by itself"
+                          + (" (random time)" if check['is_random'] else "")
+                          + f", until {check['ends_at'][11:16]}")
 
         for check in self.repository.checks_with_status(CheckStatus.OPEN):
             if check['session_status'] == 'closed':   # closed early: the check ends with it
@@ -284,15 +311,17 @@ class CheckService:
             start = end - timedelta(minutes=row['checkout_minutes'] or DEFAULT_CHECKOUT_MINUTES)
             if row['check_id'] is None:
                 if end > now:
-                    self._create(row['session_id'], CheckKind.CHECKOUT, max(start, now), end,
-                                 CheckStatus.SCHEDULED, False, None, None)
+                    check_id = self._create(row['session_id'], CheckKind.CHECKOUT, max(start, now), end,
+                                            CheckStatus.SCHEDULED, False, None, None)
+                    self._log('checkout_scheduled', row['session_id'], check_id,
+                              f"Automatic check-out #{check_id} set for {max(start, now):%H:%M} - {end:%H:%M}")
             elif row['check_status'] == CheckStatus.SCHEDULED and (row['starts_at'], row['ends_at']) != (
                     _fmt(start), _fmt(end)):
                 self.repository.set_times(row['check_id'], _fmt(max(start, now)), _fmt(end))
         for check_id in self.repository.scheduled_checkouts_without_setting():
             self.repository.set_status(check_id, CheckStatus.VOID, void_reason=VoidReason.SETTING_OFF)
 
-    def _finalize(self, check: Dict[str, Any], ends_at: str) -> Optional[int]:
+    def _finalize(self, check: Dict[str, Any], ends_at: str, by_hand: bool = False) -> Optional[int]:
         """
         Close a check. The camera never saw it (off the whole time) -> void,
         nobody flagged, returns None. Otherwise flag who missed it and return
@@ -300,20 +329,40 @@ class CheckService:
         """
         label = f"{KIND_LABELS[check['kind']]} #{check['id']} of session {check['session_id']}"
         flagged: Optional[int] = None
+        kind = KIND_LABELS[check['kind']]
+        how = f"Finished {kind.lower()} #{check['id']} by hand" if by_hand else f"{kind} #{check['id']} ended"
         if not check.get('camera_seen_at') and not self.repository.marked_student_ids(check['id']):
             self.repository.set_status(check['id'], CheckStatus.VOID, ends_at=ends_at,
                                        void_reason=VoidReason.CAMERA_OFF)
             logger.warning(f"{label} ended without the camera running; it does not count, nobody flagged")
+            self._log('check_not_counted', check['session_id'], check['id'],
+                      f"{how}: it didn't count (the camera was off), nobody flagged")
         else:
+            due = self.repository.count_due(check['session_id'], check['starts_at'])
+            seen = len(self.repository.marked_student_ids(check['id']))
             self.repository.set_status(check['id'], CheckStatus.DONE, ends_at=ends_at)
             flagged = self.repository.flag_missed(check['id'])
             logger.info(f"{label} closed; {flagged} student(s) flagged as left early")
+            self._log('check_done', check['session_id'], check['id'],
+                      f"{how}: {seen} of {due} seen, {flagged} marked 🚪 Left early",
+                      details={'seen': seen, 'due': due, 'flagged': flagged})
         if check.get('close_session_after'):
             session = self.session_repository.get_by_id(check['session_id'])
             if session and session['status'] == 'active':
                 self.session_repository.close_session(check['session_id'])
                 logger.info(f"Session {check['session_id']} closed after its check-out")
+                self.activity.record(Category.SESSIONS, 'session_closed_after_checkout',
+                                     f"Session #{session['id']} \"{session['session_name']}\" closed by itself "
+                                     f"after its check-out", target_type='session', target_id=session['id'],
+                                     session_id=session['id'])
         return flagged
+
+    def _log(self, action: str, session_id: int, check_id: int, summary: str,
+             details: Optional[Dict[str, Any]] = None) -> None:
+        session = self.session_repository.get_by_id(session_id) or {}
+        self.activity.record(Category.CHECKS, action,
+                             f"{summary} - session #{session_id} \"{session.get('session_name', '?')}\"",
+                             target_type='check', target_id=check_id, session_id=session_id, details=details)
 
     # -- helpers ---------------------------------------------------------------------
 

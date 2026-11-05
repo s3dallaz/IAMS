@@ -198,6 +198,26 @@ CREATE TABLE IF NOT EXISTS check_marks (
 )
 """
 
+# Who did what, when (append-only; kept when the account or the object is deleted,
+# so user_id / session_id have no foreign keys and the names are copied in)
+CREATE_ACTIVITY_LOG_TABLE = """
+CREATE TABLE IF NOT EXISTS activity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TIMESTAMP NOT NULL,
+    user_id INTEGER,
+    username TEXT,
+    full_name TEXT,
+    role TEXT,
+    category TEXT NOT NULL,
+    action TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    target_type TEXT,
+    target_id INTEGER,
+    session_id INTEGER,
+    details TEXT
+)
+"""
+
 CREATE_UNKNOWN_FACES_TABLE = """
 CREATE TABLE IF NOT EXISTS unknown_faces (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,6 +278,10 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_attendance_marked_at ON attendance_records(marked_at)",
     "CREATE INDEX IF NOT EXISTS idx_checks_session ON attendance_checks(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_checks_status ON attendance_checks(status)",
+    "CREATE INDEX IF NOT EXISTS idx_activity_at ON activity_log(at)",
+    "CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_log(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_activity_session ON activity_log(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_activity_target ON activity_log(target_type, target_id)",
     
     # Unknown faces indexes
     "CREATE INDEX IF NOT EXISTS idx_unknown_session ON unknown_faces(session_id)",
@@ -306,6 +330,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
         ("attendance_records", CREATE_ATTENDANCE_RECORDS_TABLE),
         ("attendance_checks", CREATE_ATTENDANCE_CHECKS_TABLE),
         ("check_marks", CREATE_CHECK_MARKS_TABLE),
+        ("activity_log", CREATE_ACTIVITY_LOG_TABLE),
         ("unknown_faces", CREATE_UNKNOWN_FACES_TABLE),
         ("settings", CREATE_SETTINGS_TABLE),
     ]
@@ -506,6 +531,7 @@ def verify_schema(database_path: Optional[Path] = None) -> bool:
         'attendance_records',
         'attendance_checks',
         'check_marks',
+        'activity_log',
         'unknown_faces',
         'settings',
     ]

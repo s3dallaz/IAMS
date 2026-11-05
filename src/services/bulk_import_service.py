@@ -29,6 +29,7 @@ import pandas as pd
 from src.services.enrollment_service import EnrollmentService, InvalidFaceImageError
 from src.services.face_index import FaceIndex
 from src.services.student_service import StudentService
+from src.services.activity_log import ActivityLog, Category
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -268,6 +269,12 @@ def apply_student_import(plan: StudentImportPlan, student_service: StudentServic
         raise BulkImportError(f"Nothing was saved - the database refused the import: {e}")
     logger.info(f"Student import: {len(creates)} created, {len(updates)} updated, "
                 f"{plan.counts['error']} rows with errors skipped")
+    ActivityLog(student_service.repository.database_path).record(
+        Category.STUDENTS, 'students_imported',
+        f"Imported students from a CSV file: {len(creates)} added, {len(updates)} updated, "
+        f"{plan.counts['error']} row(s) with errors skipped",
+        details={'added': [row['student_id'] for row in creates][:2000],
+                 'updated': [row['student_id'] for row in updates][:2000]})
     return {"created": len(creates), "updated": len(updates),
             "unchanged": plan.counts["unchanged"], "errors": plan.counts["error"]}
 
@@ -467,6 +474,10 @@ def import_face_zip(
     c = report.counts
     logger.info(f"Face ZIP import: {c['enrolled']} enrolled ({c['warnings']} with warnings), "
                 f"{c['skipped']} skipped, {c['failed']} failed")
+    ActivityLog(enrollment_service.database_path).record(
+        Category.STUDENTS, 'faces_imported',
+        f"Imported face photos from a ZIP file: {c['enrolled']} added ({c['warnings']} with warnings), "
+        f"{c['skipped']} skipped, {c['failed']} failed", details=c)
     return report
 
 

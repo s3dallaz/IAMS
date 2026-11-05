@@ -171,6 +171,7 @@ After signing in, the sidebar shows the pages your role may open:
 6. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course (filter by course / section; session reports show the section and instructor; a **section summary** table), and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
 7. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
 8. **Users** (Admin / IT) - create accounts, change a name or role, reset a password, unlock, deactivate.
+9. **Activity Log** (Admin / IT) - who did what, and when: sign-ins (also failed ones and lockouts), accounts, students and face photos, courses and class lists, sessions, attendance changed by hand, check-outs and spot checks, the camera choice. Filter by dates, person, kind and text; click a row for its details (e.g. what an edit changed); **⬇️ Save as CSV**. Entries can't be edited or deleted. Background work (sessions / checks that start or end by themselves) shows as *System (automatic)*. The camera's own marks aren't listed (each record already says *Camera*), and passwords / recovery codes are never written. Each session's own history is also under **Session Details → 🕘 History of this session**.
 
 ### How sessions behave
 
@@ -337,7 +338,6 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 Planned, not built yet:
 
 * **Instructor screen** - an instructor picks their course and session and starts it
-* **Activity log** - who changed or deleted what, and when
 * **Use from several devices** - a school server with classroom PCs, HTTPS and device keys (today the app only opens on its own PC)
 * **AI Assistant updates** - e.g. answering questions about absent students
 * **New design** - a visual redesign of the whole app
