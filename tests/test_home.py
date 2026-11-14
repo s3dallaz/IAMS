@@ -74,7 +74,7 @@ def test_guide_steps_follow_the_data():
 
 def test_system_check_all_good():
     rows = system_checks(students_without_faces=0, pending_samples=0, scheduler_running=True,
-                         camera_session=None, ai_ready=True, missing_models=[])
+                         camera_session=None, missing_models=[])
     assert all(r[''] in ("✅", "ℹ️") for r in rows)
     camera = next(r for r in rows if r['Item'] == "Camera")
     assert camera[''] == "ℹ️" and camera['Result'].startswith("Off")
@@ -82,9 +82,9 @@ def test_system_check_all_good():
 
 def test_system_check_reports_problems():
     rows = system_checks(students_without_faces=4, pending_samples=2, scheduler_running=False,
-                         camera_session=7, ai_ready=False, missing_models=["MiniFASNetV2.onnx"])
+                         camera_session=7, missing_models=["MiniFASNetV2.onnx"])
     by_item = {r['Item']: r for r in rows}
-    for item in ("Face models", "Session timer", "Recognition data", "Face data", "AI Assistant"):
+    for item in ("Face models", "Session timer", "Recognition data", "Face data"):
         assert by_item[item][''] == "⚠️", item
     assert "MiniFASNetV2.onnx" in by_item["Face models"]['Result']
     assert "4 active student(s)" in by_item["Face data"]['Result']

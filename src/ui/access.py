@@ -2,8 +2,8 @@
 What each signed-in user may see.
 
 Pages: the lowest role that may open each sidebar page. Instructors run their
-classes; data management (students, courses, accounts) and the AI Assistant,
-which reads all data, are for Admin / IT.
+classes; data management (students, courses, accounts) and the activity
+log are for Admin / IT.
 
 Sessions: Admin / IT see every session. An instructor sees the sessions they
 own - those of the sections linked to their account, and the ones they
@@ -24,7 +24,6 @@ PAGE_ROLES = {
     "Student Registry": Role.ADMIN,
     "Courses & Sections": Role.ADMIN,
     "Statistics & Reports": Role.INSTRUCTOR,
-    "AI Assistant": Role.ADMIN,
     "Users": Role.ADMIN,
     "Activity Log": Role.ADMIN,
 }

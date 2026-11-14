@@ -7,7 +7,7 @@ Future phase configurations will be added as needed.
 
 import os
 from pathlib import Path
-from typing import Final, Optional
+from typing import Final
 
 # Project root directory
 PROJECT_ROOT: Final[Path] = Path(__file__).parent.absolute()
@@ -20,23 +20,6 @@ PROJECT_ROOT: Final[Path] = Path(__file__).parent.absolute()
 # `.env` holds real secrets and is listed in .gitignore - only `.env.example`
 # is tracked by Git, so credentials are never committed.
 ENV_FILE: Final[Path] = PROJECT_ROOT / ".env"
-
-# Values that mean "the key has not been filled in yet" (not a real secret).
-AI_API_KEY_PLACEHOLDERS: Final[frozenset] = frozenset({
-    "",
-    "your_api_key_here",
-    "your-api-key-here",
-    "changeme",
-    "todo",
-    "none",
-    "null",
-})
-
-# Environment variable names that must never be logged or sent to the model.
-SENSITIVE_ENV_VARS: Final[frozenset] = frozenset({
-    "OMNIROUTE_API_KEY",
-})
-
 
 def load_environment() -> bool:
     """
@@ -110,63 +93,6 @@ def _env_int(name: str, default: int) -> int:
 CAMERA_NAME: str = os.getenv("CAMERA_NAME", "").strip()
 CAMERA_WIDTH: int = _env_int("CAMERA_WIDTH", 1280)
 CAMERA_HEIGHT: int = _env_int("CAMERA_HEIGHT", 720)
-
-
-# ============================================================================
-# Phase 6: AI Assistant Configuration (OmniRoute)
-# ============================================================================
-
-# Defaults mirror the OmniRoute provider settings in opencode.json
-OMNIROUTE_API_KEY: str = os.getenv("OMNIROUTE_API_KEY", "")
-OMNIROUTE_BASE_URL: str = os.getenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1")
-OMNIROUTE_MODEL: str = os.getenv("OMNIROUTE_MODEL", "kr/claude-sonnet-4.5")
-
-# Timeout (seconds) applied to AI provider requests
-AI_REQUEST_TIMEOUT: float = _env_float("AI_REQUEST_TIMEOUT", 30.0)
-
-# Sampling temperature for the AI Assistant.
-# Low value keeps factual answers deterministic and reduces hallucination.
-AI_TEMPERATURE: float = _env_float("AI_TEMPERATURE", 0.0)
-
-# Maximum tokens for a generated answer
-AI_MAX_TOKENS: int = int(_env_float("AI_MAX_TOKENS", 800))
-
-# Maximum characters accepted for any single tool argument value.
-# Keeps model output bounded and prevents oversized/injected payloads.
-AI_MAX_ARG_LENGTH: int = int(_env_float("AI_MAX_ARG_LENGTH", 200))
-
-# Number of prior conversation turns kept as LLM context.
-AI_MAX_HISTORY_MESSAGES: int = int(_env_float("AI_MAX_HISTORY_MESSAGES", 12))
-
-# Set to True to skip the natural-language answer step and return raw tool
-# results. Useful for debugging and for offline environments.
-AI_RAW_MODE: bool = os.getenv("AI_RAW_MODE", "false").lower() == "true"
-
-
-def get_ai_api_key() -> str:
-    """
-    Return the OmniRoute API key, read live from the environment.
-
-    Read live (not cached at import) so tests and runtime changes to the
-    environment are picked up without reimporting the module.
-    """
-    return os.getenv("OMNIROUTE_API_KEY", "").strip()
-
-
-def is_ai_assistant_configured(api_key: Optional[str] = None) -> bool:
-    """
-    Check whether the AI Assistant has a usable API key.
-
-    Args:
-        api_key: Optional explicit key to test. When omitted, the current
-                 environment value is used.
-
-    Returns:
-        bool: True if a real (non-empty, non-placeholder) key is available.
-    """
-    if api_key is None:
-        api_key = get_ai_api_key()
-    return api_key.strip().lower() not in AI_API_KEY_PLACEHOLDERS
 
 
 # Data directories
@@ -447,10 +373,6 @@ ATTENDANCE_SNAPSHOTS_ENABLED: bool = os.getenv("ATTENDANCE_SNAPSHOTS_ENABLED", "
 # LATE_THRESHOLD_MINUTES: int = 15
 # AUTO_CLOSE_SESSIONS: bool = True
 # REQUIRE_LIVENESS: bool = True
-
-# Phase 6: AI Configuration - implemented above (OMNIROUTE_API_KEY,
-# OMNIROUTE_BASE_URL, OMNIROUTE_MODEL, AI_REQUEST_TIMEOUT).
-AI_RATE_LIMIT: int = 10  # queries per minute
 
 
 def ensure_directories() -> None:

@@ -26,7 +26,6 @@ This project is an AI-powered attendance system that automates student attendanc
 * Student registry with face enrollment from the camera or from photos
 * Bulk import of students (Excel / CSV) and face photos (ZIP), with a duplicate-face check
 * Statistics with **absences and attendance rates** (per student, session and course), a "most absences" list, CSV export and PDF reports
-* AI Assistant: ask questions about attendance in plain language (needs an API key)
 
 ## 🧠 Technologies Used
 
@@ -130,7 +129,7 @@ Setup only ever touches **software**: Python, CMake, the C++ Build Tools, the `.
   |---|---|---|---|
   | Home, Real-Time Attendance, Session Management, Statistics & Reports | ✅ own classes | ✅ all | ✅ all |
   | My Classes (their sections: start a session, class list) | ✅ | if they teach | if they teach |
-  | Student Registry, Courses & Sections, AI Assistant | ❌ | ✅ | ✅ |
+  | Student Registry, Courses & Sections, Activity Log | ❌ | ✅ | ✅ |
   | Users: instructor accounts | ❌ | ✅ | ✅ |
   | Users: Admin and IT accounts | ❌ | ❌ | ✅ |
 
@@ -154,9 +153,9 @@ After signing in, the sidebar shows the pages your role may open:
 
 1. **Home** - the start page, top to bottom:
    * **Getting started** - the setup steps (add students → add face photos → create a session → take attendance), ticked off automatically, with a **Go** button for the next one. It folds away once all are done.
-   * **Today** - quick buttons (**▶️ Start a class**, new session, add students, reports, AI Assistant), a card for every running session with live counts (expected / present / late / absent / attendance %) and **Open camera** / **Details** buttons, today's sessions and the next scheduled one. It refreshes itself every 10 seconds.
+   * **Today** - quick buttons (**▶️ Start a class**, new session, add students, reports), a card for every running session with live counts (expected / present / late / absent / attendance %) and **Open camera** / **Details** buttons, today's sessions and the next scheduled one. It refreshes itself every 10 seconds.
    * **Overview** - active students, students without face data, attendance rate, sessions in the last 7 days, and a 14-day chart.
-   * **System check** - face models, the session timer, recognition data, face data, camera on/off and the AI Assistant key. It never turns the camera on.
+   * **System check** - face models, the session timer, recognition data, face data and camera on/off. It never turns the camera on.
 2. **Real-Time Attendance** - pick an **active** session, press **Start Attendance Stream**, and students in front of the camera are recognized, liveness-checked and marked. A scheduled session can be started early here with **Activate Session**. In a session that belongs to a **section**, only students on its class list are marked; anyone else is shown as **Not in this class**. Pick the webcam under **📷 Camera** in the sidebar (also shown before taking face photos). *Automatic* uses the first real camera and skips phones linked to the PC; the choice is remembered, and if the chosen camera is unplugged you get a clear message instead of another camera opening.
 3. **Session Management** - three tabs:
    * **Sessions List** - every session with its status and present / late counts. Click a row to get its buttons: **Start Now**, **Close**, **View**, **Edit**, **Delete** (an active session must be closed before it can be deleted).
@@ -169,9 +168,8 @@ After signing in, the sidebar shows the pages your role may open:
    * **Import class lists** - an Excel / CSV file with the columns `course_code`, `section`, `student_id` (optional: `course_name`, `instructor`). Courses and sections that don't exist yet are created; you see a preview first. Importing the same file again is safe, and an import never removes anyone.
    * A course or section that has sessions can't be deleted - deactivate it instead, so its history is kept.
 6. **Statistics & Reports** - four tabs: an overview (attendance rate, present / late / absent totals, charts, the students with the most absences), one student's record (search by name or ID; attended and missed sessions), one session or course (filter by course / section; session reports show the section and instructor; a **section summary** table), and a searchable history. Every tab has CSV / PDF downloads; the session CSV lists every expected student, absent ones included. Absence totals count **closed** sessions only, where attendance is final.
-7. **AI Assistant** - ask questions about attendance in plain language (requires an OmniRoute API key in `.env`).
-8. **Users** (Admin / IT) - create accounts, change a name or role, reset a password, unlock, deactivate.
-9. **Activity Log** (Admin / IT) - who did what, and when: sign-ins (also failed ones and lockouts), accounts, students and face photos, courses and class lists, sessions, attendance changed by hand, check-outs and spot checks, the camera choice. Filter by dates, person, kind and text; click a row for its details (e.g. what an edit changed); **⬇️ Save as CSV**. Entries can't be edited or deleted. Background work (sessions / checks that start or end by themselves) shows as *System (automatic)*. The camera's own marks aren't listed (each record already says *Camera*), and passwords / recovery codes are never written. Each session's own history is also under **Session Details → 🕘 History of this session**.
+7. **Users** (Admin / IT) - create accounts, change a name or role, reset a password, unlock, deactivate.
+8. **Activity Log** (Admin / IT) - who did what, and when: sign-ins (also failed ones and lockouts), accounts, students and face photos, courses and class lists, sessions, attendance changed by hand, check-outs and spot checks, the camera choice. Filter by dates, person, kind and text; click a row for its details (e.g. what an edit changed); **⬇️ Save as CSV**. Entries can't be edited or deleted. Background work (sessions / checks that start or end by themselves) shows as *System (automatic)*. The camera's own marks aren't listed (each record already says *Camera*), and passwords / recovery codes are never written. Each session's own history is also under **Session Details → 🕘 History of this session**.
 
 ### How sessions behave
 
@@ -230,8 +228,7 @@ Open pages notice when a session starts or closes by itself and refresh within a
 │   ├── services/               # Business logic (attendance, enrollment, the session scheduler, etc.)
 │   ├── realtime/               # Camera / vision engine process and its connection to the app
 │   ├── ui/pages/               # Streamlit page components
-│   ├── utils/                  # Logging, performance timing
-│   └── ai/                     # LLM integration
+│   └── utils/                  # Logging, performance timing
 ├── tests/                      # Unit and integration tests
 └── manual_tests/               # Manual testing scripts
 ```
@@ -240,16 +237,9 @@ The database, face encodings, enrollment images, and `.env` file are **not** inc
 
 ## ⚙️ Configuration
 
-Copy `.env.example` to `.env` and adjust. The application starts without a `.env` file; it is only needed for the AI Assistant and optional overrides:
+Nothing needs to be configured: the app runs without a `.env` file and needs no internet connection or API key. To change a setting, copy `.env.example` to `.env` and adjust:
 
 ```ini
-# Required for AI Assistant
-OMNIROUTE_API_KEY=your_api_key_here
-
-# Optional overrides
-OMNIROUTE_BASE_URL=http://localhost:20128/v1
-OMNIROUTE_MODEL=kr/claude-sonnet-4.5
-
 # Application settings
 # APP_DEBUG=false
 # APP_LOG_LEVEL=INFO
@@ -344,14 +334,12 @@ OMNIROUTE_MODEL=kr/claude-sonnet-4.5
 - **Cause:** pip cannot reach PyPI to download packages, including the dlib source archive
 - **Fix:** allow `pypi.org` and `files.pythonhosted.org`, or configure an internal mirror with `pip config set global.index-url <url>`
 
-## 🗺️ Next Phases
+## 🗺️ Possible Future Work
 
-Planned, not built yet:
+Not part of this project; ideas if it grows:
 
-* **Instructor screen** - an instructor picks their course and session and starts it
 * **Use from several devices** - a school server with classroom PCs, HTTPS and device keys (today the app only opens on its own PC)
-* **AI Assistant updates** - e.g. answering questions about absent students
-* **New design** - a visual redesign of the whole app
+* **New design** - a visual redesign of the whole app, with an Arabic language option
 
 ## 📚 Documentation
 

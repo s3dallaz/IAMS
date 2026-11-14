@@ -73,7 +73,6 @@ def test_src_imports():
     import src.database
     import src.services
     import src.computer_vision
-    import src.ai
     import src.ui
     import src.utils
     

@@ -7,7 +7,7 @@ Sections, top to bottom:
 2. Today - live counts of active sessions, today's sessions, the next one,
    and quick buttons (refreshes itself every few seconds)
 3. Overview - students, missing face data, attendance rate, a 14-day chart
-4. System check - models, scheduler, recognition data, camera, AI Assistant
+4. System check - models, scheduler, recognition data, face data, camera
 
 Read-only: it never opens the camera; it only reports whether it is on.
 """
@@ -44,7 +44,6 @@ PAGE_ATTENDANCE = "Real-Time Attendance"
 PAGE_SESSIONS = "Session Management"
 PAGE_STUDENTS = "Student Registry"
 PAGE_REPORTS = "Statistics & Reports"
-PAGE_ASSISTANT = "AI Assistant"
 PAGE_COURSES = "Courses & Sections"
 
 CAMERA_SELECTOR_KEY = "realtime_session_selector"  # session picker of the camera page
@@ -178,7 +177,7 @@ def _camera_session_id() -> Optional[int]:
 
 def system_checks(students_without_faces: int, pending_samples: int,
                   scheduler_running: bool, camera_session: Optional[int],
-                  ai_ready: bool, missing_models: List[str]) -> List[Dict[str, str]]:
+                  missing_models: List[str]) -> List[Dict[str, str]]:
     """Rows of the system check: icon, item, result."""
     def row(ok: Optional[bool], item: str, result: str) -> Dict[str, str]:
         icon = "✅" if ok else ("ℹ️" if ok is None else "⚠️")
@@ -200,8 +199,6 @@ def system_checks(students_without_faces: int, pending_samples: int,
         row(None, "Camera",
             f"On - session #{camera_session}" if camera_session
             else "Off - it turns on only during an active session"),
-        row(ai_ready, "AI Assistant",
-            "Ready" if ai_ready else "No API key - add OMNIROUTE_API_KEY to .env to use it"),
     ]
 
 
@@ -263,7 +260,7 @@ def _render_getting_started(stats: Dict[str, Any], with_faces: int) -> None:
             if i == next_step:
                 col_button.button("Go", key=f"home_guide_{i}", type="primary",
                                   on_click=_go, args=(step['page'],), width="stretch")
-        st.caption("Then see the results in **Statistics & Reports**, or ask the **AI Assistant**.")
+        st.caption("Then see the results in **Statistics & Reports**.")
 
 
 @st.fragment(run_every=TODAY_REFRESH_SECONDS)
@@ -296,8 +293,6 @@ def _render_today() -> None:
     if can_open(user, PAGE_STUDENTS):
         quick.button("👤 Add students", key="home_students", on_click=_go, args=(PAGE_STUDENTS,))
     quick.button("📊 Reports", key="home_reports", on_click=_go, args=(PAGE_REPORTS,))
-    if can_open(user, PAGE_ASSISTANT):
-        quick.button("🤖 AI Assistant", key="home_ai", on_click=_go, args=(PAGE_ASSISTANT,))
 
     active = [s for s in sessions if s['status'] == SessionStatus.ACTIVE]
     for session in active:
@@ -383,7 +378,7 @@ def _render_system_check(enrollment_service: EnrollmentService, without_faces: i
         pending = 0
     missing = [name for name, _ in MODEL_FILES if not (config.PROJECT_ROOT / name).exists()]
     rows = system_checks(without_faces, pending, is_session_scheduler_running(),
-                         _camera_session_id(), config.is_ai_assistant_configured(), missing)
+                         _camera_session_id(), missing)
     problems = sum(1 for r in rows if r[''] == "⚠️")
     if problems:
         st.warning(f"{problems} item(s) need attention.")
